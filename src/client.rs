@@ -837,6 +837,17 @@ async fn run_one_connection(
                                     warn!("passive active iq failed: {e}");
                                 }
                             });
+
+                            // Announce presence=available with a name — without this,
+                            // the server keeps us in passive mode and only delivers
+                            // offline-queued messages, never live fan-out.
+                            let pres_mgr = mgr.clone();
+                            tokio::spawn(async move {
+                                match pres_mgr.send_presence(true).await {
+                                    Ok(()) => info!("→ presence type=available name=WhatsApp-rs"),
+                                    Err(e) => warn!("presence available failed: {e}"),
+                                }
+                            });
                         }
 
                         if let Some(count) = crate::messages::recv::extract_encrypt_count(&node) {

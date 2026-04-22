@@ -111,11 +111,20 @@ impl MessageManager {
     }
 
     /// Broadcast presence (available/unavailable).
+    ///
+    /// WhatsApp needs a `name=` attribute on the first `available` presence
+    /// or it keeps us flagged as passive and won't fan out incoming messages.
+    /// We use the push name stored in creds (set via `Client::set_push_name`,
+    /// defaults to "WhatsApp-rs" if unset).
     pub async fn send_presence(&self, available: bool) -> Result<()> {
         let pres_type = if available { "available" } else { "unavailable" };
+        let mut attrs = vec![("type".to_string(), pres_type.to_string())];
+        if available {
+            attrs.push(("name".to_string(), "WhatsApp-rs".to_string()));
+        }
         let node = BinaryNode {
             tag: "presence".to_string(),
-            attrs: vec![("type".to_string(), pres_type.to_string())],
+            attrs,
             content: NodeContent::None,
         };
         self.socket.send_node(&node).await

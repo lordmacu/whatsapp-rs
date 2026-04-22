@@ -37,9 +37,49 @@ impl MessageManager {
             "iq" => self.handle_iq(node).await,
             "presence" => self.handle_presence(node).await,
             "chatstate" => self.handle_chatstate(node).await,
+            "ib" => self.handle_ib(node).await,
             "failure" | "stream:failure" => { self.handle_stream_failure(node); Ok(()) }
             _ => Ok(()),
         }
+    }
+
+    /// Handle `<ib>` (info broadcast) server-push nodes. The important one is
+    /// `<offline_preview>` — the server is telling us how many offline events
+    /// it has queued and asking how big a batch to deliver. Without our reply
+    /// it keeps the queue frozen and never switches to live fan-out.
+    async fn handle_ib(&self, node: &BinaryNode) -> Result<()> {
+        let children: Vec<&BinaryNode> = if let NodeContent::List(v) = &node.content {
+            v.iter().collect()
+        } else { Vec::new() };
+
+        for child in &children {
+            match child.tag.as_str() {
+                "offline_preview" => {
+                    debug!("ib offline_preview → requesting offline_batch");
+                    let reply = BinaryNode {
+                        tag: "ib".into(),
+                        attrs: vec![],
+                        content: NodeContent::List(vec![BinaryNode {
+                            tag: "offline_batch".into(),
+                            attrs: vec![("count".into(), "100".into())],
+                            content: NodeContent::None,
+                        }]),
+                    };
+                    let _ = self.socket.send_node(&reply).await;
+                }
+                "offline" => {
+                    let count = child.attr("count").unwrap_or("?");
+                    debug!("ib offline drain complete (count={count}) — live fan-out should start");
+                }
+                "edge_routing" | "downgrade_webclient" | "dirty" => {
+                    // telemetry/notice — ignore
+                }
+                other => {
+                    debug!("ib unknown child: {other}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Decrypt a group SenderKey message.
@@ -181,7 +221,14 @@ impl MessageManager {
                         }
                         Err(e) => {
                             debug!("signal decrypt failed for {from}: {e}");
-                            send_retry_receipt_fn(&self.socket, &from, &id, t).await;
+                            // Wipe the stale session so the sender's re-send
+                            // (prompted by our retry receipt) is treated as a
+                            // fresh pkmsg and creates a new session for us.
+                            self.signal.drop_session(&decrypt_jid);
+                            send_retry_receipt_fn(
+                                &self.socket, node, &from, &id, t,
+                                self.signal.registration_id(),
+                            ).await;
                             Some(DecodedPayload::Message(MessageContent::Text {
                                 text: "<decrypt failed>".to_string(),
                                 mentioned_jids: Vec::new(),
@@ -533,6 +580,20 @@ fn decode_plaintext(data: &[u8]) -> DecodedPayload {
     use crate::messages::MediaInfo;
     use crate::signal::wa_proto;
 
+    // DSM wrapper: Message.deviceSentMessage (field 31) { destinationJid=1, message=2 }.
+    // Our own phone sends self-addressed payloads wrapped like this, including
+    // history-sync and app-state-sync-key-share. Unwrap the inner Message and
+    // recurse so downstream decoders see the real content.
+    if let Some(fields) = wa_proto::parse_proto_fields(data) {
+        if let Some(dsm) = fields.get(&31) {
+            if let Some(dsm_fields) = wa_proto::parse_proto_fields(dsm) {
+                if let Some(inner) = dsm_fields.get(&2) {
+                    return decode_plaintext(inner);
+                }
+            }
+        }
+    }
+
     // ProtocolMessage (revoke, edit, ephemeral, history sync, …)
     if let Some(proto_payload) = wa_proto::decode_protocol_message(data) {
         return DecodedPayload::Protocol(proto_payload);
@@ -625,24 +686,52 @@ fn decode_message_content(node: &BinaryNode) -> Option<MessageContent> {
 }
 
 /// Send a retry receipt so the sender re-establishes the session and re-sends.
-async fn send_retry_receipt_fn(socket: &crate::socket::SocketSender, to: &str, msg_id: &str, t: u64) {
+/// Matches Baileys' format: `<receipt type="retry" id to [participant] [recipient]>`
+/// with `<retry count id t v="1" error="0"/>` + `<registration>` big-endian reg_id.
+async fn send_retry_receipt_fn(
+    socket: &crate::socket::SocketSender,
+    orig: &BinaryNode,
+    to: &str,
+    msg_id: &str,
+    t: u64,
+    registration_id: u16,
+) {
+    let mut attrs = vec![
+        ("id".to_string(), msg_id.to_string()),
+        ("type".to_string(), "retry".to_string()),
+        ("to".to_string(), to.to_string()),
+    ];
+    if let Some(p) = orig.attr("participant") {
+        attrs.push(("participant".to_string(), p.to_string()));
+    }
+    if let Some(r) = orig.attr("recipient") {
+        attrs.push(("recipient".to_string(), r.to_string()));
+    }
+
+    // Big-endian 4-byte registration id.
+    let reg_id_be: Vec<u8> = (registration_id as u32).to_be_bytes().to_vec();
+
     let node = BinaryNode {
         tag: "receipt".to_string(),
-        attrs: vec![
-            ("to".to_string(), to.to_string()),
-            ("type".to_string(), "retry".to_string()),
-            ("id".to_string(), msg_id.to_string()),
-        ],
-        content: NodeContent::List(vec![BinaryNode {
-            tag: "retry".to_string(),
-            attrs: vec![
-                ("count".to_string(), "1".to_string()),
-                ("id".to_string(), msg_id.to_string()),
-                ("t".to_string(), t.to_string()),
-                ("v".to_string(), "1".to_string()),
-            ],
-            content: NodeContent::None,
-        }]),
+        attrs,
+        content: NodeContent::List(vec![
+            BinaryNode {
+                tag: "retry".to_string(),
+                attrs: vec![
+                    ("count".to_string(), "1".to_string()),
+                    ("id".to_string(), msg_id.to_string()),
+                    ("t".to_string(), t.to_string()),
+                    ("v".to_string(), "1".to_string()),
+                    ("error".to_string(), "0".to_string()),
+                ],
+                content: NodeContent::None,
+            },
+            BinaryNode {
+                tag: "registration".to_string(),
+                attrs: vec![],
+                content: NodeContent::Bytes(reg_id_be),
+            },
+        ]),
     };
     if let Err(e) = socket.send_node(&node).await {
         tracing::debug!("retry receipt failed: {e}");

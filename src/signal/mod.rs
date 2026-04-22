@@ -128,6 +128,12 @@ impl SignalRepository {
 
     pub fn account_identity_bytes(&self) -> &[u8] { &self.account_enc }
 
+    pub fn registration_id(&self) -> u16 { self.registration_id }
+
+    pub fn drop_session(&self, jid: &str) {
+        self.sessions.lock().unwrap().remove(jid);
+    }
+
     pub fn pkmsg_count(&self) -> u32 {
         self.pkmsg_count.load(Ordering::Relaxed)
     }
