@@ -336,10 +336,36 @@ async fn main() -> Result<()> {
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 async fn cmd_listen() -> Result<()> {
+    use crate::auth::{AuthManager, AuthState, FileStore};
+
+    // Snapshot auth state before `connect()` so we can tell if pairing just
+    // happened. If it did, we'll hand the session off to the daemon on exit.
+    let was_paired_before = {
+        let store = std::sync::Arc::new(FileStore::new()?);
+        let mgr = AuthManager::new(store)?;
+        *mgr.state() == AuthState::Authenticated
+    };
+
     let client = client::Client::new()?;
     let session = client.connect().await?;
     info!("connected as {}", session.our_jid);
     session.send_presence(true).await?;
+
+    if !was_paired_before {
+        // First-time pairing just finished. Drop our WA socket, install
+        // autostart, and return — the newly installed daemon will take
+        // over and `whatsapp-rs send ...` will Just Work.
+        println!();
+        println!("✓ Paired. Installing autostart so the daemon starts every login…");
+        drop(session);
+        if let Err(e) = install::install_autostart() {
+            eprintln!("autostart install failed: {e}");
+            eprintln!("you can still run `whatsapp-rs daemon` manually.");
+        } else {
+            println!("✓ Daemon installed and running. You're good to send.");
+        }
+        return Ok(());
+    }
 
     let mut events = session.events();
     loop {

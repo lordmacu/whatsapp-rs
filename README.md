@@ -9,14 +9,17 @@ official mobile apps.
 
 ```bash
 cargo build --release
-./target/release/whatsapp-rs setup       # pair via QR + install autostart
+./target/release/whatsapp-rs listen      # scan QR — install runs automatically
 ./target/release/whatsapp-rs send 573144347358@s.whatsapp.net "hello"
 ```
 
-`setup` walks you through QR pairing if you aren't paired yet, then
-installs the background daemon for your OS (systemd / launchd / Task
-Scheduler). From that point every CLI command proxies through the
-daemon and round-trips in ~10 ms.
+That's it. The first `listen` shows the QR, waits for you to scan, then —
+because it's your first pairing — installs the autostart unit for your
+OS (systemd / launchd / Task Scheduler) and exits. From that point the
+background daemon handles every `send`/`history`/etc. call in ~10 ms.
+
+If you need to re-run the setup later (e.g. after changing binary
+location): `whatsapp-rs setup`.
 
 ## Daemon mode (fast sends)
 
