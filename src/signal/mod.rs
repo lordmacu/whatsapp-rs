@@ -134,6 +134,37 @@ impl SignalRepository {
         self.sessions.lock().unwrap().remove(jid);
     }
 
+    pub fn identity_public(&self) -> &[u8; 32] { &self.identity.public }
+
+    /// Signed pre-key for retry receipts: (keyId, pub32, signature64).
+    pub fn signed_prekey_fields(&self) -> (u32, [u8; 32], Vec<u8>) {
+        (
+            self.signed_pre_key.key_id,
+            self.signed_pre_key.key_pair.public,
+            self.signed_pre_key.signature.to_vec(),
+        )
+    }
+
+    /// Pick any remaining one-time pre-key on disk for a retry receipt.
+    /// Returns (keyId, pub32). Does not consume — the sender will trigger
+    /// a pkmsg that consumes it via the normal decrypt path. `None` if
+    /// no usable OTK is available.
+    pub fn pick_unused_prekey(&self) -> Option<(u32, [u8; 32])> {
+        // Walk ids downward from the most-recently-generated batch.
+        // upload_pre_keys uses ids 1.. in batches of 30, writing zeroed
+        // bytes on consumption. Scan a reasonable window.
+        for id in (1..=2000u32).rev() {
+            if let Ok(Some(bytes)) = self.store.load_prekey(id) {
+                if bytes.len() == 64 && bytes[..32] != [0u8; 32] {
+                    let mut pub_b = [0u8; 32];
+                    pub_b.copy_from_slice(&bytes[32..64]);
+                    return Some((id, pub_b));
+                }
+            }
+        }
+        None
+    }
+
     pub fn pkmsg_count(&self) -> u32 {
         self.pkmsg_count.load(Ordering::Relaxed)
     }

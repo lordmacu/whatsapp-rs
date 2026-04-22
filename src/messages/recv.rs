@@ -228,6 +228,10 @@ impl MessageManager {
                             send_retry_receipt_fn(
                                 &self.socket, node, &from, &id, t,
                                 self.signal.registration_id(),
+                                self.signal.identity_public(),
+                                self.signal.signed_prekey_fields(),
+                                self.signal.pick_unused_prekey(),
+                                self.signal.account_identity_bytes(),
                             ).await;
                             Some(DecodedPayload::Message(MessageContent::Text {
                                 text: "<decrypt failed>".to_string(),
@@ -687,7 +691,9 @@ fn decode_message_content(node: &BinaryNode) -> Option<MessageContent> {
 
 /// Send a retry receipt so the sender re-establishes the session and re-sends.
 /// Matches Baileys' format: `<receipt type="retry" id to [participant] [recipient]>`
-/// with `<retry count id t v="1" error="0"/>` + `<registration>` big-endian reg_id.
+/// with `<retry …/>`, `<registration>`, and a full `<keys>` bundle so the sender
+/// has everything to build a fresh pkmsg (version byte 0x05 prefix on each key,
+/// u24 big-endian key ids, signed-pre-key includes signature).
 async fn send_retry_receipt_fn(
     socket: &crate::socket::SocketSender,
     orig: &BinaryNode,
@@ -695,6 +701,10 @@ async fn send_retry_receipt_fn(
     msg_id: &str,
     t: u64,
     registration_id: u16,
+    identity_pub: &[u8; 32],
+    signed_prekey: (u32, [u8; 32], Vec<u8>),
+    one_time_prekey: Option<(u32, [u8; 32])>,
+    device_identity: &[u8],
 ) {
     let mut attrs = vec![
         ("id".to_string(), msg_id.to_string()),
@@ -708,8 +718,48 @@ async fn send_retry_receipt_fn(
         attrs.push(("recipient".to_string(), r.to_string()));
     }
 
-    // Big-endian 4-byte registration id.
     let reg_id_be: Vec<u8> = (registration_id as u32).to_be_bytes().to_vec();
+
+    // Helper: u24 big-endian key id + 0x05-prefixed 33-byte pub key.
+    let u24_be = |v: u32| -> Vec<u8> { vec![(v >> 16) as u8, (v >> 8) as u8, v as u8] };
+    let prefixed = |pk: &[u8; 32]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(0x05);
+        out.extend_from_slice(pk);
+        out
+    };
+    let bytes_node = |tag: &str, data: Vec<u8>| BinaryNode {
+        tag: tag.to_string(),
+        attrs: vec![],
+        content: NodeContent::Bytes(data),
+    };
+
+    // Build <keys> block
+    let (spk_id, spk_pub, spk_sig) = signed_prekey;
+    let mut keys_children: Vec<BinaryNode> = vec![
+        bytes_node("type", vec![0x05]),
+        bytes_node("identity", prefixed(identity_pub)),
+    ];
+    if let Some((otk_id, otk_pub)) = one_time_prekey {
+        keys_children.push(BinaryNode {
+            tag: "key".to_string(),
+            attrs: vec![],
+            content: NodeContent::List(vec![
+                bytes_node("id", u24_be(otk_id)),
+                bytes_node("value", prefixed(&otk_pub)),
+            ]),
+        });
+    }
+    keys_children.push(BinaryNode {
+        tag: "skey".to_string(),
+        attrs: vec![],
+        content: NodeContent::List(vec![
+            bytes_node("id", u24_be(spk_id)),
+            bytes_node("value", prefixed(&spk_pub)),
+            bytes_node("signature", spk_sig),
+        ]),
+    });
+    keys_children.push(bytes_node("device-identity", device_identity.to_vec()));
 
     let node = BinaryNode {
         tag: "receipt".to_string(),
@@ -726,10 +776,11 @@ async fn send_retry_receipt_fn(
                 ],
                 content: NodeContent::None,
             },
+            bytes_node("registration", reg_id_be),
             BinaryNode {
-                tag: "registration".to_string(),
+                tag: "keys".to_string(),
                 attrs: vec![],
-                content: NodeContent::Bytes(reg_id_be),
+                content: NodeContent::List(keys_children),
             },
         ]),
     };
