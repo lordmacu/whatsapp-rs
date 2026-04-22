@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         "daemon-stop" => cmd_daemon_stop().await,
         "install" => install::install_autostart(),
         "uninstall" => install::uninstall_autostart(),
+        "setup" => cmd_setup().await,
         "listen" => cmd_listen().await,
         "send" => {
             if args.len() < 3 {
@@ -370,6 +371,29 @@ async fn cmd_send(jid: &str, text: &str) -> Result<()> {
     let id = session.send_text(jid, text).await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     println!("sent: {id}");
+    Ok(())
+}
+
+/// One-shot onboarding: pair (if needed) then install autostart.
+/// After this the daemon is running and will come back on every reboot.
+async fn cmd_setup() -> Result<()> {
+    use crate::auth::{AuthManager, AuthState, FileStore};
+    let store = std::sync::Arc::new(FileStore::new()?);
+    let mgr = AuthManager::new(store)?;
+    if *mgr.state() != AuthState::Authenticated {
+        println!("Not paired yet — scanning QR. Leave this running until the");
+        println!("pairing is confirmed on your phone (takes ~15 s), then Ctrl+C.\n");
+        // Drive the normal pairing flow and exit as soon as it completes.
+        let client = client::Client::new()?;
+        let _session = client.connect().await?;
+        println!("\n✓ Paired.");
+    } else {
+        println!("Already paired as {}.", mgr.creds().me.as_ref().map(|c| c.id.as_str()).unwrap_or("?"));
+    }
+
+    install::install_autostart()?;
+    println!("\n✓ Autostart installed. The daemon is running and will start on every login.");
+    println!("  Test it: whatsapp-rs send <jid> \"hi\"");
     Ok(())
 }
 

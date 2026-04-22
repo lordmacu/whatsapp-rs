@@ -5,22 +5,18 @@ protocol, pairs by QR, and speaks the full Signal protocol (X3DH + Double
 Ratchet) end-to-end — interoperates with the real WhatsApp servers and
 official mobile apps.
 
-## Quick start
+## Quick start (one command)
 
-Build:
 ```bash
 cargo build --release
-```
-
-Pair your phone (scan QR):
-```bash
-./target/release/whatsapp-rs listen
-```
-
-Send a message:
-```bash
+./target/release/whatsapp-rs setup       # pair via QR + install autostart
 ./target/release/whatsapp-rs send 573144347358@s.whatsapp.net "hello"
 ```
+
+`setup` walks you through QR pairing if you aren't paired yet, then
+installs the background daemon for your OS (systemd / launchd / Task
+Scheduler). From that point every CLI command proxies through the
+daemon and round-trips in ~10 ms.
 
 ## Daemon mode (fast sends)
 
