@@ -1,0 +1,70 @@
+[package]
+name = "whatsapp-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "whatsapp-rs"
+path = "src/main.rs"
+
+[lib]
+name = "whatsapp_rs"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+native-tls = "0.2"
+
+# Crypto - Noise protocol
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+
+# Crypto - Signal protocol
+hmac = "0.12"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+pbkdf2 = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+xeddsa = "1"
+
+# Protobuf
+prost = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = { version = "0.22", features = ["std"] }
+
+# QR code display en terminal
+qrcode = "0.14"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utils
+bytes = "1"
+anyhow = "1"
+thiserror = "1"
+futures-util = "0.3"
+flate2 = "1"
+hex = "0.4"
+md5 = "0.7"
+dirs = "5"
+
+# HTTP client (media download)
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+
+# HTTP server for QR endpoint
+axum = "0.7"
+
+[build-dependencies]
+prost-build = "0.13"

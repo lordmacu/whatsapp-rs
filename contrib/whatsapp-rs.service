@@ -1,0 +1,21 @@
+[Unit]
+Description=whatsapp-rs daemon (persistent WhatsApp Web session)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the path if the binary lives elsewhere.
+ExecStart=%h/whatsapp-rs/target/release/whatsapp-rs daemon
+
+# Restart on crash; wait 3 s between attempts.
+Restart=on-failure
+RestartSec=3
+
+# Keep stdout/stderr in the systemd journal (view with `journalctl --user -u whatsapp-rs -f`).
+StandardOutput=journal
+StandardError=journal
+Environment=RUST_LOG=info,whatsapp_rs=info
+
+[Install]
+WantedBy=default.target

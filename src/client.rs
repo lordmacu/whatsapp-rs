@@ -1,0 +1,1255 @@
+/// High-level WhatsApp client.
+///
+/// `Client::new()` → `client.connect().await` → `Session`
+///
+/// `Session` owns the background receive loop and reconnects automatically.
+/// Subscribe to events with `session.events()`.
+use crate::auth::{AuthManager, AuthState, FileStore};
+use crate::contacts::ContactStore;
+use crate::message_store::MessageStore;
+use crate::messages::{MessageEvent, MessageKey, MessageManager};
+use crate::outbox::OutboxStore;
+use crate::poll_store::PollStore;
+use crate::signal::SignalRepository;
+use crate::socket;
+use anyhow::Result;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{broadcast, RwLock};
+use tracing::{debug, info, warn};
+
+// ── Client ────────────────────────────────────────────────────────────────────
+
+pub struct Client {
+    store: Arc<FileStore>,
+}
+
+impl Client {
+    /// Create a client backed by the default file store (`~/.wacli/`).
+    pub fn new() -> Result<Self> {
+        Ok(Self { store: Arc::new(FileStore::new()?) })
+    }
+
+    #[allow(dead_code)]
+    pub fn is_authenticated(&self) -> bool {
+        AuthManager::new(self.store.clone())
+            .map(|m| *m.state() == AuthState::Authenticated)
+            .unwrap_or(false)
+    }
+
+    /// Link by phone number instead of QR scan.
+    ///
+    /// Prints an 8-character code; user enters it in WhatsApp →
+    /// Settings → Linked Devices → Link a Device → "Link with phone number".
+    /// Blocks until paired, then returns a live `Session`.
+    pub async fn connect_with_phone(&self, phone: &str) -> Result<Session> {
+        let mut auth_mgr = AuthManager::new(self.store.clone())?;
+
+        if *auth_mgr.state() != AuthState::Authenticated {
+            self.run_pairing_code(phone, &mut auth_mgr).await?;
+        }
+
+        // same post-auth setup as `connect`
+        self.start_session(auth_mgr).await
+    }
+
+    /// Connect and return a live `Session`.
+    ///
+    /// On first run: prints QR to stdout, blocks until scanned.
+    /// On subsequent runs: reconnects immediately.
+    /// The session auto-reconnects in the background on any disconnect.
+    pub async fn connect(&self) -> Result<Session> {
+        let mut auth_mgr = AuthManager::new(self.store.clone())?;
+
+        if *auth_mgr.state() != AuthState::Authenticated {
+            self.run_pairing(&mut auth_mgr).await?;
+        }
+
+        self.start_session(auth_mgr).await
+    }
+
+    async fn start_session(&self, auth_mgr: AuthManager) -> Result<Session> {
+        let our_jid = auth_mgr.creds().me.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+
+        // Shared state — survives reconnects
+        let base = self.store.base_dir();
+        let (event_tx, _) = broadcast::channel::<MessageEvent>(512);
+        let contacts   = Arc::new(ContactStore::new(base)?);
+        let msg_store  = Arc::new(MessageStore::new(base)?);
+        let poll_store = Arc::new(PollStore::new(base)?);
+        let outbox     = Arc::new(OutboxStore::new(base)?);
+
+        // Initial connection. Do NOT send any IQ yet — server hasn't authenticated us
+        // until it emits <success>. Pre-key upload / passive-active happen in the recv
+        // loop when that node arrives.
+        let (sender, receiver) =
+            socket::connect(auth_mgr.creds()).await.map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let sender = Arc::new(sender);
+
+        let creds: SharedCreds = Arc::new(tokio::sync::Mutex::new(auth_mgr.creds().clone()));
+        let signal = Arc::new(SignalRepository::new(&*creds.lock().await, self.store.clone()));
+
+        let mgr = Arc::new(MessageManager::with_stores(
+            sender, signal, our_jid.clone(), event_tx.clone(),
+            contacts.clone(), msg_store.clone(), poll_store.clone(), outbox.clone(),
+        ));
+        let current_mgr: Arc<RwLock<Arc<MessageManager>>> = Arc::new(RwLock::new(mgr.clone()));
+
+        info!("connected as {our_jid}");
+
+        // Retry any messages that were left in the outbox from a previous run
+        let pending = outbox.pending();
+        if !pending.is_empty() {
+            info!("{} outbox entries pending from previous session, retrying", pending.len());
+            let mgr_retry = mgr.clone();
+            tokio::spawn(async move {
+                for (jid, msg) in pending {
+                    mgr_retry.retry_outbox_entry(&jid, msg).await;
+                }
+            });
+        }
+
+        // Spawn background loop: recv nodes + keepalive + auto-reconnect + pre-key rotation
+        let bg_store    = self.store.clone();
+        let bg_creds    = creds.clone();
+        let bg_mgr      = current_mgr.clone();
+        let bg_tx       = event_tx.clone();
+        let bg_jid      = our_jid.clone();
+        let bg_contacts = contacts.clone();
+        let bg_msgs     = msg_store.clone();
+        let bg_polls    = poll_store.clone();
+        let bg_outbox   = outbox.clone();
+        // Subscribe before spawning so we don't miss the Connected event
+        // emitted from inside run_session_loop.
+        let mut ready_rx = event_tx.subscribe();
+
+        let bg_handle = tokio::spawn(async move {
+            run_session_loop(
+                receiver, mgr, bg_mgr, bg_tx, bg_creds, bg_store, bg_jid,
+                bg_contacts, bg_msgs, bg_polls, bg_outbox,
+            ).await;
+        });
+
+        // Wait up to 10 s for <success>. `Connected` is emitted immediately
+        // after the server sends <success>; passive-active and OTK upload
+        // run in the background and don't block the send path.
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Ok(ev) = ready_rx.recv().await {
+                if matches!(ev, MessageEvent::Connected) {
+                    return;
+                }
+            }
+        }).await;
+
+        Ok(Session {
+            mgr: current_mgr, event_tx, our_jid, contacts, msg_store, poll_store,
+            creds: creds.clone(),
+            store: self.store.clone(),
+            bg_handle: bg_handle.abort_handle(),
+        })
+    }
+
+    // ── Pairing ───────────────────────────────────────────────────────────────
+
+    async fn run_pairing(&self, auth_mgr: &mut AuthManager) -> Result<()> {
+        use crate::binary::{BinaryNode, NodeContent};
+        use crate::qr;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        loop {
+            let (sender, mut receiver) = socket::connect(auth_mgr.creds()).await?;
+
+            // Keepalive task: server closes after 30s without ping during pairing.
+            let ping_sender = sender.clone();
+            let keepalive = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(25));
+                tick.tick().await; // discard immediate tick
+                loop {
+                    tick.tick().await;
+                    let id = ping_sender.next_id();
+                    let ping = BinaryNode {
+                        tag: "iq".into(),
+                        attrs: vec![
+                            ("id".into(), id),
+                            ("to".into(), "s.whatsapp.net".into()),
+                            ("type".into(), "get".into()),
+                            ("xmlns".into(), "w:p".into()),
+                        ],
+                        content: NodeContent::List(vec![BinaryNode {
+                            tag: "ping".into(),
+                            attrs: vec![],
+                            content: NodeContent::None,
+                        }]),
+                    };
+                    if ping_sender.send_node(&ping).await.is_err() { break; }
+                }
+            });
+
+            let result: Result<()> = async {
+            loop {
+                let node = match receiver.recv_node().await? {
+                    Some(n) => n,
+                    None => break,
+                };
+                let content_kind = match &node.content {
+                    NodeContent::None => "none".to_string(),
+                    NodeContent::Text(t) => format!("text(len={})", t.len()),
+                    NodeContent::Bytes(b) => format!("bytes(len={})", b.len()),
+                    NodeContent::List(c) => format!("list(n={})", c.len()),
+                };
+                info!("pairing ← node tag={} content={} attrs={:?}", node.tag, content_kind, node.attrs);
+
+                // Auto-ACK any iq that is not pair-device/pair-success (commerce_experience, pings, etc).
+                // Those two cases send their own iq result inside the match arms below.
+                let is_pair_iq = node.tag == "iq" && matches!(&node.content, NodeContent::List(c) if c.iter().any(|x| x.tag == "pair-device" || x.tag == "pair-success"));
+                if node.tag == "iq" && !is_pair_iq {
+                    let id = node.attr("id").unwrap_or("").to_string();
+                    let from = node.attr("from").unwrap_or("s.whatsapp.net").to_string();
+                    match sender.send_iq_result(&id, &from).await {
+                        Ok(_)  => info!("pairing → ack iq id={id} to={from}"),
+                        Err(e) => warn!("pairing → ack failed: {e}"),
+                    }
+                }
+
+                if let NodeContent::List(children) = &node.content {
+                    let child_tags: Vec<&str> = children.iter().map(|c| c.tag.as_str()).collect();
+                    info!("pairing ← children={:?}", child_tags);
+                    for child in children.clone() {
+                        match child.tag.as_str() {
+                            "pair-device" => {
+                                let refs: Vec<String> =
+                                    if let NodeContent::List(gc) = &child.content {
+                                        gc.iter()
+                                            .filter(|n| n.tag == "ref")
+                                            .filter_map(|n| match &n.content {
+                                                NodeContent::Text(s) => Some(s.clone()),
+                                                NodeContent::Bytes(b) => {
+                                                    String::from_utf8(b.clone()).ok()
+                                                }
+                                                _ => None,
+                                            })
+                                            .collect()
+                                    } else {
+                                        vec![]
+                                    };
+                                if refs.is_empty() {
+                                    continue;
+                                }
+                                let c = auth_mgr.creds();
+                                let qr_data = format!(
+                                    "{},{},{},{}",
+                                    refs[0],
+                                    B64.encode(c.noise_key.public),
+                                    B64.encode(c.signed_identity_key.public),
+                                    B64.encode(&c.adv_secret_key)
+                                );
+                                println!("\n{}", qr::ascii::render_qr(qr_data.as_bytes()));
+                                println!("Scan with WhatsApp on your phone\n");
+                                let id = node.attr("id").unwrap_or("").to_string();
+                                let from =
+                                    node.attr("from").unwrap_or("s.whatsapp.net").to_string();
+                                sender.send_iq_result(&id, &from).await?;
+                            }
+                            "pair-success" => {
+                                use crate::auth::{Contact, pair_success::process_pair_success};
+                                match process_pair_success(&node, auth_mgr.creds()) {
+                                    Ok((outcome, reply)) => {
+                                        // Persist identity + account-identity blob + save creds
+                                        // before replying, so a crash after the reply still
+                                        // leaves us paired and able to build pkmsg later.
+                                        auth_mgr.set_me(Contact {
+                                            id:   outcome.jid.clone(),
+                                            name: outcome.business_name.clone(),
+                                            lid:  outcome.lid.clone(),
+                                        });
+                                        auth_mgr.creds_mut().account_enc = outcome.account_enc.clone();
+                                        auth_mgr.set_auth_state(AuthState::Authenticated);
+                                        if let Err(e) = auth_mgr.save() {
+                                            warn!("save creds after pair-success: {e}");
+                                        }
+
+                                        if let Err(e) = sender.send_node(&reply).await {
+                                            warn!("send pair-device-sign reply: {e}");
+                                        }
+                                        info!(
+                                            "paired! jid={} lid={:?} platform={:?} key_index={}",
+                                            outcome.jid, outcome.lid,
+                                            outcome.platform, outcome.key_index,
+                                        );
+                                        // Note: pre-key upload is skipped here —
+                                        // server will disconnect after pair-success and we
+                                        // reconnect in `start_session` where we upload then.
+                                    }
+                                    Err(e) => {
+                                        warn!("pair-success processing failed: {e}");
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Once paired, do NOT reconnect immediately — the server still
+                // needs to validate our pair-device-sign reply. Keep reading on
+                // this socket until the server tears it down (xmlstreamend /
+                // recv returns None). Reconnecting too early gives a 401.
+            }
+            Ok(())
+            }.await;
+
+            keepalive.abort();
+
+            // Any exit path counts as success once the state flipped to Authenticated
+            // (the server typically closes the socket after we send pair-device-sign,
+            // which propagates up as Err from recv_node).
+            if *auth_mgr.state() == AuthState::Authenticated {
+                let _ = result; // ignore the connection-close error
+                return Ok(());
+            }
+            info!("connection dropped during pairing, retrying in 3s…");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    // ── Pairing-by-phone-number ───────────────────────────────────────────────
+
+    async fn run_pairing_code(&self, phone: &str, auth_mgr: &mut AuthManager) -> Result<()> {
+        use crate::binary::NodeContent;
+
+        // Set provisional JID so the server knows which account to link
+        {
+            let c = auth_mgr.creds_mut();
+            c.me = Some(crate::auth::Contact {
+                id: format!("{}@s.whatsapp.net", phone.trim_start_matches('+')),
+                name: None,
+                lid: None,
+            });
+        }
+
+        let mut pairing_code: Option<String> = None;
+
+        loop {
+            let (sender, mut receiver) = socket::connect(auth_mgr.creds()).await?;
+
+            loop {
+                let node = match receiver.recv_node().await? {
+                    Some(n) => n,
+                    None => break,
+                };
+
+                // pair-device: send companion_hello and display code
+                if let NodeContent::List(children) = &node.content {
+                    for child in children.clone() {
+                        if child.tag == "pair-device" {
+                            let code = pairing_code_send_hello(&sender, auth_mgr).await?;
+                            println!("\nEnter this code in WhatsApp → Settings → Linked Devices → Link a Device → \"Link with phone number instead\":\n");
+                            println!("  {}-{}\n", &code[..4], &code[4..]);
+                            pairing_code = Some(code);
+                        }
+                        if child.tag == "pair-success" {
+                            let jid = if let NodeContent::List(gc) = &child.content {
+                                gc.iter()
+                                    .find(|n| n.tag == "device")
+                                    .and_then(|n| n.attr("jid"))
+                                    .map(|s| s.to_string())
+                            } else {
+                                None
+                            };
+                            if let Some(jid) = jid {
+                                auth_mgr.set_me(crate::auth::Contact {
+                                    id: jid.clone(),
+                                    name: None,
+                                    lid: None,
+                                });
+                                auth_mgr.set_auth_state(AuthState::Authenticated);
+                                auth_mgr.save()?;
+                                let id = node.attr("id").unwrap_or("").to_string();
+                                let from = node.attr("from").unwrap_or("s.whatsapp.net").to_string();
+                                sender.send_iq_result(&id, &from).await?;
+                                if let Err(e) = socket::prekey::upload_pre_keys(
+                                    &sender, auth_mgr.creds_mut(), self.store.as_ref(),
+                                ).await {
+                                    warn!("pre-key upload: {e}");
+                                }
+                                info!("paired via phone code! JID={jid}");
+                            }
+                        }
+                    }
+                }
+
+                // link_code_companion_reg notification from phone → do companion_finish
+                if node.tag == "notification" && node.attr("type") == Some("link_code_companion_reg") {
+                    if let Some(ref code) = pairing_code {
+                        if let Err(e) = pairing_code_send_finish(&sender, auth_mgr, &node, code).await {
+                            warn!("companion_finish failed: {e}");
+                        }
+                    }
+                }
+
+                if *auth_mgr.state() == AuthState::Authenticated {
+                    return Ok(());
+                }
+            }
+
+            info!("connection dropped during pairing, retrying in 3s…");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+}
+
+// ── Pairing code crypto ───────────────────────────────────────────────────────
+// All helpers live in auth::pairing_crypto for testability.
+
+use crate::auth::pairing_crypto::{
+    aes256_gcm_encrypt, decipher_link_public_key,
+    generate_pairing_code, hkdf_sha256, make_wrapped_companion_ephemeral, x25519_dh,
+};
+
+/// Send the companion_hello IQ; returns the 8-char pairing code.
+async fn pairing_code_send_hello(
+    sender: &crate::socket::SocketSender,
+    auth_mgr: &mut AuthManager,
+) -> Result<String> {
+    use crate::binary::{BinaryNode, NodeContent};
+
+    let code = generate_pairing_code();
+    auth_mgr.creds_mut().pairing_code = Some(code.clone());
+
+    let ephemeral_pub = auth_mgr.creds().pairing_ephemeral_key.public;
+    let noise_pub     = auth_mgr.creds().noise_key.public;
+    let our_jid       = auth_mgr.creds().me.as_ref()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+
+    let wrapped = make_wrapped_companion_ephemeral(&code, &ephemeral_pub);
+
+    let id = sender.next_id();
+    let node = BinaryNode {
+        tag: "iq".to_string(),
+        attrs: vec![
+            ("id".to_string(), id),
+            ("to".to_string(), "s.whatsapp.net".to_string()),
+            ("type".to_string(), "set".to_string()),
+            ("xmlns".to_string(), "md".to_string()),
+        ],
+        content: NodeContent::List(vec![BinaryNode {
+            tag: "link_code_companion_reg".to_string(),
+            attrs: vec![
+                ("jid".to_string(), our_jid),
+                ("stage".to_string(), "companion_hello".to_string()),
+                ("should_show_push_notification".to_string(), "true".to_string()),
+            ],
+            content: NodeContent::List(vec![
+                BinaryNode {
+                    tag: "link_code_pairing_wrapped_companion_ephemeral_pub".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Bytes(wrapped),
+                },
+                BinaryNode {
+                    tag: "companion_server_auth_key_pub".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Bytes(noise_pub.to_vec()),
+                },
+                BinaryNode {
+                    tag: "companion_platform_id".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Text("1".to_string()), // Chrome
+                },
+                BinaryNode {
+                    tag: "companion_platform_display".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Text("Chrome (WhatsApp)".to_string()),
+                },
+                BinaryNode {
+                    tag: "link_code_pairing_nonce".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Text("0".to_string()),
+                },
+            ]),
+        }]),
+    };
+
+    sender.send_node(&node).await?;
+    Ok(code)
+}
+
+/// Process the phone's `link_code_companion_reg` notification and send companion_finish.
+async fn pairing_code_send_finish(
+    sender: &crate::socket::SocketSender,
+    auth_mgr: &mut AuthManager,
+    notification: &crate::binary::BinaryNode,
+    pairing_code: &str,
+) -> Result<()> {
+    use crate::binary::{BinaryNode, NodeContent};
+    use rand::RngCore;
+
+    // Find the inner link_code_companion_reg child
+    let inner = match &notification.content {
+        NodeContent::List(ch) => ch.iter().find(|n| n.tag == "link_code_companion_reg").cloned(),
+        _ => None,
+    }.ok_or_else(|| anyhow::anyhow!("no link_code_companion_reg in notification"))?;
+
+    let get_bytes = |tag: &str| -> Result<Vec<u8>> {
+        match &inner.content {
+            NodeContent::List(ch) => ch.iter()
+                .find(|n| n.tag == tag)
+                .and_then(|n| match &n.content {
+                    NodeContent::Bytes(b) => Some(b.clone()),
+                    NodeContent::Text(t) => Some(t.as_bytes().to_vec()),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow::anyhow!("missing {} in link_code_companion_reg", tag)),
+            _ => Err(anyhow::anyhow!("empty link_code_companion_reg")),
+        }
+    };
+
+    let link_ref          = get_bytes("link_code_pairing_ref")?;
+    let primary_id_pub    = get_bytes("primary_identity_pub")?;
+    let wrapped_primary   = get_bytes("link_code_pairing_wrapped_primary_ephemeral_pub")?;
+
+    // Decipher phone's ephemeral public key
+    let code_pairing_pub  = decipher_link_public_key(pairing_code, &wrapped_primary)?;
+
+    let pairing_priv      = auth_mgr.creds().pairing_ephemeral_key.private;
+    let identity_priv     = auth_mgr.creds().signed_identity_key.private;
+    let identity_pub      = auth_mgr.creds().signed_identity_key.public;
+
+    let companion_shared  = x25519_dh(&pairing_priv, &code_pairing_pub);
+
+    let mut random_bytes  = [0u8; 32];
+    let mut link_salt     = [0u8; 32];
+    let mut encrypt_iv    = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut random_bytes);
+    rand::rngs::OsRng.fill_bytes(&mut link_salt);
+    rand::rngs::OsRng.fill_bytes(&mut encrypt_iv);
+
+    let link_key = hkdf_sha256(
+        &companion_shared,
+        Some(&link_salt),
+        b"link_code_pairing_key_bundle_encryption_key",
+        32,
+    );
+    let link_key_arr: [u8; 32] = link_key.try_into().unwrap();
+
+    let primary_id_pub_arr: [u8; 32] = primary_id_pub.as_slice().try_into()
+        .map_err(|_| anyhow::anyhow!("primary_identity_pub wrong length"))?;
+
+    let mut encrypt_payload = Vec::with_capacity(96);
+    encrypt_payload.extend_from_slice(&identity_pub);
+    encrypt_payload.extend_from_slice(&primary_id_pub_arr);
+    encrypt_payload.extend_from_slice(&random_bytes);
+
+    let encrypted = aes256_gcm_encrypt(&encrypt_payload, &link_key_arr, &encrypt_iv);
+
+    let mut encrypted_bundle = Vec::with_capacity(156);
+    encrypted_bundle.extend_from_slice(&link_salt);
+    encrypted_bundle.extend_from_slice(&encrypt_iv);
+    encrypted_bundle.extend_from_slice(&encrypted);
+
+    // Derive new adv_secret_key
+    let identity_shared = x25519_dh(&identity_priv, &primary_id_pub_arr);
+    let mut identity_payload = Vec::with_capacity(96);
+    identity_payload.extend_from_slice(&companion_shared);
+    identity_payload.extend_from_slice(&identity_shared);
+    identity_payload.extend_from_slice(&random_bytes);
+    let new_adv = hkdf_sha256(&identity_payload, None, b"adv_secret", 32);
+    auth_mgr.creds_mut().adv_secret_key = new_adv;
+
+    let our_jid = auth_mgr.creds().me.as_ref()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+
+    let id = sender.next_id();
+    let node = BinaryNode {
+        tag: "iq".to_string(),
+        attrs: vec![
+            ("id".to_string(), id),
+            ("to".to_string(), "s.whatsapp.net".to_string()),
+            ("type".to_string(), "set".to_string()),
+            ("xmlns".to_string(), "md".to_string()),
+        ],
+        content: NodeContent::List(vec![BinaryNode {
+            tag: "link_code_companion_reg".to_string(),
+            attrs: vec![
+                ("jid".to_string(), our_jid),
+                ("stage".to_string(), "companion_finish".to_string()),
+            ],
+            content: NodeContent::List(vec![
+                BinaryNode {
+                    tag: "link_code_pairing_wrapped_key_bundle".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Bytes(encrypted_bundle),
+                },
+                BinaryNode {
+                    tag: "companion_identity_public".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Bytes(identity_pub.to_vec()),
+                },
+                BinaryNode {
+                    tag: "link_code_pairing_ref".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Bytes(link_ref),
+                },
+            ]),
+        }]),
+    };
+
+    sender.send_node(&node).await?;
+    Ok(())
+}
+
+// ── Background session loop ───────────────────────────────────────────────────
+
+type SharedCreds = Arc<tokio::sync::Mutex<crate::auth::credentials::AuthCredentials>>;
+
+/// Runs recv + keepalive for the current connection, then reconnects on drop.
+async fn run_session_loop(
+    receiver: socket::SocketReceiver,
+    initial_mgr: Arc<MessageManager>,
+    current_mgr: Arc<RwLock<Arc<MessageManager>>>,
+    event_tx: broadcast::Sender<MessageEvent>,
+    creds: SharedCreds,
+    store: Arc<FileStore>,
+    our_jid: String,
+    contacts: Arc<ContactStore>,
+    msg_store: Arc<MessageStore>,
+    poll_store: Arc<PollStore>,
+    outbox: Arc<OutboxStore>,
+) {
+    if !run_one_connection(receiver, initial_mgr, creds.clone(), store.clone()).await {
+        return; // permanent failure — don't reconnect
+    }
+
+    // Reconnect loop with exponential backoff
+    let mut backoff = Duration::from_secs(2);
+    loop {
+        info!("reconnecting in {backoff:?}…");
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+
+        let (sender, receiver) = {
+            let c = creds.lock().await;
+            match socket::connect(&*c).await {
+                Ok(pair) => { backoff = Duration::from_secs(2); pair }
+                Err(e) => { warn!("reconnect failed: {e}"); continue; }
+            }
+        };
+        let sender = Arc::new(sender);
+        // Pre-key upload deferred to <success> handler (session not authenticated yet).
+
+        let signal = {
+            let c = creds.lock().await;
+            Arc::new(SignalRepository::new(&*c, store.clone()))
+        };
+        let mgr = Arc::new(MessageManager::with_stores(
+            sender, signal, our_jid.clone(), event_tx.clone(),
+            contacts.clone(), msg_store.clone(), poll_store.clone(), outbox.clone(),
+        ));
+
+        *current_mgr.write().await = mgr.clone();
+        info!("reconnected as {our_jid}");
+
+        // Retry any messages that failed during the previous connection
+        let pending = outbox.pending();
+        if !pending.is_empty() {
+            info!("{} outbox entries, retrying after reconnect", pending.len());
+            let mgr_retry = mgr.clone();
+            tokio::spawn(async move {
+                for (jid, msg) in pending {
+                    mgr_retry.retry_outbox_entry(&jid, msg).await;
+                }
+            });
+        }
+
+        if !run_one_connection(receiver, mgr, creds.clone(), store.clone()).await {
+            warn!("permanent disconnect — stopping reconnect loop");
+            return;
+        }
+    }
+}
+
+/// Drive a single connection to completion (recv loop + keepalive + pre-key rotation).
+/// Returns `true` if the caller should reconnect, `false` if a permanent failure occurred.
+async fn run_one_connection(
+    mut receiver: socket::SocketReceiver,
+    mgr: Arc<MessageManager>,
+    creds: SharedCreds,
+    store: Arc<FileStore>,
+) -> bool {
+    let ping_socket = mgr.socket.clone();
+    let keepalive = tokio::spawn(async move {
+        use crate::binary::{BinaryNode, NodeContent};
+        let mut interval = tokio::time::interval(Duration::from_secs(25));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let id = ping_socket.next_id();
+            let ping = BinaryNode {
+                tag: "iq".to_string(),
+                attrs: vec![
+                    ("id".to_string(), id),
+                    ("xmlns".to_string(), "w:p".to_string()),
+                    ("type".to_string(), "get".to_string()),
+                    ("to".to_string(), "s.whatsapp.net".to_string()),
+                ],
+                content: NodeContent::List(vec![BinaryNode {
+                    tag: "ping".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::None,
+                }]),
+            };
+            if ping_socket.send_node(&ping).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Proactive key rotation: every 6 hours check OTK count; every 7 days rotate SPK.
+    let rot_socket = mgr.socket.clone();
+    let rot_creds  = creds.clone();
+    let rot_store  = store.clone();
+    let rotation = tokio::spawn(async move {
+        const OTK_THRESHOLD: u32    = 10;
+        const SPK_INTERVAL_SECS: u64 = 7 * 24 * 3600;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
+        interval.tick().await; // discard the immediate first tick
+        loop {
+            interval.tick().await;
+
+            // ── OTK check ────────────────────────────────────────────────────
+            match socket::prekey::query_pre_key_count(&rot_socket).await {
+                Ok(count) if count < OTK_THRESHOLD => {
+                    info!("proactive OTK rotation: {count} keys left, uploading batch");
+                    let mut c = rot_creds.lock().await;
+                    if let Err(e) = socket::prekey::upload_pre_keys(&rot_socket, &mut *c, rot_store.as_ref()).await {
+                        warn!("OTK upload failed: {e}");
+                    }
+                }
+                Ok(count) => debug!("OTK count OK: {count}"),
+                Err(e) => {
+                    warn!("OTK count query failed: {e}");
+                    break; // connection dead; stop the task
+                }
+            }
+
+            // ── SPK rotation ─────────────────────────────────────────────────
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let spk_age = {
+                let c = rot_creds.lock().await;
+                if c.spk_last_rotated == 0 { SPK_INTERVAL_SECS + 1 } // never rotated
+                else { now.saturating_sub(c.spk_last_rotated) }
+            };
+            if spk_age >= SPK_INTERVAL_SECS {
+                info!("SPK age {spk_age}s ≥ 7 days, rotating signed pre-key");
+                let mut c = rot_creds.lock().await;
+                if let Err(e) = socket::prekey::rotate_signed_pre_key(&rot_socket, &mut *c, rot_store.as_ref()).await {
+                    warn!("SPK rotation failed: {e}");
+                }
+            }
+        }
+    });
+
+    let mut event_rx = mgr.subscribe();
+    let mut should_reconnect = true;
+
+    loop {
+        tokio::select! {
+            // Drain event bus to watch for permanent disconnects
+            ev = event_rx.recv() => {
+                if let Ok(MessageEvent::Disconnected { reconnect, .. }) = ev {
+                    should_reconnect = reconnect;
+                    if !reconnect {
+                        break;
+                    }
+                }
+            }
+            node_result = receiver.recv_node() => {
+                match node_result {
+                    Ok(Some(node)) => {
+                        tracing::debug!(tag = %node.tag, attrs = ?node.attrs, "← node");
+
+                        // Login confirmation — session is authenticated and
+                        // usable NOW. Emit Connected immediately so send-path
+                        // code can unblock; background tasks (OTK upload +
+                        // passive-active) finish asynchronously and WA won't
+                        // reject messages while they run.
+                        if node.tag == "success" {
+                            info!("login success ({})", node.attr("lid").unwrap_or("no lid"));
+                            let _ = mgr.event_tx.send(MessageEvent::Connected);
+
+                            let sock = mgr.socket.clone();
+                            let cr   = creds.clone();
+                            let st   = store.clone();
+                            tokio::spawn(async move {
+                                let need = socket::prekey::query_pre_key_count(&sock).await
+                                    .map(|c| c < 10)
+                                    .unwrap_or(true);
+                                if need {
+                                    let mut c = cr.lock().await;
+                                    if let Err(e) = socket::prekey::upload_pre_keys(
+                                        &sock, &mut *c, st.as_ref(),
+                                    ).await {
+                                        warn!("pre-key upload after success: {e}");
+                                    }
+                                }
+                                if let Err(e) = sock.send_passive_active().await {
+                                    warn!("passive active iq failed: {e}");
+                                }
+                            });
+                        }
+
+                        if let Some(count) = crate::messages::recv::extract_encrypt_count(&node) {
+                            if count < 5 {
+                                info!("server OTK count low ({count}), uploading new batch");
+                                let mut c = creds.lock().await;
+                                if let Err(e) = socket::prekey::upload_pre_keys(&mgr.socket, &mut *c, store.as_ref()).await {
+                                    warn!("pre-key upload on low count: {e}");
+                                }
+                            }
+                        }
+                        if let Err(e) = mgr.handle_node(&node).await {
+                            debug!("handle_node: {e}");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        debug!("recv: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    keepalive.abort();
+    rotation.abort();
+    should_reconnect
+}
+
+// ── Session ───────────────────────────────────────────────────────────────────
+
+/// A live authenticated session.
+///
+/// All methods are cheap — they read-lock the current `MessageManager` which
+/// is swapped atomically on each reconnect.
+pub struct Session {
+    mgr: Arc<RwLock<Arc<MessageManager>>>,
+    event_tx: broadcast::Sender<MessageEvent>,
+    pub our_jid: String,
+    contacts: Arc<ContactStore>,
+    msg_store: Arc<MessageStore>,
+    #[allow(dead_code)]
+    poll_store: Arc<PollStore>,
+    creds: SharedCreds,
+    store: Arc<FileStore>,
+    bg_handle: tokio::task::AbortHandle,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.bg_handle.abort();
+    }
+}
+
+#[allow(dead_code)]
+impl Session {
+    // ── Events ────────────────────────────────────────────────────────────────
+
+    /// Subscribe to all incoming events.
+    /// The same channel is reused across reconnects so no events are missed.
+    pub fn events(&self) -> broadcast::Receiver<MessageEvent> {
+        self.event_tx.subscribe()
+    }
+
+    // ── Sending ───────────────────────────────────────────────────────────────
+
+    pub async fn send_text(&self, jid: &str, text: &str) -> Result<String> {
+        self.mgr.read().await.send_text(jid, text).await
+    }
+
+    pub async fn send_reply(&self, jid: &str, reply_to_id: &str, text: &str) -> Result<String> {
+        self.mgr.read().await.send_reply(jid, reply_to_id, text).await
+    }
+
+    pub async fn send_reaction(&self, jid: &str, target_id: &str, emoji: &str) -> Result<()> {
+        self.mgr.read().await.send_reaction(jid, target_id, emoji).await
+    }
+
+    pub async fn send_mention(
+        &self,
+        jid: &str,
+        text: &str,
+        mention_jids: &[&str],
+    ) -> Result<String> {
+        self.mgr.read().await.send_mention(jid, text, mention_jids).await
+    }
+
+    pub async fn send_revoke(&self, jid: &str, msg_id: &str) -> Result<()> {
+        self.mgr.read().await.send_revoke(jid, msg_id).await
+    }
+
+    pub async fn send_edit(&self, jid: &str, msg_id: &str, new_text: &str) -> Result<()> {
+        self.mgr.read().await.send_edit(jid, msg_id, new_text).await
+    }
+
+    pub async fn send_poll_vote(
+        &self,
+        jid: &str,
+        poll_msg_id: &str,
+        selected_options: &[&str],
+    ) -> Result<()> {
+        self.mgr.read().await.send_poll_vote(jid, poll_msg_id, selected_options).await
+    }
+
+    pub async fn send_image(
+        &self, jid: &str, data: &[u8], caption: Option<&str>,
+    ) -> Result<String> {
+        self.mgr.read().await.send_image(jid, data, caption).await
+    }
+
+    pub async fn send_video(
+        &self, jid: &str, data: &[u8], caption: Option<&str>,
+    ) -> Result<String> {
+        self.mgr.read().await.send_video(jid, data, caption).await
+    }
+
+    pub async fn send_audio(&self, jid: &str, data: &[u8], mimetype: &str) -> Result<String> {
+        self.mgr.read().await.send_audio(jid, data, mimetype).await
+    }
+
+    pub async fn send_document(
+        &self, jid: &str, data: &[u8], mimetype: &str, file_name: &str,
+    ) -> Result<String> {
+        self.mgr.read().await.send_document(jid, data, mimetype, file_name).await
+    }
+
+    pub async fn send_sticker(&self, jid: &str, data: &[u8]) -> Result<String> {
+        self.mgr.read().await.send_sticker(jid, data).await
+    }
+
+    pub async fn send_poll(
+        &self,
+        jid: &str,
+        question: &str,
+        options: &[&str],
+        selectable_count: u32,
+    ) -> Result<String> {
+        self.mgr.read().await.send_poll(jid, question, options, selectable_count).await
+    }
+
+    pub async fn send_link_preview(
+        &self,
+        jid: &str,
+        text: &str,
+        url: &str,
+        title: &str,
+        description: &str,
+        thumbnail_jpeg: Option<Vec<u8>>,
+    ) -> Result<String> {
+        self.mgr.read().await
+            .send_link_preview(jid, text, url, title, description, thumbnail_jpeg)
+            .await
+    }
+
+    pub async fn send_group_text(&self, group_jid: &str, text: &str) -> Result<String> {
+        self.mgr.read().await.send_group_text(group_jid, text).await
+    }
+
+    /// Post a text status update visible to all contacts.
+    pub async fn send_status_text(&self, text: &str) -> Result<String> {
+        self.mgr.read().await.send_status_text(text).await
+    }
+
+    pub async fn send_status_image(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
+        self.mgr.read().await.send_status_image(data, caption).await
+    }
+
+    pub async fn send_status_video(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
+        self.mgr.read().await.send_status_video(data, caption).await
+    }
+
+    pub async fn forward_message(
+        &self,
+        to_jid: &str,
+        from_jid: &str,
+        msg_id: &str,
+    ) -> Result<String> {
+        self.mgr.read().await.forward_message(to_jid, from_jid, msg_id).await
+    }
+
+    pub async fn set_ephemeral_duration(&self, jid: &str, expiration_secs: u32) -> Result<()> {
+        self.mgr.read().await.set_ephemeral_duration(jid, expiration_secs).await
+    }
+
+    pub async fn group_info(
+        &self,
+        group_jid: &str,
+    ) -> Result<crate::socket::group::GroupInfo> {
+        self.mgr.read().await.group_info(group_jid).await
+    }
+
+    // ── Privacy settings ─────────────────────────────────────────────────────
+
+    /// Fetch current privacy settings from the server.
+    pub async fn fetch_privacy(
+        &self,
+    ) -> Result<crate::socket::privacy::PrivacySettings> {
+        let socket = self.mgr.read().await.socket.clone();
+        crate::socket::privacy::fetch_privacy(&socket).await
+    }
+
+    /// Update privacy settings.  Only fields set to `Some(...)` are changed.
+    /// Use `PrivacyPatch::default()` as the base and override only what you need.
+    pub async fn set_privacy(
+        &self,
+        patch: crate::socket::privacy::PrivacyPatch,
+    ) -> Result<()> {
+        let socket = self.mgr.read().await.socket.clone();
+        crate::socket::privacy::set_privacy(&socket, &patch).await
+    }
+
+    // ── Key management ───────────────────────────────────────────────────────
+
+    /// Manually rotate the signed pre-key now (normally done automatically every 7 days).
+    pub async fn rotate_signed_pre_key(&self) -> Result<()> {
+        let socket = self.mgr.read().await.socket.clone();
+        let mut c = self.creds.lock().await;
+        socket::prekey::rotate_signed_pre_key(&socket, &mut *c, self.store.as_ref()).await
+    }
+
+    // ── Receipts & presence ───────────────────────────────────────────────────
+
+    pub async fn mark_read(&self, keys: &[MessageKey]) -> Result<()> {
+        self.mgr.read().await.read_messages(keys).await
+    }
+
+    pub async fn send_typing(&self, jid: &str, composing: bool) -> Result<()> {
+        self.mgr.read().await.send_typing(jid, composing).await
+    }
+
+    pub async fn send_presence(&self, available: bool) -> Result<()> {
+        self.mgr.read().await.send_presence(available).await
+    }
+
+    /// Subscribe to presence updates for a contact (online/offline notifications).
+    pub async fn subscribe_contact_presence(&self, jid: &str) -> Result<()> {
+        self.mgr.read().await.subscribe_contact_presence(jid).await
+    }
+
+    /// Mark a WhatsApp Status (story) as viewed.
+    pub async fn mark_status_viewed(&self, sender_jid: &str, msg_id: &str) -> Result<()> {
+        self.mgr.read().await.mark_status_viewed(sender_jid, msg_id).await
+    }
+
+    /// Fetch the list of JIDs you have blocked.
+    pub async fn fetch_blocklist(&self) -> Result<Vec<String>> {
+        self.mgr.read().await.fetch_blocklist().await
+    }
+
+    /// Block a contact.
+    pub async fn block_contact(&self, jid: &str) -> Result<()> {
+        self.mgr.read().await.block_contact(jid).await
+    }
+
+    /// Unblock a contact.
+    pub async fn unblock_contact(&self, jid: &str) -> Result<()> {
+        self.mgr.read().await.unblock_contact(jid).await
+    }
+
+    // ── Contacts ──────────────────────────────────────────────────────────────
+
+    /// Look up a cached display name for a JID.
+    pub fn contact_name(&self, jid: &str) -> Option<String> {
+        self.contacts.get(jid)
+    }
+
+    /// Snapshot of all known contacts.
+    pub fn contacts_snapshot(&self) -> std::collections::HashMap<String, String> {
+        self.contacts.snapshot()
+    }
+
+    /// Flush contact cache to disk.
+    pub fn save_contacts(&self) {
+        self.contacts.save();
+    }
+
+    /// Last `n` stored messages for a JID (oldest first, most-recent last).
+    pub fn message_history(&self, jid: &str, n: usize) -> Vec<crate::message_store::StoredMessage> {
+        self.msg_store.recent(jid, n)
+    }
+
+    /// All JIDs that have at least one stored message.
+    pub fn known_chats(&self) -> Vec<String> {
+        self.msg_store.known_jids()
+    }
+
+    // ── Media ─────────────────────────────────────────────────────────────────
+
+    pub async fn download_media(
+        &self,
+        info: &crate::messages::MediaInfo,
+        media_type: crate::media::MediaType,
+    ) -> Result<Vec<u8>> {
+        self.mgr.read().await.download_media(info, media_type).await
+    }
+
+    /// Download media for a stored message by JID + message ID.
+    /// Returns the raw decrypted bytes, or an error if the message is not found,
+    /// is not a media message, or the download fails.
+    pub async fn download_media_by_id(&self, jid: &str, msg_id: &str) -> Result<Vec<u8>> {
+        let stored = self.msg_store.lookup(jid, msg_id)
+            .ok_or_else(|| anyhow::anyhow!("message {msg_id} not found in {jid}"))?;
+        let info = stored.media_info
+            .ok_or_else(|| anyhow::anyhow!("message {msg_id} is not a media message"))?;
+        let media_type = match stored.media_type.as_deref() {
+            Some("image")    => crate::media::MediaType::Image,
+            Some("video")    => crate::media::MediaType::Video,
+            Some("audio")    => crate::media::MediaType::Audio,
+            Some("sticker")  => crate::media::MediaType::Sticker,
+            _                => crate::media::MediaType::Document,
+        };
+        self.download_media(&info, media_type).await
+    }
+
+    // ── Contact / usync ───────────────────────────────────────────────────────
+
+    /// Check if phone numbers are registered on WhatsApp.
+    /// `phones` — E.164 digits without `+`, e.g. `["5491112345678"]`.
+    pub async fn on_whatsapp(
+        &self, phones: &[&str],
+    ) -> Result<Vec<crate::socket::usync::ContactInfo>> {
+        self.mgr.read().await.on_whatsapp(phones).await
+    }
+
+    /// Resolve JIDs to `ContactInfo` (on_whatsapp + status text).
+    /// Results are cached in `ContactStore` for future use.
+    pub async fn resolve_contacts(
+        &self, jids: &[&str],
+    ) -> Result<std::collections::HashMap<String, crate::socket::usync::ContactInfo>> {
+        let result = self.mgr.read().await.resolve_contacts(jids).await?;
+        // Cache display names from usync results
+        let entries: Vec<(String, String)> = result
+            .iter()
+            .filter_map(|(jid, info)| {
+                // Use the JID itself as a fallback name only when the contact is registered
+                if info.on_whatsapp { Some((jid.clone(), jid.clone())) } else { None }
+            })
+            .collect();
+        if !entries.is_empty() {
+            self.contacts.bulk_upsert(&entries);
+            self.contacts.save();
+        }
+        Ok(result)
+    }
+
+    /// Like `resolve_contacts` but skips the network for JIDs already in the contact cache.
+    pub async fn resolve_contacts_cached(
+        &self,
+        jids: &[&str],
+    ) -> Result<std::collections::HashMap<String, crate::socket::usync::ContactInfo>> {
+        use crate::socket::usync::ContactInfo;
+        let mut result = std::collections::HashMap::new();
+        let mut unknown: Vec<&str> = Vec::new();
+
+        for &jid in jids {
+            if let Some(name) = self.contacts.get(jid) {
+                result.insert(jid.to_string(), ContactInfo {
+                    jid: jid.to_string(),
+                    on_whatsapp: true,
+                    status: None,
+                });
+                let _ = name; // name is in the cache but ContactInfo doesn't carry it
+            } else {
+                unknown.push(jid);
+            }
+        }
+
+        if !unknown.is_empty() {
+            let fresh = self.resolve_contacts(&unknown).await?;
+            result.extend(fresh);
+        }
+        Ok(result)
+    }
+
+    /// Fetch status text for a list of JIDs.
+    pub async fn fetch_status(
+        &self, jids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        self.mgr.read().await.fetch_status(jids).await
+    }
+
+    // ── Group management ──────────────────────────────────────────────────────
+
+    pub async fn create_group(
+        &self,
+        subject: &str,
+        participant_jids: &[&str],
+    ) -> Result<crate::socket::group::GroupInfo> {
+        self.mgr.read().await.create_group(subject, participant_jids).await
+    }
+
+    pub async fn add_participants(
+        &self,
+        group_jid: &str,
+        jids: &[&str],
+    ) -> Result<Vec<crate::socket::group::ParticipantResult>> {
+        self.mgr.read().await.add_participants(group_jid, jids).await
+    }
+
+    pub async fn remove_participants(
+        &self,
+        group_jid: &str,
+        jids: &[&str],
+    ) -> Result<Vec<crate::socket::group::ParticipantResult>> {
+        self.mgr.read().await.remove_participants(group_jid, jids).await
+    }
+
+    pub async fn promote_to_admin(
+        &self,
+        group_jid: &str,
+        jids: &[&str],
+    ) -> Result<Vec<crate::socket::group::ParticipantResult>> {
+        self.mgr.read().await.promote_to_admin(group_jid, jids).await
+    }
+
+    pub async fn demote_from_admin(
+        &self,
+        group_jid: &str,
+        jids: &[&str],
+    ) -> Result<Vec<crate::socket::group::ParticipantResult>> {
+        self.mgr.read().await.demote_from_admin(group_jid, jids).await
+    }
+
+    pub async fn leave_group(&self, group_jid: &str) -> Result<()> {
+        self.mgr.read().await.leave_group(group_jid).await
+    }
+
+    pub async fn set_group_subject(&self, group_jid: &str, subject: &str) -> Result<()> {
+        self.mgr.read().await.set_group_subject(group_jid, subject).await
+    }
+
+    pub async fn set_group_description(&self, group_jid: &str, description: &str) -> Result<()> {
+        self.mgr.read().await.set_group_description(group_jid, description).await
+    }
+
+    pub async fn subscribe_group_presence(&self, group_jid: &str) -> Result<()> {
+        self.mgr.read().await.subscribe_group_presence(group_jid).await
+    }
+
+    // ── Profile pictures ──────────────────────────────────────────────────────
+
+    pub async fn get_profile_picture(
+        &self,
+        jid: &str,
+        high_res: bool,
+    ) -> Result<Option<String>> {
+        self.mgr.read().await.get_profile_picture(jid, high_res).await
+    }
+
+    pub async fn set_profile_picture(&self, jpeg_data: &[u8]) -> Result<()> {
+        self.mgr.read().await.set_profile_picture(jpeg_data).await
+    }
+}

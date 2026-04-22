@@ -1,0 +1,26 @@
+# Git worktrees
+.worktrees/
+
+# Rust build artifacts
+/target/
+/Cargo.lock
+
+# Local state (secrets + per-machine data)
+/device_cache.json
+**/creds.json
+**/sessions.json
+**/pre-keys/
+**/messages/
+**/daemon.json
+
+# Test debug
+*.log
+Z07*
+captura_*
+bible_*.json
+*.backup.*.json
+
+# Reference only — not shipped
+/Baileys/
+/proto/
+/PENDIENTES.md
