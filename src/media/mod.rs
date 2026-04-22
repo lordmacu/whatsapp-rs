@@ -24,6 +24,7 @@ pub enum MediaType {
     Document,
     Sticker,
     HistorySync,
+    AppState,
 }
 
 impl MediaType {
@@ -34,6 +35,7 @@ impl MediaType {
             MediaType::Audio => b"WhatsApp Audio Keys",
             MediaType::Document => b"WhatsApp Document Keys",
             MediaType::HistorySync => b"WhatsApp History Keys",
+            MediaType::AppState => b"WhatsApp App State Keys",
         }
     }
 }

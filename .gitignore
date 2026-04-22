@@ -5,13 +5,17 @@
 /target/
 /Cargo.lock
 
-# Local state (secrets + per-machine data)
+# Local state (secrets + per-machine data) — these live in the runtime
+# data dir (~/.local/share/.whatsapp-rs), never in the repo tree.
+# The leading `/.whatsapp-rs/` scope keeps us from matching `src/messages/`.
+/.whatsapp-rs/
 /device_cache.json
 **/creds.json
 **/sessions.json
 **/pre-keys/
-**/messages/
 **/daemon.json
+**/app-state-keys.json
+**/app-state/
 
 # Test debug
 *.log

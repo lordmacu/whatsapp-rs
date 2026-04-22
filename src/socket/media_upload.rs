@@ -23,6 +23,7 @@ pub async fn request_upload_url(
         MediaType::Audio => "audio",
         MediaType::Document => "document",
         MediaType::HistorySync => "md-msg-hist",
+        MediaType::AppState => "md-app-state",
     };
     let id = sender.next_id();
     let node = BinaryNode {

@@ -639,6 +639,51 @@ fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
+/// Parse protobuf wire format preserving repeated fields (same tag appearing
+/// multiple times). Returned as a flat list of (field_number, value_bytes).
+///
+/// For length-delimited fields (wire type 2) `value_bytes` is the payload.
+/// For varints (type 0) `value_bytes` is the re-encoded varint (so callers
+/// can run `read_varint_from_bytes` on it uniformly).
+pub fn parse_proto_fields_repeated(data: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, n) = read_varint_at(data, pos)?;
+        pos += n;
+        let field = tag >> 3;
+        match tag & 7 {
+            0 => {
+                let (v, n) = read_varint_at(data, pos)?;
+                pos += n;
+                let mut buf = Vec::new();
+                write_varint(&mut buf, v);
+                out.push((field, buf));
+            }
+            1 => {
+                if pos + 8 > data.len() { return None; }
+                out.push((field, data[pos..pos + 8].to_vec()));
+                pos += 8;
+            }
+            2 => {
+                let (len, n) = read_varint_at(data, pos)?;
+                pos += n;
+                let end = pos + len as usize;
+                if end > data.len() { return None; }
+                out.push((field, data[pos..end].to_vec()));
+                pos = end;
+            }
+            5 => {
+                if pos + 4 > data.len() { return None; }
+                out.push((field, data[pos..pos + 4].to_vec()));
+                pos += 4;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 pub fn parse_proto_fields(data: &[u8]) -> Option<std::collections::HashMap<u64, Vec<u8>>> {
     let mut map = std::collections::HashMap::new();
     let mut pos = 0;
@@ -753,6 +798,9 @@ pub enum ProtocolMessagePayload {
     EphemeralSetting { expiration_secs: u32 },
     HistorySync(HistorySyncNotification),
     MessageEdit { key: RevokeKey, new_text: String },
+    /// Primary device shared app-state sync keys with us. Each entry is
+    /// `(keyId, keyData, timestamp_ms)`.
+    AppStateSyncKeyShare(Vec<(Vec<u8>, Vec<u8>, i64)>),
     Unknown(u32),
 }
 
@@ -792,6 +840,11 @@ pub fn decode_protocol_message(data: &[u8]) -> Option<ProtocolMessagePayload> {
             // HISTORY_SYNC_NOTIFICATION — handled by decode_history_sync_notification
             let hsn = decode_hsn_from_pm(&pm)?;
             Some(ProtocolMessagePayload::HistorySync(hsn))
+        }
+        6 => {
+            // APP_STATE_SYNC_KEY_SHARE — field 7 = appStateSyncKeyShare { repeated keys = 1 }
+            let shares = crate::app_state::proto::decode_app_state_sync_key_share(&pm);
+            Some(ProtocolMessagePayload::AppStateSyncKeyShare(shares))
         }
         14 => {
             // MESSAGE_EDIT — field 1 = key of original, field 14 = editedMessage

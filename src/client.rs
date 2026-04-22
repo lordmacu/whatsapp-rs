@@ -78,6 +78,8 @@ impl Client {
         let msg_store  = Arc::new(MessageStore::new(base)?);
         let poll_store = Arc::new(PollStore::new(base)?);
         let outbox     = Arc::new(OutboxStore::new(base)?);
+        let app_state_keys    = crate::app_state::AppStateKeyStore::new(base)?;
+        let app_state_colls   = crate::app_state::CollectionStore::new(base)?;
 
         // Initial connection. Do NOT send any IQ yet — server hasn't authenticated us
         // until it emits <success>. Pre-key upload / passive-active happen in the recv
@@ -89,10 +91,20 @@ impl Client {
         let creds: SharedCreds = Arc::new(tokio::sync::Mutex::new(auth_mgr.creds().clone()));
         let signal = Arc::new(SignalRepository::new(&*creds.lock().await, self.store.clone()));
 
-        let mgr = Arc::new(MessageManager::with_stores(
-            sender, signal, our_jid.clone(), event_tx.clone(),
-            contacts.clone(), msg_store.clone(), poll_store.clone(), outbox.clone(),
-        ));
+        let app_state_sync = Arc::new(crate::app_state::AppStateSync {
+            sender: sender.clone(),
+            keys: app_state_keys.clone(),
+            collections: app_state_colls.clone(),
+            event_tx: event_tx.clone(),
+        });
+
+        let mgr = Arc::new(
+            MessageManager::with_stores(
+                sender, signal, our_jid.clone(), event_tx.clone(),
+                contacts.clone(), msg_store.clone(), poll_store.clone(), outbox.clone(),
+            )
+            .with_app_state(app_state_keys.clone(), app_state_sync.clone()),
+        );
         let current_mgr: Arc<RwLock<Arc<MessageManager>>> = Arc::new(RwLock::new(mgr.clone()));
 
         info!("connected as {our_jid}");
@@ -641,10 +653,22 @@ async fn run_session_loop(
             let c = creds.lock().await;
             Arc::new(SignalRepository::new(&*c, store.clone()))
         };
-        let mgr = Arc::new(MessageManager::with_stores(
-            sender, signal, our_jid.clone(), event_tx.clone(),
-            contacts.clone(), msg_store.clone(), poll_store.clone(), outbox.clone(),
-        ));
+        let base = store.base_dir();
+        let app_state_keys  = crate::app_state::AppStateKeyStore::new(base).expect("app-state keys");
+        let app_state_colls = crate::app_state::CollectionStore::new(base).expect("app-state colls");
+        let app_state_sync = Arc::new(crate::app_state::AppStateSync {
+            sender: sender.clone(),
+            keys: app_state_keys.clone(),
+            collections: app_state_colls.clone(),
+            event_tx: event_tx.clone(),
+        });
+        let mgr = Arc::new(
+            MessageManager::with_stores(
+                sender, signal, our_jid.clone(), event_tx.clone(),
+                contacts.clone(), msg_store.clone(), poll_store.clone(), outbox.clone(),
+            )
+            .with_app_state(app_state_keys, app_state_sync),
+        );
 
         *current_mgr.write().await = mgr.clone();
         info!("reconnected as {our_jid}");
@@ -780,6 +804,19 @@ async fn run_one_connection(
                         if node.tag == "success" {
                             info!("login success ({})", node.attr("lid").unwrap_or("no lid"));
                             let _ = mgr.event_tx.send(MessageEvent::Connected);
+
+                            // Fire-and-forget app-state resync if we already have keys.
+                            // Fresh installs won't: the primary will push them via
+                            // `appStateSyncKeyShare` and we'll resync from there.
+                            if let Some(sync) = mgr.app_state_sync.clone() {
+                                if let Some(keys) = mgr.app_state_keys.as_ref() {
+                                    if !keys.is_empty() {
+                                        tokio::spawn(async move {
+                                            let _ = sync.resync(crate::app_state::ALL_COLLECTIONS, true).await;
+                                        });
+                                    }
+                                }
+                            }
 
                             let sock = mgr.socket.clone();
                             let cr   = creds.clone();

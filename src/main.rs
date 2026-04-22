@@ -1,3 +1,4 @@
+mod app_state;
 mod auth;
 mod binary;
 mod client;
@@ -931,6 +932,7 @@ fn event_label(event: &MessageEvent) -> &'static str {
         MessageEvent::GroupUpdate { .. }    => "GroupUpdate",
         MessageEvent::Disconnected { .. }   => "Disconnected",
         MessageEvent::Connected             => "Connected",
+        MessageEvent::AppStateUpdate { .. } => "AppStateUpdate",
     }
 }
 
@@ -1039,6 +1041,9 @@ async fn print_event(session: &client::Session, event: MessageEvent) {
 
         MessageEvent::Disconnected { reason, reconnect } => {
             println!("[DISCONNECTED] reason={reason} reconnect={reconnect}");
+        }
+        MessageEvent::AppStateUpdate { collection, action } => {
+            println!("[app-state {collection}] {action:?}");
         }
         MessageEvent::Receipt { .. }
         | MessageEvent::MessageUpdate { .. }
