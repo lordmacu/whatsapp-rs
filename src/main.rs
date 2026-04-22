@@ -4,6 +4,7 @@ mod client;
 mod contacts;
 mod daemon;
 mod device_cache;
+mod install;
 mod media;
 mod message_store;
 mod messages;
@@ -91,6 +92,8 @@ async fn main() -> Result<()> {
     match cmd {
         "daemon" => daemon::run_daemon().await,
         "daemon-stop" => cmd_daemon_stop().await,
+        "install" => install::install_autostart(),
+        "uninstall" => install::uninstall_autostart(),
         "listen" => cmd_listen().await,
         "send" => {
             if args.len() < 3 {
