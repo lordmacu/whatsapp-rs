@@ -213,9 +213,21 @@ impl MessageManager {
                     self.decrypt_skmsg(&from, &decrypt_jid, &enc_bytes).await
                 }
                 _ => {
-                    // 1:1 Signal message (msg / pkmsg)
-                    match self.signal.decrypt_message(&decrypt_jid, &enc_bytes, &enc_type).await {
-                        Ok(plaintext) => {
+                    // 1:1 Signal message (msg / pkmsg). For LID addressing
+                    // the `from`/`participant` is user-level (no device),
+                    // so one user-LID entry in our session map actually
+                    // corresponds to a specific device that happened to
+                    // send the first pkmsg. When MAC mismatches, the
+                    // encrypting device is different — fall back to any
+                    // sibling session we already have (PN-keyed sessions
+                    // from when we sent to this user, or @lid entries for
+                    // other devices of the same user).
+                    let candidates = build_candidate_jids(&decrypt_jid, node, &self.signal);
+                    match self.signal
+                        .decrypt_with_candidates(&candidates, &enc_bytes, &enc_type)
+                        .await
+                    {
+                        Ok((plaintext, _winning_jid)) => {
                             self.maybe_process_skdm(&decrypt_jid, &plaintext);
                             Some(decode_plaintext(&plaintext))
                         }
@@ -925,6 +937,50 @@ pub fn extract_enc(node: &BinaryNode) -> Option<(Vec<u8>, String)> {
 
 /// Extract the list of collection names from a `<notification type="server_sync">`.
 /// Structure: `<notification><collection name="regular" version="…"/>…</notification>`.
+/// Build the ordered list of session JIDs to try decrypting with.
+///
+/// For a PN address we only ever need the exact JID. For a LID address we
+/// also try:
+///   1. every existing session under the same LID user (different devices);
+///   2. if the stanza carried `sender_pn` / `peer_recipient_pn`, every
+///      session we have for that PN user (populated earlier by outgoing
+///      sends to that number).
+///
+/// The first candidate that successfully decrypts wins.
+fn build_candidate_jids(
+    primary: &str,
+    node: &BinaryNode,
+    signal: &crate::signal::SignalRepository,
+) -> Vec<String> {
+    let mut out = vec![primary.to_string()];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(primary.to_string());
+
+    let mut add = |jid: String, acc: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+        if seen.insert(jid.clone()) {
+            acc.push(jid);
+        }
+    };
+
+    // Siblings of the primary JID (same user, different device).
+    for j in signal.sibling_jids(primary) {
+        add(j, &mut out, &mut seen);
+    }
+
+    // LID-specific fallbacks.
+    if primary.ends_with("@lid") {
+        for attr in &["sender_pn", "peer_recipient_pn"] {
+            if let Some(pn) = node.attr(attr) {
+                for j in signal.sibling_jids(pn) {
+                    add(j, &mut out, &mut seen);
+                }
+            }
+        }
+    }
+
+    out
+}
+
 fn extract_sync_collections(node: &BinaryNode) -> Vec<String> {
     let mut out = Vec::new();
     if let NodeContent::List(children) = &node.content {

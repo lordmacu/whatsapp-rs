@@ -325,6 +325,53 @@ impl SignalRepository {
     pub fn has_session(&self, jid: &str) -> bool {
         self.sessions.lock().map(|s| s.contains_key(jid)).unwrap_or(false)
     }
+
+    /// Return all session-store JIDs whose user part matches `user_jid`'s
+    /// user part, ignoring device slot. Useful for LID resolution: when a
+    /// message arrives as `X@lid` and we only have PN-keyed device sessions,
+    /// try each candidate.
+    pub fn sibling_jids(&self, user_jid: &str) -> Vec<String> {
+        let (user, server) = split_user_server(user_jid);
+        self.sessions
+            .lock()
+            .map(|s| {
+                s.keys()
+                    .filter(|k| {
+                        let (u, sv) = split_user_server(k);
+                        u == user && sv == server
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Try `decrypt_message` against a list of candidate JIDs and return
+    /// the plaintext + the JID that successfully decrypted. Used for LID
+    /// addressing where the stanza JID doesn't identify the device that
+    /// encrypted the payload.
+    pub async fn decrypt_with_candidates(
+        &self,
+        candidates: &[String],
+        ciphertext: &[u8],
+        msg_type: &str,
+    ) -> Result<(Vec<u8>, String)> {
+        let mut last_err: Option<anyhow::Error> = None;
+        for jid in candidates {
+            match self.decrypt_message(jid, ciphertext, msg_type).await {
+                Ok(pt) => return Ok((pt, jid.clone())),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no candidates")))
+    }
+}
+
+/// `"1234:5@lid" → ("1234", "lid")`, `"1234@s.whatsapp.net" → ("1234", "s.whatsapp.net")`.
+fn split_user_server(jid: &str) -> (&str, &str) {
+    let (left, server) = jid.split_once('@').unwrap_or((jid, ""));
+    let user = left.split_once(':').map(|(u, _)| u).unwrap_or(left);
+    (user, server)
 }
 
 // ── Decrypt ───────────────────────────────────────────────────────────────────
