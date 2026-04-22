@@ -40,27 +40,42 @@ Stop it:
 ./target/release/whatsapp-rs daemon-stop
 ```
 
-### Auto-start on login (Linux / systemd)
+> **Pair first.** The daemon has no terminal to show the QR, so it will
+> refuse to start until credentials exist. Run `whatsapp-rs listen` once,
+> scan the QR, press Ctrl+C; after that the daemon is free to start.
 
-Copy the unit file and enable:
+### Auto-start on login
+
+#### Linux (systemd)
+
 ```bash
 mkdir -p ~/.config/systemd/user
 cp contrib/whatsapp-rs.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now whatsapp-rs.service
-loginctl enable-linger "$USER"   # start at boot, not just login
-```
-
-Watch logs:
-```bash
+loginctl enable-linger "$USER"   # start at boot, not just at interactive login
 journalctl --user -u whatsapp-rs -f
 ```
 
-### macOS (launchd)
+#### macOS (launchd)
 
-Create `~/Library/LaunchAgents/com.whatsapp-rs.plist` pointing to the
-binary and load with `launchctl load ...`. (No unit shipped yet; PR
-welcome.)
+```bash
+cp contrib/com.whatsapp-rs.plist ~/Library/LaunchAgents/
+# edit the <string> path inside to point at your binary, then:
+launchctl load -w ~/Library/LaunchAgents/com.whatsapp-rs.plist
+tail -f /tmp/whatsapp-rs.log
+```
+
+#### Windows (Task Scheduler)
+
+Edit `contrib\whatsapp-rs-task.xml` so `<Command>` points at your
+compiled `whatsapp-rs.exe`, then:
+
+```powershell
+schtasks /Create /TN "whatsapp-rs" /XML contrib\whatsapp-rs-task.xml
+```
+
+The task fires on every user login and auto-restarts on crash.
 
 ## Commands
 

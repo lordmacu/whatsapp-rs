@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whatsapp-rs</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Edit this path to where the binary lives on your machine. -->
+        <string>/Users/YOU/whatsapp-rs/target/release/whatsapp-rs</string>
+        <string>daemon</string>
+    </array>
+
+    <!-- Start at login; relaunch on crash. -->
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+    </dict>
+
+    <!-- Logs. Tail with: tail -f /tmp/whatsapp-rs.log -->
+    <key>StandardOutPath</key><string>/tmp/whatsapp-rs.log</string>
+    <key>StandardErrorPath</key><string>/tmp/whatsapp-rs.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key><string>info,whatsapp_rs=info</string>
+    </dict>
+</dict>
+</plist>

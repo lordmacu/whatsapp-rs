@@ -98,6 +98,21 @@ pub async fn run_daemon() -> Result<()> {
         }
     }
 
+    // Refuse to start without pre-existing credentials. The daemon has no
+    // stdin/stdout under systemd/launchd, so QR pairing would silently hang
+    // forever. Tell the user to pair interactively first.
+    {
+        use crate::auth::{AuthManager, AuthState, FileStore};
+        let store = std::sync::Arc::new(FileStore::new()?);
+        let mgr = AuthManager::new(store)?;
+        if *mgr.state() != AuthState::Authenticated {
+            bail!(
+                "daemon: not paired yet. Run `whatsapp-rs listen` once in a \
+                 terminal and scan the QR, then restart the daemon."
+            );
+        }
+    }
+
     let client = Client::new()?;
     let session = Arc::new(client.connect().await?);
     tracing::info!("daemon: connected as {}", session.our_jid);
