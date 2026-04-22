@@ -213,30 +213,21 @@ impl MessageManager {
                     self.decrypt_skmsg(&from, &decrypt_jid, &enc_bytes).await
                 }
                 _ => {
-                    // 1:1 Signal message (msg / pkmsg). For LID addressing
-                    // the `from`/`participant` is user-level (no device),
-                    // so one user-LID entry in our session map actually
-                    // corresponds to a specific device that happened to
-                    // send the first pkmsg. When MAC mismatches, the
-                    // encrypting device is different — fall back to any
-                    // sibling session we already have (PN-keyed sessions
-                    // from when we sent to this user, or @lid entries for
-                    // other devices of the same user).
-                    let candidates = build_candidate_jids(&decrypt_jid, node, &self.signal);
-                    match self.signal
-                        .decrypt_with_candidates(&candidates, &enc_bytes, &enc_type)
-                        .await
-                    {
-                        Ok((plaintext, _winning_jid)) => {
+                    // 1:1 Signal message (msg / pkmsg). We do NOT retry on
+                    // sibling sessions — each decrypt attempt mutates the
+                    // ratchet state even when it fails, so trying multiple
+                    // candidates corrupts every session we touch.
+                    match self.signal.decrypt_message(&decrypt_jid, &enc_bytes, &enc_type).await {
+                        Ok(plaintext) => {
                             self.maybe_process_skdm(&decrypt_jid, &plaintext);
                             Some(decode_plaintext(&plaintext))
                         }
                         Err(e) => {
                             debug!("signal decrypt failed for {from}: {e}");
-                            // Wipe the stale session so the sender's re-send
-                            // (prompted by our retry receipt) is treated as a
-                            // fresh pkmsg and creates a new session for us.
-                            self.signal.drop_session(&decrypt_jid);
+                            // Do NOT drop the session — if the message was a
+                            // replay of a long-stale queue item, the session
+                            // may still be valid for fresh traffic. Only the
+                            // sender's retry response creates a new pkmsg.
                             send_retry_receipt_fn(
                                 &self.socket, node, &from, &id, t,
                                 self.signal.registration_id(),
