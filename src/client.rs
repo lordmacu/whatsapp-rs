@@ -147,19 +147,43 @@ impl Client {
         // Wait up to 10 s for <success>. `Connected` is emitted immediately
         // after the server sends <success>; passive-active and OTK upload
         // run in the background and don't block the send path.
-        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        let saw_connected = tokio::time::timeout(Duration::from_secs(10), async {
             while let Ok(ev) = ready_rx.recv().await {
                 if matches!(ev, MessageEvent::Connected) {
-                    return;
+                    return true;
                 }
             }
-        }).await;
+            false
+        }).await.unwrap_or(false);
+
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(saw_connected));
+
+        // Mirror connection state from the event bus into `connected` so
+        // Session::is_connected / wait_connected are free of event-bus polling.
+        {
+            let connected = connected.clone();
+            let mut rx = event_tx.subscribe();
+            tokio::spawn(async move {
+                use std::sync::atomic::Ordering;
+                while let Ok(ev) = rx.recv().await {
+                    match ev {
+                        MessageEvent::Connected => connected.store(true, Ordering::SeqCst),
+                        MessageEvent::Disconnected { .. }
+                        | MessageEvent::Reconnecting { .. } => {
+                            connected.store(false, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
 
         Ok(Session {
             mgr: current_mgr, event_tx, our_jid, contacts, msg_store, poll_store,
             creds: creds.clone(),
             store: self.store.clone(),
             bg_handle: bg_handle.abort_handle(),
+            connected,
         })
     }
 
@@ -971,6 +995,9 @@ pub struct Session {
     creds: SharedCreds,
     store: Arc<FileStore>,
     bg_handle: tokio::task::AbortHandle,
+    /// Mirrored from `MessageEvent::Connected` / `Disconnected` so callers
+    /// can cheaply check liveness without subscribing to the event bus.
+    connected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for Session {
@@ -987,6 +1014,39 @@ impl Session {
     /// The same channel is reused across reconnects so no events are missed.
     pub fn events(&self) -> broadcast::Receiver<MessageEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Cheap, non-blocking check: was the last lifecycle event `Connected`?
+    ///
+    /// Transitions to `false` on `Disconnected` or `Reconnecting`. Flips back
+    /// to `true` once the recv loop sees `<success>` from the server. No IPC
+    /// or event-bus poll — just an atomic load, safe to call in a hot path.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Block until [`is_connected`](Self::is_connected) turns `true`, or the
+    /// `timeout` elapses. Returns `true` if we observed a live connection
+    /// during the wait, `false` on timeout.
+    ///
+    /// If already connected, returns immediately.
+    pub async fn wait_connected(&self, timeout: std::time::Duration) -> bool {
+        if self.is_connected() { return true; }
+        let mut rx = self.event_tx.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Fast-path re-check in case the flag flipped between the
+            // guard above and the subscribe above.
+            if self.is_connected() { return true; }
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() { return false; }
+            match tokio::time::timeout(rem, rx.recv()).await {
+                Err(_) => return false,
+                Ok(Err(_)) => return false, // event bus closed
+                Ok(Ok(MessageEvent::Connected)) => return true,
+                Ok(Ok(_)) => continue,
+            }
+        }
     }
 
     // ── Sending ───────────────────────────────────────────────────────────────

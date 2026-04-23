@@ -341,6 +341,7 @@ async fn dispatch(
         Request::Ping => Response::Ok(serde_json::json!({"pong": true})),
         Request::Status => Response::Ok(serde_json::json!({
             "jid": session.our_jid,
+            "connected": session.is_connected(),
         })),
         Request::SendText { jid, text } => {
             match session.send_text(&jid, &text).await {
