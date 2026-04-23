@@ -66,19 +66,33 @@ pub fn encode_wa_text_with_mentions(text: &str, mention_jids: &[&str]) -> Vec<u8
 // ── WAProto.Message encode (media) ───────────────────────────────────────────
 
 fn encode_media_fields(info: &crate::messages::MediaInfo, caption: Option<&str>, extra: &[u8]) -> Vec<u8> {
+    // Canonical ImageMessage/VideoMessage/AudioMessage/DocumentMessage field
+    // numbers (verified against Baileys WAProto.ImageMessage):
+    //   1 = url            2 = mimetype       3 = caption
+    //   4 = fileSha256     5 = fileLength
+    //   8 = mediaKey       9 = fileEncSha256  11 = directPath
+    //   12 = mediaKeyTimestamp
+    // Older code used 3/4/7/8/15 for the non-caption slots — modern WA
+    // renders those as a broken placeholder because it can't find the
+    // mediaKey / direct_path / length at the expected tags.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut sub = Vec::new();
     sub.extend(proto_bytes(1, info.url.as_bytes()));
     sub.extend(proto_bytes(2, info.mimetype.as_bytes()));
-    sub.extend(proto_bytes(3, &info.file_sha256));
-    sub.extend(proto_varint(4, info.file_length));
-    sub.extend(proto_bytes(7, &info.media_key));
     if let Some(cap) = caption {
         if !cap.is_empty() {
-            sub.extend(proto_bytes(8, cap.as_bytes()));
+            sub.extend(proto_bytes(3, cap.as_bytes()));
         }
     }
+    sub.extend(proto_bytes(4, &info.file_sha256));
+    sub.extend(proto_varint(5, info.file_length));
+    sub.extend(proto_bytes(8, &info.media_key));
     sub.extend(proto_bytes(9, &info.file_enc_sha256));
-    sub.extend(proto_bytes(15, info.direct_path.as_bytes()));
+    sub.extend(proto_bytes(11, info.direct_path.as_bytes()));
+    sub.extend(proto_varint(12, now_unix));
     sub.extend_from_slice(extra);
     sub
 }
@@ -260,15 +274,22 @@ pub fn decode_wa_media(data: &[u8]) -> Option<(WaMediaFields, u64)> {
 fn parse_media_sub(data: &[u8]) -> Option<WaMediaFields> {
     let f = parse_proto_fields(data)?;
 
+    // Canonical (Baileys) sub-field layout. Legacy tags (3=sha,4=len,7=key,
+    // 8=caption,15=directPath) tried as fallback so our own stored messages
+    // from before the fix still round-trip.
     let url = f.get(&1).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
     let mimetype = f.get(&2).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
-    let file_sha256 = f.get(&3).cloned().unwrap_or_default();
-    let file_length = f.get(&4).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0);
-    let media_key = f.get(&7).cloned().unwrap_or_default();
-    let caption = f.get(&8).and_then(|b| String::from_utf8(b.clone()).ok());
+    let caption = f.get(&3).and_then(|b| String::from_utf8(b.clone()).ok())
+        .or_else(|| f.get(&8).and_then(|b| String::from_utf8(b.clone()).ok()));
+    let file_sha256 = f.get(&4).cloned().or_else(|| f.get(&3).cloned()).unwrap_or_default();
+    let file_length = f.get(&5).or_else(|| f.get(&4))
+        .and_then(|b| read_varint_from_bytes(b)).unwrap_or(0);
+    let media_key = f.get(&8).cloned().or_else(|| f.get(&7).cloned()).unwrap_or_default();
     let file_enc_sha256 = f.get(&9).cloned().unwrap_or_default();
-    let file_name = f.get(&30).and_then(|b| String::from_utf8(b.clone()).ok()); // DocumentMessage.fileName
-    let direct_path = f.get(&15).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+    let direct_path = f.get(&11).and_then(|b| String::from_utf8(b.clone()).ok())
+        .or_else(|| f.get(&15).and_then(|b| String::from_utf8(b.clone()).ok()))
+        .unwrap_or_default();
+    let file_name = f.get(&30).and_then(|b| String::from_utf8(b.clone()).ok());
 
     if url.is_empty() && direct_path.is_empty() {
         return None;
@@ -1290,25 +1311,25 @@ fn encode_media_fields_forwarded(info: &crate::messages::MediaInfo, caption: Opt
     encode_media_fields(info, caption, &all_extra)
 }
 
-/// Forward an image message.
+/// Forward an image message. Canonical Message.imageMessage = 3.
 pub fn encode_wa_forward_image(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
     proto_message(3, &encode_media_fields_forwarded(info, caption, &[]))
 }
 
-/// Forward a video message.
+/// Forward a video message. Canonical Message.videoMessage = 9.
 pub fn encode_wa_forward_video(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
-    proto_message(6, &encode_media_fields_forwarded(info, caption, &[]))
+    proto_message(9, &encode_media_fields_forwarded(info, caption, &[]))
 }
 
-/// Forward an audio message.
+/// Forward an audio message. Canonical Message.audioMessage = 8.
 pub fn encode_wa_forward_audio(info: &crate::messages::MediaInfo) -> Vec<u8> {
-    proto_message(5, &encode_media_fields_forwarded(info, None, &[]))
+    proto_message(8, &encode_media_fields_forwarded(info, None, &[]))
 }
 
-/// Forward a document message.
+/// Forward a document message. Canonical Message.documentMessage = 7.
 pub fn encode_wa_forward_document(info: &crate::messages::MediaInfo, file_name: &str) -> Vec<u8> {
     let extra = proto_bytes(30, file_name.as_bytes());
-    proto_message(4, &encode_media_fields_forwarded(info, None, &extra))
+    proto_message(7, &encode_media_fields_forwarded(info, None, &extra))
 }
 
 /// Forward a text message (wrapped in ExtendedTextMessage with contextInfo).
