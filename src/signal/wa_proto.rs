@@ -347,7 +347,6 @@ pub fn encode_wa_buttons_message(
     buttons: &[(&str, &str)],
 ) -> Vec<u8> {
     let mut body = Vec::new();
-    // header oneof = text at field 1
     body.extend(proto_bytes(1, text.as_bytes()));
     body.extend(proto_bytes(6, text.as_bytes()));
     if let Some(f) = footer {
@@ -356,14 +355,33 @@ pub fn encode_wa_buttons_message(
     for (id, label) in buttons {
         let mut btn = Vec::new();
         btn.extend(proto_bytes(1, id.as_bytes()));
-        // ButtonText { 1 = displayText }
         let bt = proto_bytes(1, label.as_bytes());
         btn.extend(proto_message(2, &bt));
-        btn.extend(proto_varint(3, 1)); // type = RESPONSE
+        btn.extend(proto_varint(3, 1));
         body.extend(proto_message(9, &btn));
     }
-    body.extend(proto_varint(10, 2)); // headerType = TEXT
-    proto_message(42, &body)
+    body.extend(proto_varint(10, 2));
+
+    // Consumer WA drops the whole Message when the only recognized payload
+    // is ButtonsMessage (field 42) — it renders nothing, not even the
+    // fallback text. Pair a Message.conversation (field 1 = string) sibling
+    // with the button options inlined as bullets so consumer accounts at
+    // least see a readable message; Business accounts still see the pills.
+    let mut fallback = String::from(text);
+    if !buttons.is_empty() {
+        fallback.push_str("\n");
+        for (_, label) in buttons {
+            fallback.push_str(&format!("\n• {label}"));
+        }
+    }
+    if let Some(f) = footer {
+        if !f.is_empty() { fallback.push_str(&format!("\n\n{f}")); }
+    }
+
+    let mut outer = Vec::new();
+    outer.extend(proto_bytes(1, fallback.as_bytes()));
+    outer.extend(proto_message(42, &body));
+    outer
 }
 
 /// Encode WAProto.Message.listMessage = field 36.
@@ -404,7 +422,26 @@ pub fn encode_wa_list_message(
     if let Some(f) = footer {
         if !f.is_empty() { body.extend(proto_bytes(7, f.as_bytes())); }
     }
-    proto_message(36, &body)
+    // Same consumer-WA fallback as ButtonsMessage: pair the list entries
+    // as plain-text bullets under a Message.conversation sibling so accounts
+    // without list rendering still see the options.
+    let mut fallback = format!("*{title}*\n{description}");
+    for (sec_title, rows) in sections {
+        if !sec_title.is_empty() { fallback.push_str(&format!("\n\n_{sec_title}_")); }
+        for row in rows {
+            let desc_part = if row.description.is_empty() { String::new() }
+                else { format!(" — {}", row.description) };
+            fallback.push_str(&format!("\n• {}{desc_part}", row.title));
+        }
+    }
+    if let Some(f) = footer {
+        if !f.is_empty() { fallback.push_str(&format!("\n\n{f}")); }
+    }
+
+    let mut outer = Vec::new();
+    outer.extend(proto_bytes(1, fallback.as_bytes()));
+    outer.extend(proto_message(36, &body));
+    outer
 }
 
 /// One entry inside a ListMessage section.
