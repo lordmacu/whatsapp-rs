@@ -16,25 +16,28 @@ pub fn encode_wa_text_message(text: &str) -> Vec<u8> {
 ///   - `ContextInfo.participant` (field 2) — the sender jid of that message
 ///   - `ContextInfo.quotedMessage` (field 3) — a minimal copy of the quoted content
 ///
-/// Without `quotedMessage` peers fall back to showing the reply as plain text
-/// with no quote bubble. `quoted_text` is enough for the common case (text
-/// quoted); callers can pass an empty string but the quote won't render.
+/// `quoted_body` is the pre-built inner WAProto.Message bytes of the
+/// referenced message — e.g. `proto_bytes(1, text.as_bytes())` for text or
+/// `proto_message(3, image_fields)` for an image. Caller is responsible for
+/// producing it (send.rs has a helper that reads `msg_store` and assembles
+/// the right sub-message based on the stored type).
+///
+/// Empty `quoted_body` keeps the reply well-formed but peers won't render
+/// a quote bubble — use the text fallback `proto_bytes(1, "")` to at least
+/// force the ContextInfo path.
 pub fn encode_wa_reply_message(
     text: &str,
     reply_to_id: &str,
     participant: Option<&str>,
-    quoted_text: &str,
+    quoted_body: &[u8],
 ) -> Vec<u8> {
-    // Inner quoted Message: { conversation = quoted_text }
-    let quoted_msg = proto_bytes(1, quoted_text.as_bytes());
-
     // ContextInfo: stanzaId, participant, quotedMessage.
     let mut ctx_info = Vec::new();
     ctx_info.extend(proto_bytes(1, reply_to_id.as_bytes())); // stanzaId
     if let Some(p) = participant {
         ctx_info.extend(proto_bytes(2, p.as_bytes())); // participant
     }
-    ctx_info.extend(proto_message(3, &quoted_msg)); // quotedMessage
+    ctx_info.extend(proto_message(3, quoted_body)); // quotedMessage
 
     // ExtendedTextMessage: text + contextInfo.
     let mut extended = Vec::new();

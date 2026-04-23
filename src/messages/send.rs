@@ -48,6 +48,35 @@ fn pad_wa(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Build the `ContextInfo.quotedMessage` body for a reply — an inner
+/// WAProto.Message sized down to just the type + essentials of the quoted
+/// msg. Peer clients use this to render the quote bubble (they won't open
+/// the media, just show filename/caption/thumbnail).
+fn build_quoted_body(stored: Option<&crate::message_store::StoredMessage>) -> Vec<u8> {
+    use crate::signal::wa_proto::{
+        encode_wa_audio_message, encode_wa_document_message, encode_wa_image_message,
+        encode_wa_sticker_message, encode_wa_video_message,
+    };
+    let Some(m) = stored else { return Vec::new() };
+    match (m.media_type.as_deref(), m.media_info.as_ref()) {
+        (Some("image"), Some(info))    => encode_wa_image_message(info, m.text.as_deref()),
+        (Some("video"), Some(info))    => encode_wa_video_message(info, m.text.as_deref()),
+        (Some("audio"), Some(info))    => encode_wa_audio_message(info),
+        (Some("document"), Some(info)) => {
+            // file_name lives in StoredMessage.text for documents in our schema;
+            // fall back to a generic placeholder if missing.
+            let fname = m.text.as_deref().unwrap_or("file");
+            encode_wa_document_message(info, fname)
+        }
+        (Some("sticker"), Some(info))  => encode_wa_sticker_message(info),
+        _ => {
+            // Text (or unknown) — wrap the quoted plaintext in `conversation`.
+            let text = m.text.clone().unwrap_or_default();
+            crate::signal::wa_proto::proto_bytes(1, text.as_bytes())
+        }
+    }
+}
+
 /// Parse the `<keys>` child of an incoming retry-receipt into a `PreKeyBundle`.
 /// Layout: `<keys><type/><identity/><key>(id,value)</key><skey>(id,value,signature)</skey><device-identity/></keys>`.
 /// `registration_id` comes from the sibling `<registration>` node at receipt level.
@@ -706,21 +735,18 @@ impl MessageManager {
                 // Look up the quoted message by id under the current chat jid
                 // first. Incoming msgs from a LID-addressed peer are stored
                 // under the LID jid while the reply goes out under PN, so
-                // also try the aliased counterpart (learned in recv from
-                // sender_pn/participant_pn) and any stored jid ending with
-                // the peer's user id — that covers LID↔PN and device-suffix
-                // variants without requiring an exact match.
+                // also try the aliased counterpart and any stored jid under
+                // the peer's user id.
                 let stored = self.msg_store.lookup(&msg.key.remote_jid, reply_to_id)
                     .or_else(|| {
                         let alt = self.signal.alias_of(&bare_user_jid(&msg.key.remote_jid))?;
                         self.msg_store.lookup(&alt, reply_to_id)
                     })
                     .or_else(|| {
-                        // Last resort: scan every known chat for this id.
                         self.msg_store.known_jids().into_iter()
                             .find_map(|j| self.msg_store.lookup(&j, reply_to_id))
                     });
-                let quoted_text = stored.as_ref().and_then(|m| m.text.clone()).unwrap_or_default();
+                let quoted_body = build_quoted_body(stored.as_ref());
                 let quoted_sender_owned = stored.map(|m| if m.from_me {
                     self.our_jid.clone()
                 } else {
@@ -728,7 +754,7 @@ impl MessageManager {
                 });
                 let participant = quoted_sender_owned.as_deref()
                     .or(msg.key.participant.as_deref());
-                encode_wa_reply_message(text, reply_to_id, participant, &quoted_text)
+                encode_wa_reply_message(text, reply_to_id, participant, &quoted_body)
             }
             Some(MessageContent::Image { info, caption }) =>
                 encode_wa_image_message(info, caption.as_deref()),
