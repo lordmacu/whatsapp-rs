@@ -21,8 +21,33 @@ pub enum SyncAction {
     MarkChatAsRead { jid: String, read: bool },
     /// Delete a chat locally.
     DeleteChat { jid: String },
+    /// Wipe a chat's history (not just unarchive).
+    ClearChat { jid: String },
     /// Star or unstar a message.
     Star { jid: String, message_id: String, from_me: bool, starred: bool },
+    /// Delete a single message from the local transcript.
+    DeleteMessageForMe { jid: String, message_id: String, from_me: bool, delete_media: bool },
+    /// Lock a chat behind the device biometric. User toggled it from the
+    /// phone — bots that show message previews may want to hide content
+    /// for locked chats.
+    LockChat { jid: String, locked: bool },
+    /// Business label created / renamed / deleted / reordered. `id`
+    /// comes from the mutation index.
+    LabelEdit {
+        id: String,
+        name: String,
+        color: i32,
+        deleted: bool,
+        #[allow(dead_code)]
+        is_active: bool,
+    },
+    /// A chat (or message) was tagged/untagged with a label.
+    /// `label_id` + `jid` from the index.
+    LabelAssociation { label_id: String, jid: String, labeled: bool },
+    /// A contact / group / user avatar was updated, created, or deleted.
+    /// `jid` from the index. `kind` mirrors the proto enum: 0=updated,
+    /// 1=created, 2=deleted.
+    AvatarUpdated { jid: String, kind: i32 },
     /// Any action we don't decode. Keeps the collection name + raw bytes
     /// so callers can still see *something* changed.
     Raw { field: u64 },
@@ -96,6 +121,74 @@ pub fn decode(index: &[String], value_blob: &[u8]) -> Option<DecodedAction> {
         let from_me = matches!(index.get(3).map(|s| s.as_str()), Some("1"));
         return Some(DecodedAction {
             action: SyncAction::Star { jid, message_id, from_me, starred },
+            timestamp_ms,
+        });
+    }
+    if let Some(b) = f.get(&18) {
+        // deleteMessageForMeAction (18): deleteMedia(1: bool), messageTimestamp(2).
+        // Index = ["deleteMessageForMe", jid, msgId, fromMe, participant].
+        let cf = parse_proto_fields(b)?;
+        let delete_media = cf.get(&1).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0) != 0;
+        let jid = index.get(1).cloned().unwrap_or_default();
+        let message_id = index.get(2).cloned().unwrap_or_default();
+        let from_me = matches!(index.get(3).map(|s| s.as_str()), Some("1"));
+        return Some(DecodedAction {
+            action: SyncAction::DeleteMessageForMe { jid, message_id, from_me, delete_media },
+            timestamp_ms,
+        });
+    }
+    if f.contains_key(&21) {
+        // clearChatAction (21): only carries a messageRange — we surface the jid.
+        let jid = index.get(1).cloned().unwrap_or_default();
+        return Some(DecodedAction { action: SyncAction::ClearChat { jid }, timestamp_ms });
+    }
+    if let Some(b) = f.get(&14) {
+        // labelEditAction (14): name(1), color(2), deleted(4), isActive(6).
+        // Index = ["label_edit", <labelId>].
+        let cf = parse_proto_fields(b)?;
+        let name      = cf.get(&1).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+        let color     = cf.get(&2).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0) as i32;
+        let deleted   = cf.get(&4).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0) != 0;
+        let is_active = cf.get(&6).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0) != 0;
+        let id        = index.get(1).cloned().unwrap_or_default();
+        return Some(DecodedAction {
+            action: SyncAction::LabelEdit { id, name, color, deleted, is_active },
+            timestamp_ms,
+        });
+    }
+    if let Some(b) = f.get(&15) {
+        // labelAssociationAction (15): labeled(1: bool).
+        // Index shape varies: ["label_jid", labelId, jid]
+        //                  or ["label_message", labelId, jid, msgId, fromMe, participant].
+        // We expose the first two; message-level association is still surfaced
+        // (jid is the chat) and handlers can dig deeper if they care.
+        let cf = parse_proto_fields(b)?;
+        let labeled  = cf.get(&1).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0) != 0;
+        let label_id = index.get(1).cloned().unwrap_or_default();
+        let jid      = index.get(2).cloned().unwrap_or_default();
+        return Some(DecodedAction {
+            action: SyncAction::LabelAssociation { label_id, jid, labeled },
+            timestamp_ms,
+        });
+    }
+    if let Some(b) = f.get(&50) {
+        // lockChatAction (50): locked(1: bool). Index = ["lock_chat", jid].
+        let cf = parse_proto_fields(b)?;
+        let locked = cf.get(&1).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0) != 0;
+        let jid = index.get(1).cloned().unwrap_or_default();
+        return Some(DecodedAction {
+            action: SyncAction::LockChat { jid, locked },
+            timestamp_ms,
+        });
+    }
+    if let Some(b) = f.get(&72) {
+        // avatarUpdatedAction (72): type(1: enum UPDATED=0, CREATED=1, DELETED=2).
+        // Index = ["avatar", jid].
+        let cf = parse_proto_fields(b)?;
+        let kind = cf.get(&1).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0) as i32;
+        let jid  = index.get(1).cloned().unwrap_or_default();
+        return Some(DecodedAction {
+            action: SyncAction::AvatarUpdated { jid, kind },
             timestamp_ms,
         });
     }
