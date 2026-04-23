@@ -2,7 +2,7 @@
 name          = "whatsapp-rs"
 version       = "0.1.0"
 edition       = "2021"
-rust-version  = "1.82"
+rust-version  = "1.85"
 description   = "WhatsApp multi-device client library — Signal-protocol 1:1 + groups, media, polls, view-once, scheduler, and an agent runtime for LLM / webhook / voice-note bots."
 license       = "MIT OR Apache-2.0"
 repository    = "https://github.com/lordmacu/whatsapp-rs"
