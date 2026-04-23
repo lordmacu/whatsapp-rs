@@ -702,8 +702,30 @@ impl MessageManager {
                     crate::signal::wa_proto::encode_wa_text_with_mentions(text, &refs)
                 }
             }
-            Some(MessageContent::Reply { reply_to_id, text }) =>
-                encode_wa_reply_message(text, reply_to_id, msg.key.participant.as_deref()),
+            Some(MessageContent::Reply { reply_to_id, text }) => {
+                // Look up the quoted message's text from our store so the
+                // peer renders the quote bubble. Falls back to empty text
+                // when unknown; the reply still sends but without a quote.
+                let quoted_text = self
+                    .msg_store
+                    .lookup(&msg.key.remote_jid, reply_to_id)
+                    .and_then(|m| m.text)
+                    .unwrap_or_default();
+                // Determine the quoted message's sender for ContextInfo.
+                // Peer clients validate this matches their view of the
+                // original sender before rendering the quote.
+                let quoted_sender_owned = self
+                    .msg_store
+                    .lookup(&msg.key.remote_jid, reply_to_id)
+                    .map(|m| if m.from_me {
+                        self.our_jid.clone()
+                    } else {
+                        m.participant.unwrap_or_else(|| m.remote_jid.clone())
+                    });
+                let participant = quoted_sender_owned.as_deref()
+                    .or(msg.key.participant.as_deref());
+                encode_wa_reply_message(text, reply_to_id, participant, &quoted_text)
+            }
             Some(MessageContent::Image { info, caption }) =>
                 encode_wa_image_message(info, caption.as_deref()),
             Some(MessageContent::Video { info, caption }) =>

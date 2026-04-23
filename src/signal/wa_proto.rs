@@ -9,19 +9,38 @@ pub fn encode_wa_text_message(text: &str) -> Vec<u8> {
     proto_bytes(1, text.as_bytes())
 }
 
-/// Encode a reply WAProto.Message.
-/// `participant` = original sender JID (required for group replies so the app shows the quote correctly).
-pub fn encode_wa_reply_message(text: &str, reply_to_id: &str, participant: Option<&str>) -> Vec<u8> {
-    // ContextInfo (WAProto): field 1 = stanzaId, field 2 = participant.
+/// Encode a reply WAProto.Message with a quote bubble.
+///
+/// To render a quote, peer clients require all of:
+///   - `ContextInfo.stanzaId` (field 1) — the id of the message being replied to
+///   - `ContextInfo.participant` (field 2) — the sender jid of that message
+///   - `ContextInfo.quotedMessage` (field 3) — a minimal copy of the quoted content
+///
+/// Without `quotedMessage` peers fall back to showing the reply as plain text
+/// with no quote bubble. `quoted_text` is enough for the common case (text
+/// quoted); callers can pass an empty string but the quote won't render.
+pub fn encode_wa_reply_message(
+    text: &str,
+    reply_to_id: &str,
+    participant: Option<&str>,
+    quoted_text: &str,
+) -> Vec<u8> {
+    // Inner quoted Message: { conversation = quoted_text }
+    let quoted_msg = proto_bytes(1, quoted_text.as_bytes());
+
+    // ContextInfo: stanzaId, participant, quotedMessage.
     let mut ctx_info = Vec::new();
     ctx_info.extend(proto_bytes(1, reply_to_id.as_bytes())); // stanzaId
     if let Some(p) = participant {
         ctx_info.extend(proto_bytes(2, p.as_bytes())); // participant
     }
-    // ExtendedTextMessage: field 1 = text, field 17 = contextInfo.
+    ctx_info.extend(proto_message(3, &quoted_msg)); // quotedMessage
+
+    // ExtendedTextMessage: text + contextInfo.
     let mut extended = Vec::new();
     extended.extend(proto_bytes(1, text.as_bytes()));
     extended.extend(proto_message(17, &ctx_info));
+
     // Message.extendedTextMessage = field 6.
     proto_message(6, &extended)
 }

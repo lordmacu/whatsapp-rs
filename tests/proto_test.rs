@@ -11,7 +11,7 @@ fn test_encode_decode_text() {
 
 #[test]
 fn test_encode_decode_reply() {
-    let encoded = wa_proto::encode_wa_reply_message("my reply", "ABCDEF1234", None);
+    let encoded = wa_proto::encode_wa_reply_message("my reply", "ABCDEF1234", None, "");
     let decoded = wa_proto::decode_wa_text(&encoded);
     assert_eq!(decoded, Some("my reply".to_string()));
 }
