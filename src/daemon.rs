@@ -52,6 +52,13 @@ pub enum Request {
     SendContact { jid: String, display_name: String, phone_e164: String },
     /// Send text that auto-attaches a link preview if the body contains a URL.
     SendTextPreview { jid: String, text: String },
+    /// Queue a text message for delivery at a future unix timestamp.
+    /// Persists across daemon restarts; see `src/scheduler.rs`.
+    Schedule { jid: String, text: String, send_at_unix: u64 },
+    /// List all pending scheduled items.
+    ListScheduled,
+    /// Cancel a pending scheduled item by its id. No-op if unknown.
+    CancelScheduled { id: String },
     /// "View once" image/video — receiver's WA wipes after first open.
     SendViewOnceImage { jid: String, data_b64: String, caption: Option<String> },
     SendViewOnceVideo { jid: String, data_b64: String, caption: Option<String> },
@@ -160,6 +167,34 @@ pub async fn run_daemon() -> Result<()> {
     save_handle(&Handle { port, token: token.clone(), pid: std::process::id() })?;
     tracing::info!("daemon: listening on 127.0.0.1:{port}");
 
+    // Persistent scheduler — loaded once, shared with IPC handlers + the
+    // dispatcher task. File lives next to the handle under
+    // `~/.local/share/.whatsapp-rs/scheduled.json`.
+    let scheduler = {
+        let base = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".whatsapp-rs");
+        crate::scheduler::Scheduler::open(base.join("scheduled.json"))?
+    };
+    {
+        let sched = scheduler.clone();
+        let sess = session.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let now = crate::scheduler::now_unix();
+                for item in sched.take_due(now) {
+                    tracing::info!("scheduler: firing {} → {}", item.id, item.jid);
+                    if let Err(e) = sess.send_text(&item.jid, &item.text).await {
+                        tracing::warn!("scheduler: send {} failed: {e}", item.id);
+                    }
+                }
+            }
+        });
+    }
+
     // Optional HTTP metrics server. Off by default; set
     // WA_METRICS_ADDR="127.0.0.1:9100" to enable. Exposes `/health` (liveness
     // probe for k8s/systemd) and `/metrics` (JSON counters).
@@ -180,6 +215,7 @@ pub async fn run_daemon() -> Result<()> {
 
     let accept_session = session.clone();
     let accept_token = token.clone();
+    let accept_sched = scheduler.clone();
     let accept_task = tokio::spawn(async move {
         loop {
             let (sock, _addr) = match listener.accept().await {
@@ -189,8 +225,9 @@ pub async fn run_daemon() -> Result<()> {
             let sess = accept_session.clone();
             let tok = accept_token.clone();
             let sd = shutdown_tx.clone();
+            let sched = accept_sched.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_client(sock, sess, tok, sd).await {
+                if let Err(e) = handle_client(sock, sess, tok, sd, sched).await {
                     tracing::debug!("daemon: client error: {e}");
                 }
             });
@@ -212,6 +249,7 @@ async fn handle_client(
     session: Arc<Session>,
     expected_token: String,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
 ) -> Result<()> {
     let (rx, mut tx) = stream.into_split();
     let mut rx = BufReader::new(rx);
@@ -254,7 +292,7 @@ async fn handle_client(
             break;
         }
 
-        let resp = dispatch(&session, req, &shutdown_tx).await;
+        let resp = dispatch(&session, req, &shutdown_tx, &scheduler).await;
         tx.write_all(serde_json::to_vec(&resp)?.as_slice()).await?;
         tx.write_all(b"\n").await?;
     }
@@ -352,6 +390,7 @@ async fn dispatch(
     session: &Session,
     req: Request,
     shutdown_tx: &tokio::sync::mpsc::Sender<()>,
+    scheduler: &crate::scheduler::Scheduler,
 ) -> Response {
     match req {
         Request::Ping => Response::Ok(serde_json::json!({"pong": true})),
@@ -495,6 +534,18 @@ async fn dispatch(
         Request::Subscribe => {
             // Handled earlier in handle_client; unreachable here.
             Response::Err { error: "subscribe handled out-of-band".into() }
+        }
+        Request::Schedule { jid, text, send_at_unix } => {
+            let id = scheduler.schedule(jid, text, send_at_unix);
+            Response::Ok(serde_json::json!({"id": id}))
+        }
+        Request::ListScheduled => {
+            let items = scheduler.list();
+            Response::Ok(serde_json::json!({"scheduled": items}))
+        }
+        Request::CancelScheduled { id } => {
+            let removed = scheduler.cancel(&id);
+            Response::Ok(serde_json::json!({"removed": removed}))
         }
         Request::Shutdown => {
             let _ = shutdown_tx.send(()).await;

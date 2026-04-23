@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod noise;
 pub mod poll_store;
 pub mod qr;
+pub mod scheduler;
 pub mod signal;
 pub mod socket;
 pub mod webhook;

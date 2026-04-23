@@ -18,6 +18,7 @@ mod noise;
 mod outbox;
 mod poll_store;
 mod qr;
+mod scheduler;
 mod signal;
 mod socket;
 mod webhook;
@@ -57,6 +58,9 @@ Commands:
   lookup <phone>...                     Check if phone numbers are on WhatsApp
   status                                Show our JID and exit
   metrics                               Pretty-print /metrics from WA_METRICS_ADDR (default 127.0.0.1:9100)
+  schedule <when> <jid> <text>          Queue a text for later delivery (when: 30s/15m/2h/1d/<unix>/ISO-8601)
+  scheduled                             List pending scheduled messages
+  cancel-schedule <id>                  Cancel a pending scheduled message
   group <jid>                           Fetch and print group info and exit
 
 Group management:
@@ -263,6 +267,19 @@ async fn main() -> Result<()> {
         }
         "status" => cmd_status().await,
         "metrics" => cmd_metrics().await,
+        "schedule" => {
+            if args.len() < 4 {
+                bail!("Usage: whatsapp-rs schedule <when> <jid> <text>\n  <when>: 30s | 15m | 2h | 1d | <unix-seconds> | 2026-04-24T09:00:00");
+            }
+            cmd_schedule(&args[1], &args[2], &args[3]).await
+        }
+        "scheduled" => cmd_scheduled_list().await,
+        "cancel-schedule" => {
+            if args.len() < 2 {
+                bail!("Usage: whatsapp-rs cancel-schedule <id>");
+            }
+            cmd_cancel_schedule(&args[1]).await
+        }
         "group" => {
             if args.len() < 2 {
                 bail!("Usage: whatsapp-rs group <jid>");
@@ -867,6 +884,53 @@ async fn cmd_status() -> Result<()> {
     println!("connected as {}", session.our_jid);
     let contacts = session.contacts_snapshot();
     println!("{} cached contacts", contacts.len());
+    Ok(())
+}
+
+async fn cmd_schedule(when: &str, jid: &str, text: &str) -> Result<()> {
+    let send_at = scheduler::parse_when(when)?;
+    let req = daemon::Request::Schedule {
+        jid: jid.to_string(),
+        text: text.to_string(),
+        send_at_unix: send_at,
+    };
+    match daemon::try_daemon_request(req).await? {
+        Some(v) => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+            let delta = send_at.saturating_sub(scheduler::now_unix());
+            println!("scheduled {id} — fires in {delta}s (at unix {send_at})");
+            Ok(())
+        }
+        None => bail!("no daemon running — start with `systemctl --user start whatsapp-rs`"),
+    }
+}
+
+async fn cmd_scheduled_list() -> Result<()> {
+    let v = daemon::try_daemon_request(daemon::Request::ListScheduled).await?
+        .ok_or_else(|| anyhow::anyhow!("no daemon running"))?;
+    let items = v.get("scheduled").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    if items.is_empty() { println!("(no scheduled messages)"); return Ok(()); }
+    let now = scheduler::now_unix();
+    for it in items {
+        let id = it.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        let jid = it.get("jid").and_then(|x| x.as_str()).unwrap_or("?");
+        let text = it.get("text").and_then(|x| x.as_str()).unwrap_or("");
+        let at = it.get("send_at_unix").and_then(|x| x.as_u64()).unwrap_or(0);
+        let delta = at.saturating_sub(now);
+        let when = if delta == 0 { "due".to_string() } else { format!("in {delta}s") };
+        println!("{id}  {when:>10}  {jid}  {text:.60}");
+    }
+    Ok(())
+}
+
+async fn cmd_cancel_schedule(id: &str) -> Result<()> {
+    let v = daemon::try_daemon_request(daemon::Request::CancelScheduled { id: id.to_string() }).await?
+        .ok_or_else(|| anyhow::anyhow!("no daemon running"))?;
+    if v.get("removed").and_then(|x| x.as_bool()).unwrap_or(false) {
+        println!("cancelled {id}");
+    } else {
+        println!("not found: {id}");
+    }
     Ok(())
 }
 
