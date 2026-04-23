@@ -20,7 +20,10 @@ pub fn encode_wa_reply_message(text: &str, reply_to_id: &str, participant: Optio
     let mut extended = Vec::new();
     extended.extend(proto_bytes(1, text.as_bytes())); // text
     extended.extend(proto_message(2, &ctx_info));     // contextInfo
-    proto_message(17, &extended)
+    // Message.extendedTextMessage = field 6 (WAProto). Older code used 17,
+    // which current WA clients render as "this message is incompatible
+    // with your version of WhatsApp".
+    proto_message(6, &extended)
 }
 
 /// Encode a text message with @mention JIDs embedded in contextInfo.
@@ -36,7 +39,10 @@ pub fn encode_wa_text_with_mentions(text: &str, mention_jids: &[&str]) -> Vec<u8
     let mut extended = Vec::new();
     extended.extend(proto_bytes(1, text.as_bytes()));
     extended.extend(proto_message(2, &ctx_info));
-    proto_message(17, &extended)
+    // Message.extendedTextMessage = field 6 (WAProto). Older code used 17,
+    // which current WA clients render as "this message is incompatible
+    // with your version of WhatsApp".
+    proto_message(6, &extended)
 }
 
 // ── WAProto.Message encode (media) ───────────────────────────────────────────
@@ -105,7 +111,9 @@ pub fn encode_wa_link_preview_message(
             ext.extend(proto_bytes(8, thumb));
         }
     }
-    proto_message(17, &ext)
+    // Same field 6 fix as above — link preview is a specialized
+    // ExtendedTextMessage.
+    proto_message(6, &ext)
 }
 
 /// Encode WAProto.Message poll creation (field 49 = PollCreationMessage).
@@ -156,8 +164,10 @@ pub fn decode_wa_text_full(data: &[u8]) -> Option<(String, Vec<String>)> {
             if !s.is_empty() { return Some((s, Vec::new())); }
         }
     }
-    // field 17 = extendedTextMessage { field 1 = text, field 17 = contextInfo }
-    if let Some(ext) = fields.get(&17) {
+    // field 6 = extendedTextMessage { field 1 = text, field 17 = contextInfo }
+    // Legacy: we used to encode under field 17 ourselves — accept that too
+    // so round-trip with older stored messages still decodes.
+    if let Some(ext) = fields.get(&6).or_else(|| fields.get(&17)) {
         let ef = parse_proto_fields(ext)?;
         if let Some(b) = ef.get(&1) {
             if let Ok(s) = String::from_utf8(b.clone()) {
@@ -178,11 +188,12 @@ pub fn decode_wa_text_full(data: &[u8]) -> Option<(String, Vec<String>)> {
     None
 }
 
-/// Decode link preview from WAProto.Message field 17 = ExtendedTextMessage.
+/// Decode link preview from WAProto.Message field 6 = ExtendedTextMessage
+/// (legacy field 17 also accepted for backwards compat).
 /// Returns `(text, url, title, description)` — only present when field 2 (matchedText/URL) is set.
 pub fn decode_wa_link_preview(data: &[u8]) -> Option<(String, String, String, String)> {
     let outer = parse_proto_fields(data)?;
-    let ext = outer.get(&17)?;
+    let ext = outer.get(&6).or_else(|| outer.get(&17))?;
     let ef = parse_proto_fields(ext)?;
 
     let url = ef.get(&2).and_then(|b| String::from_utf8(b.clone()).ok()).filter(|s| !s.is_empty())?;
