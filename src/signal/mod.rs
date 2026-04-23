@@ -462,16 +462,38 @@ impl SignalRepository {
         let ad_decrypt = make_ad(&entry.peer_identity, &self.identity.public);
         // Snapshot before MAC check — state mutates before MAC verify.
         let pre_snap = entry.session.snapshot();
+        if ratchet_dump_enabled() {
+            dump_ratchet_state(
+                jid, "pre",
+                &entry.peer_identity, &self.identity.public,
+                &pre_snap, &msg, &ad_decrypt, None,
+            );
+        }
         let result = entry.session.decrypt(&msg, &ad_decrypt);
         let plaintext = match result {
             Ok(pt) => pt,
             Err(e) => {
+                if ratchet_dump_enabled() {
+                    let post_snap = entry.session.snapshot();
+                    dump_ratchet_state(
+                        jid, "post-fail",
+                        &entry.peer_identity, &self.identity.public,
+                        &post_snap, &msg, &ad_decrypt, Some(&e.to_string()),
+                    );
+                }
                 entry.session = RatchetSession::from_snapshot(pre_snap);
                 return Err(e);
             }
         };
         let peer_identity = entry.peer_identity;
         let snap = entry.session.snapshot();
+        if ratchet_dump_enabled() {
+            dump_ratchet_state(
+                jid, "post-ok",
+                &entry.peer_identity, &self.identity.public,
+                &snap, &msg, &ad_decrypt, None,
+            );
+        }
         drop(sessions);
         self.persist_session(jid, &peer_identity, &snap);
         Ok(plaintext)
@@ -762,6 +784,60 @@ fn persisted_to_snapshot(p: &PersistedEntry) -> Option<RatchetSnapshot> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Dump ratchet state to /tmp when `RATCHET_DUMP=1` is set in env. Used for
+/// diagnosing MAC-mismatch cases (ratchet drift). No-op without the env var.
+fn ratchet_dump_enabled() -> bool {
+    std::env::var("RATCHET_DUMP").ok().as_deref() == Some("1")
+}
+
+fn dump_ratchet_state(
+    jid: &str,
+    label: &str,
+    peer_identity: &[u8; 32],
+    our_identity: &[u8; 32],
+    snap: &RatchetSnapshot,
+    msg: &RatchetMessage,
+    ad: &[u8],
+    err: Option<&str>,
+) {
+    use serde_json::json;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let jid_safe = jid.replace(['/', ':', '@'], "_");
+    let path = format!("/tmp/ratchet-{ts}-{label}-{jid_safe}.json");
+    let value = json!({
+        "jid": jid,
+        "label": label,
+        "ts_ms": ts,
+        "peer_identity": hex::encode(peer_identity),
+        "our_identity": hex::encode(our_identity),
+        "ad": hex::encode(ad),
+        "root_key": hex::encode(snap.root_key),
+        "send_chain_key": hex::encode(snap.send_chain_key),
+        "send_chain_index": snap.send_chain_index,
+        "recv_chain_key": snap.recv_chain_key.map(hex::encode),
+        "recv_chain_index": snap.recv_chain_index,
+        "dh_send_pub": hex::encode(snap.dh_send_pub),
+        "dh_send_priv": hex::encode(snap.dh_send_priv),
+        "dh_recv": snap.dh_recv.map(hex::encode),
+        "prev_send_count": snap.prev_send_count,
+        "skipped_count": snap.skipped.len(),
+        "msg": {
+            "ratchet_key": hex::encode(msg.ratchet_key),
+            "counter": msg.counter,
+            "prev_counter": msg.prev_counter,
+            "ciphertext_len": msg.ciphertext.len(),
+            "ciphertext_head": hex::encode(&msg.ciphertext[..msg.ciphertext.len().min(32)]),
+        },
+        "err": err,
+    });
+    if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(&path, pretty);
+    }
+}
 
 /// libsignal MAC associated data. Order is direction-aware:
 /// `sender_identity || receiver_identity`, each as `0x05 || pub32`.
