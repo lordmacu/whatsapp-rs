@@ -41,9 +41,24 @@ async fn main() -> Result<()> {
     loop {
         match events.recv().await {
             Ok(MessageEvent::NewMessage { msg }) if !msg.key.from_me => {
+                // Pull a text payload if the msg is text-ish, or an
+                // acknowledgement tag if it's media. Anything unknown is
+                // skipped entirely.
                 let text = match &msg.message {
                     Some(MessageContent::Text { text, .. }) => text.clone(),
                     Some(MessageContent::Reply { text, .. }) => text.clone(),
+                    Some(MessageContent::LinkPreview { text, .. }) => text.clone(),
+                    Some(MessageContent::Image { caption, .. }) => {
+                        let c = caption.as_deref().unwrap_or("");
+                        format!("[imagen{}]", if c.is_empty() { String::new() } else { format!(" — {c}") })
+                    }
+                    Some(MessageContent::Video { caption, .. }) => {
+                        let c = caption.as_deref().unwrap_or("");
+                        format!("[video{}]", if c.is_empty() { String::new() } else { format!(" — {c}") })
+                    }
+                    Some(MessageContent::Audio { .. })    => "[audio]".to_string(),
+                    Some(MessageContent::Document { file_name, .. }) => format!("[documento: {file_name}]"),
+                    Some(MessageContent::Sticker { .. })  => "[sticker]".to_string(),
                     _ => continue,
                 };
                 if text.starts_with('<') { continue; } // skip decrypt-failed placeholders
