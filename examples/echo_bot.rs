@@ -62,7 +62,11 @@ async fn main() -> Result<()> {
 
                 let echo = format!("eco: {text}");
                 let chat = session.chat(&msg.key.remote_jid);
-                match chat.reply(&msg.key.id, &echo).await {
+                // Plain text reply — feels like a normal conversation.
+                // Use `chat.reply(&msg.key.id, ...)` when you want an
+                // explicit quote bubble (e.g. answering a specific
+                // question in a busy thread).
+                match chat.text(&echo).await {
                     Ok(id) => println!("→ replied id={id}\n"),
                     Err(e) => println!("× reply failed: {e}\n"),
                 }
