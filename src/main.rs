@@ -56,6 +56,7 @@ Commands:
   history <jid> [n]                     Print last N messages for a chat (default 20)
   lookup <phone>...                     Check if phone numbers are on WhatsApp
   status                                Show our JID and exit
+  metrics                               Pretty-print /metrics from WA_METRICS_ADDR (default 127.0.0.1:9100)
   group <jid>                           Fetch and print group info and exit
 
 Group management:
@@ -261,6 +262,7 @@ async fn main() -> Result<()> {
             cmd_lookup(&phones).await
         }
         "status" => cmd_status().await,
+        "metrics" => cmd_metrics().await,
         "group" => {
             if args.len() < 2 {
                 bail!("Usage: whatsapp-rs group <jid>");
@@ -850,11 +852,64 @@ fn cmd_contacts() -> Result<()> {
 }
 
 async fn cmd_status() -> Result<()> {
+    // Prefer the daemon's own view of connection state so we don't open a
+    // second socket when the daemon is live. Falls back to a fresh
+    // connect when no daemon is running.
+    if let Some(v) = daemon::try_daemon_request(daemon::Request::Status).await? {
+        let jid = v.get("jid").and_then(|x| x.as_str()).unwrap_or("?");
+        let connected = v.get("connected").and_then(|x| x.as_bool()).unwrap_or(false);
+        let tag = if connected { "connected" } else { "disconnected" };
+        println!("{tag} as {jid}");
+        return Ok(());
+    }
     let client = client::Client::new()?;
     let session = client.connect().await?;
     println!("connected as {}", session.our_jid);
     let contacts = session.contacts_snapshot();
     println!("{} cached contacts", contacts.len());
+    Ok(())
+}
+
+/// Pretty-print the HTTP `/metrics` snapshot so operators don't need curl+jq.
+/// Reads `WA_METRICS_ADDR` (same env the daemon uses) — fails with a clear
+/// hint if unset.
+async fn cmd_metrics() -> Result<()> {
+    let addr = std::env::var("WA_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9100".into());
+    let url = format!("http://{}/metrics", addr.trim_start_matches("http://"));
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()?;
+    let resp = match http.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => bail!(
+            "couldn't reach {url} ({e}). Is WA_METRICS_ADDR set and the daemon running?"
+        ),
+    };
+    let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await?)?;
+
+    let get_str = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    let get_u64 = |k: &str| body.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let get_bool = |k: &str| body.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let fmt_age = |t: u64| if t == 0 { "never".into() } else { format!("{}s ago", now.saturating_sub(t)) };
+    let fmt_uptime = |s: u64| {
+        let h = s / 3600; let m = (s / 60) % 60; let sec = s % 60;
+        if h > 0 { format!("{h}h{m:02}m{sec:02}s") } else if m > 0 { format!("{m}m{sec:02}s") }
+        else { format!("{sec}s") }
+    };
+
+    println!("jid:              {}", get_str("jid"));
+    println!("connected:        {}", get_bool("connected"));
+    println!("uptime:           {}", fmt_uptime(get_u64("uptime_secs")));
+    println!("messages in:      {}", get_u64("messages_received"));
+    println!("messages out:     {}", get_u64("messages_sent"));
+    println!("decrypt failures: {}", get_u64("decrypt_failures"));
+    println!("reconnects:       {}", get_u64("reconnects"));
+    println!("last rx:          {}", fmt_age(get_u64("last_rx_unix")));
+    println!("last tx:          {}", fmt_age(get_u64("last_tx_unix")));
     Ok(())
 }
 
