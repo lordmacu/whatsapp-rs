@@ -783,11 +783,18 @@ impl MessageManager {
                 encode_wa_reply_message(text, reply_to_id, participant, &quoted_body)
             }
             Some(MessageContent::Image { info, caption, view_once }) => {
-                let bytes = encode_wa_image_message(info, caption.as_deref());
+                // Set both the inner ImageMessage.viewOnce (field 25) AND
+                // wrap in ViewOnceMessageV2 envelope — some WA client
+                // versions gate the "open once" UI on the inner flag.
+                let bytes = crate::signal::wa_proto::encode_wa_image_message_opts(
+                    info, caption.as_deref(), *view_once,
+                );
                 if *view_once { wrap_view_once(&bytes) } else { bytes }
             }
             Some(MessageContent::Video { info, caption, view_once }) => {
-                let bytes = encode_wa_video_message(info, caption.as_deref());
+                let bytes = crate::signal::wa_proto::encode_wa_video_message_opts(
+                    info, caption.as_deref(), *view_once,
+                );
                 if *view_once { wrap_view_once(&bytes) } else { bytes }
             }
             Some(MessageContent::Audio { info, ptt }) => encode_wa_audio_message(info, *ptt),
