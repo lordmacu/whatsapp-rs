@@ -42,6 +42,11 @@ async fn main() -> Result<()> {
     let chat = session.chat(&jid);
     println!("chat target: {} (name={:?})", chat.jid(), chat.name());
 
+    // Start listening for a reply *before* we send anything. This catches
+    // fast replies that would arrive during the text_and_wait window.
+    let reply_waiter = chat.listen_for_reply(Duration::from_secs(120));
+    println!("→ reply listener armed (120s window)");
+
     // 1. Send + wait for delivered
     println!("→ sending and waiting for delivery (30s)…");
     let (id, status) = chat
@@ -63,9 +68,9 @@ async fn main() -> Result<()> {
     chat.typing(false).await?;
     println!("→ typing pulse sent");
 
-    // 4. Wait for reply
-    println!("→ waiting up to 60s for a reply from {jid}…");
-    match chat.wait_for_reply(Duration::from_secs(60)).await {
+    // 4. Await the pre-armed reply listener
+    println!("→ awaiting reply (up to 120s total from listener start)…");
+    match reply_waiter.await.ok().flatten() {
         Some(msg) => {
             let preview = match &msg.message {
                 Some(whatsapp_rs::MessageContent::Text { text, .. }) => text.clone(),

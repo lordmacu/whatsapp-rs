@@ -1479,6 +1479,66 @@ impl<'a> Chat<'a> {
         wait_for_status(&mut rx, msg_id, min_status, timeout).await
     }
 
+    /// Start listening for the next incoming reply **now**, and return a
+    /// handle that can be awaited later. Use this when you want to send
+    /// something and then wait for a reply without racing the subscription:
+    ///
+    /// ```ignore
+    /// let waiter = chat.listen_for_reply(Duration::from_secs(60));
+    /// chat.text("hola").await?;
+    /// if let Some(msg) = waiter.await { … }
+    /// ```
+    ///
+    /// Internally spawns a task that subscribes to events immediately, so
+    /// replies that arrive before/during your send are not missed.
+    pub fn listen_for_reply(
+        &self,
+        timeout: std::time::Duration,
+    ) -> tokio::task::JoinHandle<Option<crate::messages::WAMessage>> {
+        // Capture what we need for the background task.
+        let event_tx = self.session.event_tx.clone();
+        let target_jid = self.jid.clone();
+        let mgr = self.session.mgr.clone();
+        tokio::spawn(async move {
+            let mut rx = event_tx.subscribe();
+            let target_bare = bare_user_jid(&target_jid);
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if rem.is_zero() { return None; }
+                match tokio::time::timeout(rem, rx.recv()).await {
+                    Err(_) => return None,
+                    Ok(Err(_)) => return None,
+                    Ok(Ok(MessageEvent::NewMessage { msg })) if !msg.key.from_me => {
+                        if matches!(
+                            &msg.message,
+                            Some(crate::messages::MessageContent::Text { text, .. })
+                                if text == "<decrypt failed>" || text == "<skmsg decrypt failed>"
+                        ) {
+                            continue;
+                        }
+                        let remote_bare = bare_user_jid(&msg.key.remote_jid);
+                        if remote_bare == target_bare {
+                            return Some(msg);
+                        }
+                        // Re-query mapping in case it was just learned.
+                        let alt = {
+                            let m = mgr.read().await;
+                            m.lid_pn_map.lock().ok()
+                                .and_then(|map| map.get(&target_bare).cloned())
+                        };
+                        if let Some(alt) = alt {
+                            if bare_user_jid(&alt) == remote_bare {
+                                return Some(msg);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+    }
+
     /// Block until the next incoming (non-self) message in this chat, or
     /// until `timeout`. For Q&A-style bots.
     ///
@@ -1486,6 +1546,10 @@ impl<'a> Chat<'a> {
     /// whose LID↔PN counterpart (learned from earlier stanzas) equals it —
     /// so a Chat tracked by PN still catches replies addressed via LID and
     /// vice versa.
+    ///
+    /// Beware: this subscribes only when you call it. If you intend to send
+    /// first and then wait for a reply, use [`Self::listen_for_reply`]
+    /// instead — it subscribes up-front so fast replies aren't missed.
     pub async fn wait_for_reply(
         &self,
         timeout: std::time::Duration,
