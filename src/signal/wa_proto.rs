@@ -110,11 +110,37 @@ fn encode_media_fields(info: &crate::messages::MediaInfo, caption: Option<&str>,
 // StickerMessage. Using one shared helper (`encode_media_fields` below)
 // only works for image; the others need per-type encoders.
 pub fn encode_wa_image_message(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
-    proto_message(3, &encode_media_fields(info, caption, &[]))
+    encode_wa_image_message_opts(info, caption, false)
+}
+
+/// Like [`encode_wa_image_message`] but also sets `ImageMessage.viewOnce = true`
+/// (field 25) in the sub-message. Used together with [`wrap_view_once`] — the
+/// flag *inside* the ImageMessage is what drives the "1" icon in the UI,
+/// while the envelope forces the client to delete after open.
+pub fn encode_wa_image_message_opts(
+    info: &crate::messages::MediaInfo, caption: Option<&str>, view_once: bool,
+) -> Vec<u8> {
+    let mut sub = encode_media_fields(info, caption, &[]);
+    if view_once {
+        sub.extend(proto_varint(25, 1));
+    }
+    proto_message(3, &sub)
 }
 
 pub fn encode_wa_video_message(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
-    proto_message(9, &encode_video_fields(info, caption))
+    encode_wa_video_message_opts(info, caption, false)
+}
+
+/// Like [`encode_wa_video_message`] but sets `VideoMessage.viewOnce = true`
+/// (field 20) when requested.
+pub fn encode_wa_video_message_opts(
+    info: &crate::messages::MediaInfo, caption: Option<&str>, view_once: bool,
+) -> Vec<u8> {
+    let mut sub = encode_video_fields(info, caption);
+    if view_once {
+        sub.extend(proto_varint(20, 1));
+    }
+    proto_message(9, &sub)
 }
 
 pub fn encode_wa_audio_message(info: &crate::messages::MediaInfo, ptt: bool) -> Vec<u8> {
