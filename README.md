@@ -18,16 +18,24 @@ Wire-format field numbers verified against [Baileys] and [whatsmeow].
 
 ## Install
 
+Published on crates.io as **`wa-agent`**; imported in Rust as
+**`whatsapp_rs`** (the original lib name, kept stable so upgrades
+don't churn imports):
+
 ```toml
 [dependencies]
-whatsapp-rs = "0.1"
-tokio       = { version = "1", features = ["full"] }
+wa-agent = "0.1"
+tokio    = { version = "1", features = ["full"] }
+```
+
+```rust
+use whatsapp_rs::{Client, agent::Response};
 ```
 
 Or pin to the git repo while the API is unstable:
 
 ```toml
-whatsapp-rs = { git = "https://github.com/lordmacu/whatsapp-rs" }
+wa-agent = { git = "https://github.com/lordmacu/whatsapp-rs" }
 ```
 
 ## Quick start
