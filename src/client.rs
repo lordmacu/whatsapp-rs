@@ -1048,6 +1048,13 @@ impl Session {
             .await
     }
 
+    /// Send text and auto-attach a link preview if the body contains a URL.
+    /// Fetches OG metadata + thumbnail with a short timeout; degrades to
+    /// plain text on fetch failure.
+    pub async fn send_text_with_preview(&self, jid: &str, text: &str) -> Result<String> {
+        self.mgr.read().await.send_text_with_auto_preview(jid, text).await
+    }
+
     pub async fn send_group_text(&self, group_jid: &str, text: &str) -> Result<String> {
         self.mgr.read().await.send_group_text(group_jid, text).await
     }
@@ -1485,6 +1492,12 @@ impl<'a> Chat<'a> {
         self.session
             .send_link_preview(&self.jid, text, url, title, description, thumbnail_jpeg)
             .await
+    }
+
+    /// Send text with an auto-fetched link preview. Falls back to plain text
+    /// when the URL fetch fails or no URL is present.
+    pub async fn text_with_preview(&self, text: &str) -> Result<String> {
+        self.session.send_text_with_preview(&self.jid, text).await
     }
 
     pub async fn typing(&self, composing: bool) -> Result<()> {

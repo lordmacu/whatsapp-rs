@@ -1,3 +1,4 @@
+pub mod link_preview;
 pub mod recent_sends;
 pub mod recv;
 pub mod send;

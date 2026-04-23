@@ -50,6 +50,8 @@ pub enum Request {
     SendDocument { jid: String, data_b64: String, mimetype: String, file_name: String },
     SendLocation { jid: String, latitude: f64, longitude: f64, name: Option<String>, address: Option<String> },
     SendContact { jid: String, display_name: String, phone_e164: String },
+    /// Send text that auto-attaches a link preview if the body contains a URL.
+    SendTextPreview { jid: String, text: String },
     Shutdown,
 }
 
@@ -425,6 +427,12 @@ async fn dispatch(
         }
         Request::SendContact { jid, display_name, phone_e164 } => {
             match session.send_contact(&jid, &display_name, &phone_e164).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendTextPreview { jid, text } => {
+            match session.send_text_with_preview(&jid, &text).await {
                 Ok(id) => Response::Ok(serde_json::json!({"id": id})),
                 Err(e) => Response::Err { error: e.to_string() },
             }

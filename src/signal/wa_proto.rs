@@ -244,10 +244,11 @@ fn encode_sticker_fields(info: &crate::messages::MediaInfo) -> Vec<u8> {
     sub
 }
 
-/// Encode WAProto.Message with link preview (field 17 = ExtendedTextMessage).
+/// Encode WAProto.Message with link preview (field 6 = ExtendedTextMessage).
 ///
-/// ExtendedTextMessage fields used:
-///   1 = text, 2 = matchedText (URL), 4 = description, 5 = title, 8 = jpegThumbnail
+/// Canonical ExtendedTextMessage fields (Baileys):
+///   1 = text, 2 = matchedText (URL), 4 = canonicalUrl, 5 = description,
+///   6 = title, 16 = jpegThumbnail
 pub fn encode_wa_link_preview_message(
     text: &str,
     url: &str,
@@ -258,19 +259,18 @@ pub fn encode_wa_link_preview_message(
     let mut ext = Vec::new();
     ext.extend(proto_bytes(1, text.as_bytes()));
     ext.extend(proto_bytes(2, url.as_bytes()));
+    ext.extend(proto_bytes(4, url.as_bytes()));
     if !description.is_empty() {
-        ext.extend(proto_bytes(4, description.as_bytes()));
+        ext.extend(proto_bytes(5, description.as_bytes()));
     }
     if !title.is_empty() {
-        ext.extend(proto_bytes(5, title.as_bytes()));
+        ext.extend(proto_bytes(6, title.as_bytes()));
     }
     if let Some(thumb) = thumbnail_jpeg {
         if !thumb.is_empty() {
-            ext.extend(proto_bytes(8, thumb));
+            ext.extend(proto_bytes(16, thumb));
         }
     }
-    // Same field 6 fix as above — link preview is a specialized
-    // ExtendedTextMessage.
     proto_message(6, &ext)
 }
 
@@ -356,8 +356,12 @@ pub fn decode_wa_link_preview(data: &[u8]) -> Option<(String, String, String, St
 
     let url = ef.get(&2).and_then(|b| String::from_utf8(b.clone()).ok()).filter(|s| !s.is_empty())?;
     let text = ef.get(&1).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
-    let description = ef.get(&4).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
-    let title = ef.get(&5).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+    // Canonical: description=5, title=6. Fall back to legacy 4/5 (our earlier
+    // wrong mapping) so previews sent before the fix still decode.
+    let description = ef.get(&5).or_else(|| ef.get(&4))
+        .and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+    let title = ef.get(&6).or_else(|| ef.get(&5))
+        .and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
 
     Some((text, url, title, description))
 }

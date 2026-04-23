@@ -33,6 +33,7 @@ Commands:
   send-voice <jid> <path.ogg>           Send a push-to-talk voice note (Opus/OGG recommended)
   send-location <jid> <lat> <lon> [name] [address]   Share a location pin
   send-contact <jid> <display-name> <phone-E164>     Share a contact card
+  send-text-preview <jid> <text>        Send text + auto-fetched link preview (detects URL)
   download <jid> <msg-id> [path]        Download received media to a file (default: ./<msg-id>)
   reply <jid> <msg-id> <text>           Reply to a specific message and exit
   react <jid> <msg-id> <emoji>          Send a reaction and exit
@@ -147,6 +148,12 @@ async fn main() -> Result<()> {
                 bail!("Usage: whatsapp-rs send-contact <jid> <display-name> <phone-E164>");
             }
             cmd_send_contact(&args[1], &args[2], &args[3]).await
+        }
+        "send-text-preview" => {
+            if args.len() < 3 {
+                bail!("Usage: whatsapp-rs send-text-preview <jid> <text>");
+            }
+            cmd_send_text_preview(&args[1], &args[2]).await
         }
         "download" => {
             if args.len() < 3 {
@@ -643,6 +650,23 @@ async fn cmd_send_contact(jid: &str, display_name: &str, phone_e164: &str) -> Re
     let client = client::Client::new()?;
     let session = client.connect().await?;
     let id = session.send_contact(jid, display_name, phone_e164).await?;
+    println!("sent: {id}");
+    Ok(())
+}
+
+async fn cmd_send_text_preview(jid: &str, text: &str) -> Result<()> {
+    let req = daemon::Request::SendTextPreview {
+        jid: jid.to_string(),
+        text: text.to_string(),
+    };
+    if let Some(v) = daemon::try_daemon_request(req).await? {
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        println!("sent: {id}");
+        return Ok(());
+    }
+    let client = client::Client::new()?;
+    let session = client.connect().await?;
+    let id = session.send_text_with_preview(jid, text).await?;
     println!("sent: {id}");
     Ok(())
 }

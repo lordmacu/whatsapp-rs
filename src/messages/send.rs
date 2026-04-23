@@ -1347,6 +1347,26 @@ impl MessageManager {
         Ok(id)
     }
 
+    /// Send text that auto-detects a URL and attaches a link preview card.
+    ///
+    /// If `text` contains a URL, this fetches OG metadata + thumbnail with
+    /// short timeouts and sends as an `ExtendedTextMessage` with preview.
+    /// Falls back to plain text when fetch fails or no URL is present.
+    pub async fn send_text_with_auto_preview(&self, jid: &str, text: &str) -> Result<String> {
+        let url = match crate::messages::link_preview::extract_first_url(text) {
+            Some(u) => u,
+            None => return self.send_text(jid, text).await,
+        };
+        match crate::messages::link_preview::fetch_preview(&url).await {
+            Some(p) => {
+                self.send_link_preview(
+                    jid, text, &p.url, &p.title, &p.description, p.thumbnail_jpeg,
+                ).await
+            }
+            None => self.send_text(jid, text).await,
+        }
+    }
+
     /// Send a poll to a 1:1 or group JID.
     /// `selectable_count` = max options a voter can pick (0 = unlimited).
     pub async fn send_poll(
