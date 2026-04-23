@@ -28,6 +28,16 @@ struct MediaConn {
 /// Baileys' `refreshMediaConn`. Older code here asked the server for a
 /// pre-signed URL via `action=mms-url-fetch`; modern WA ignores that path
 /// and we used to time out after 60s.
+/// Probe the media_conn IQ and return the first advertised upload hostname.
+/// Used by `whatsapp-rs doctor` to prove the media-upload path is unlocked
+/// without actually uploading anything.
+pub async fn probe_media_conn(sender: &SocketSender) -> Result<String> {
+    let conn = fetch_media_conn(sender).await?;
+    conn.hosts.first()
+        .map(|h| h.hostname.clone())
+        .ok_or_else(|| anyhow::anyhow!("media_conn returned but no hosts"))
+}
+
 async fn fetch_media_conn(sender: &SocketSender) -> Result<MediaConn> {
     let id = sender.next_id();
     let node = BinaryNode {

@@ -8,6 +8,7 @@ pub mod client;
 pub mod contacts;
 pub mod daemon;
 pub mod device_cache;
+pub mod doctor;
 pub mod error;
 pub mod event_print;
 pub mod install;

@@ -7,6 +7,7 @@ mod client;
 mod contacts;
 mod daemon;
 mod device_cache;
+mod doctor;
 mod error;
 mod event_print;
 mod install;
@@ -58,6 +59,7 @@ Commands:
   history <jid> [n]                     Print last N messages for a chat (default 20)
   lookup <phone>...                     Check if phone numbers are on WhatsApp
   status                                Show our JID and exit
+  doctor                                Self-test: creds, daemon, handshake, success, IQ, media
   metrics                               Pretty-print /metrics from WA_METRICS_ADDR (default 127.0.0.1:9100)
   schedule <when> <jid> <text>          Queue a text for later delivery (when: 30s/15m/2h/1d/<unix>/ISO-8601)
   schedule-daily <HH:MM> <jid> <text>   Send <text> every day at HH:MM UTC
@@ -271,6 +273,10 @@ async fn main() -> Result<()> {
         }
         "status" => cmd_status().await,
         "metrics" => cmd_metrics().await,
+        "doctor" => {
+            let ok = doctor::run_doctor().await?;
+            std::process::exit(if ok { 0 } else { 1 });
+        }
         "broadcast" => {
             if args.len() < 3 {
                 bail!("Usage: whatsapp-rs broadcast <jid1,jid2,...> <text>\n  (or <file> with one JID per line)");
