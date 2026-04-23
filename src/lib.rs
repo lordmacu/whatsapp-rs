@@ -14,6 +14,7 @@ pub mod install;
 pub mod media;
 pub mod message_store;
 pub mod messages;
+pub mod metrics;
 pub mod noise;
 pub mod poll_store;
 pub mod qr;

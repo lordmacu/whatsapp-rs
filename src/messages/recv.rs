@@ -194,6 +194,7 @@ impl MessageManager {
             Ok(plaintext) => Some(decode_plaintext(unpad_wa(&plaintext))),
             Err(e) => {
                 debug!("skmsg decrypt failed from {sender_jid} in {group_jid}: {e}");
+                crate::metrics::inc_decrypt_fail();
                 Some(DecodedPayload::Message(MessageContent::Text {
                     text: "<skmsg decrypt failed>".to_string(),
                     mentioned_jids: Vec::new(),
@@ -793,6 +794,7 @@ impl MessageManager {
                     push_name,
                 };
                 if self.msg_store.push(&msg) {
+                    crate::metrics::inc_rx();
                     log_incoming_message(&msg);
                     let _ = self.event_tx.send(MessageEvent::NewMessage { msg });
                 } else {

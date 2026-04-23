@@ -1051,6 +1051,7 @@ impl MessageManager {
             },
         );
         self.socket.send_node(&stanza).await?;
+        crate::metrics::inc_tx();
         if jid.ends_with("@g.us") {
             for dev_jid in skdm_distributed {
                 self.signal.mark_skdm_distributed(jid, &dev_jid);

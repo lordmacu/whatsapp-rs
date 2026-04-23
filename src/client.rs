@@ -667,6 +667,7 @@ async fn run_session_loop(
     let mut attempt: u32 = 0;
     loop {
         attempt = attempt.saturating_add(1);
+        crate::metrics::inc_reconnect();
         let delay = with_jitter(backoff);
         info!("reconnecting in {delay:?} (attempt {attempt})");
         let _ = event_tx.send(MessageEvent::Reconnecting { attempt, delay });

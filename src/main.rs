@@ -13,6 +13,7 @@ mod install;
 mod media;
 mod message_store;
 mod messages;
+mod metrics;
 mod noise;
 mod outbox;
 mod poll_store;

@@ -160,6 +160,22 @@ pub async fn run_daemon() -> Result<()> {
     save_handle(&Handle { port, token: token.clone(), pid: std::process::id() })?;
     tracing::info!("daemon: listening on 127.0.0.1:{port}");
 
+    // Optional HTTP metrics server. Off by default; set
+    // WA_METRICS_ADDR="127.0.0.1:9100" to enable. Exposes `/health` (liveness
+    // probe for k8s/systemd) and `/metrics` (JSON counters).
+    if let Ok(addr_s) = std::env::var("WA_METRICS_ADDR") {
+        if let Ok(addr) = addr_s.parse::<std::net::SocketAddr>() {
+            let metrics_sess = session.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::metrics::serve(addr, metrics_sess).await {
+                    tracing::warn!("metrics server exited: {e}");
+                }
+            });
+        } else {
+            tracing::warn!("WA_METRICS_ADDR={addr_s:?} is not a valid socket addr — metrics disabled");
+        }
+    }
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     let accept_session = session.clone();
