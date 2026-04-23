@@ -1,4 +1,5 @@
 pub mod link_preview;
+pub mod rate_limit;
 pub mod recent_sends;
 pub mod recv;
 pub mod send;
