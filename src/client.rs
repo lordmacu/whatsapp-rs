@@ -1335,13 +1335,9 @@ impl Session {
     /// isn't emitted). Group stanzas do carry `participant_pn` and
     /// populate this map automatically.
     pub async fn set_jid_alias(&self, lid: &str, pn: &str) {
-        let mgr = self.mgr.read().await;
         let lid_bare = bare_user_jid(lid);
         let pn_bare = bare_user_jid(pn);
-        if let Ok(mut map) = mgr.lid_pn_map.lock() {
-            map.insert(lid_bare.clone(), pn_bare.clone());
-            map.insert(pn_bare.clone(), lid_bare.clone());
-        }
+        let mgr = self.mgr.read().await;
         mgr.signal.set_jid_alias(&lid_bare, &pn_bare);
     }
 
@@ -1355,8 +1351,7 @@ impl Session {
         let bare_user = user.split(':').next().unwrap_or(user);
         let bare = format!("{bare_user}{server}");
         let mgr = self.mgr.read().await;
-        let map = mgr.lid_pn_map.lock().ok()?;
-        map.get(&bare).cloned()
+        mgr.signal.alias_of(&bare)
     }
 }
 
@@ -1543,8 +1538,7 @@ impl<'a> Chat<'a> {
                         // Re-query mapping in case it was just learned.
                         let alt = {
                             let m = mgr.read().await;
-                            m.lid_pn_map.lock().ok()
-                                .and_then(|map| map.get(&target_bare).cloned())
+                            m.signal.alias_of(&target_bare)
                         };
                         if let Some(alt) = alt {
                             if bare_user_jid(&alt) == remote_bare {

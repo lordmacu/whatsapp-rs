@@ -304,8 +304,9 @@ impl MessageManager {
         let push_name = node.attr("notify").map(|s| s.to_string());
         let t: u64 = node.attr("t").and_then(|s| s.parse().ok()).unwrap_or_else(unix_now);
 
-        // Learn LID↔PN equivalence from stanza attrs so Session::equivalent_jids
-        // can resolve peers addressed under either identity.
+        // Learn LID↔PN equivalence from stanza attrs and hand it to the
+        // Signal layer (persistent, source of truth). `set_jid_alias`
+        // also drops any divergent LID sessions in one shot.
         let pn_counterpart = node.attr("sender_pn").or_else(|| node.attr("participant_pn"));
         if let Some(pn) = pn_counterpart {
             let lid_user = bare_user_jid(
@@ -313,13 +314,6 @@ impl MessageManager {
             );
             let pn_user = bare_user_jid(pn);
             if lid_user.ends_with("@lid") && pn_user.ends_with("@s.whatsapp.net") {
-                {
-                    let mut map = self.lid_pn_map.lock().unwrap();
-                    map.insert(lid_user.clone(), pn_user.clone());
-                    map.insert(pn_user.clone(), lid_user.clone());
-                }
-                // Also inform the Signal layer so session lookup can fall
-                // back across LID/PN before decrypt (critical for MAC match).
                 self.signal.set_jid_alias(&lid_user, &pn_user);
             }
         }

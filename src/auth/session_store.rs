@@ -15,6 +15,9 @@ pub trait SessionStore: Send + Sync {
     fn load_all_sessions(&self) -> Result<Option<Vec<u8>>>;
     fn save_sender_keys(&self, data: &[u8]) -> Result<()>;
     fn load_sender_keys(&self) -> Result<Option<Vec<u8>>>;
+    /// Save/load the LID↔PN bare-user alias map (JSON).
+    fn save_jid_alias(&self, data: &[u8]) -> Result<()>;
+    fn load_jid_alias(&self) -> Result<Option<Vec<u8>>>;
     fn clear(&self) -> Result<()>;
 }
 
@@ -122,6 +125,17 @@ impl SessionStore for FileStore {
 
     fn load_sender_keys(&self) -> Result<Option<Vec<u8>>> {
         let path = self.base_dir.join("sender_keys.json");
+        if !path.exists() { return Ok(None); }
+        Ok(Some(std::fs::read(path)?))
+    }
+
+    fn save_jid_alias(&self, data: &[u8]) -> Result<()> {
+        std::fs::write(self.base_dir.join("jid_alias.json"), data)?;
+        Ok(())
+    }
+
+    fn load_jid_alias(&self) -> Result<Option<Vec<u8>>> {
+        let path = self.base_dir.join("jid_alias.json");
         if !path.exists() { return Ok(None); }
         Ok(Some(std::fs::read(path)?))
     }

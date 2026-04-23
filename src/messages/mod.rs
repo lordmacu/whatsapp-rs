@@ -206,11 +206,6 @@ pub struct MessageManager {
     /// Ring cache of last ~256 outgoing messages. Answers incoming
     /// `<receipt type="retry">` from peer devices that missed the original.
     pub(crate) recent_sends: Arc<recent_sends::RecentSends>,
-    /// Bidirectional map of LID↔PN user JIDs learned from incoming stanza
-    /// attrs (`sender_pn`, `participant_pn`). Used by `Chat` helpers to
-    /// match replies that arrive under a peer's LID when the caller is
-    /// tracking the PN (or vice versa). Populated opportunistically.
-    pub(crate) lid_pn_map: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 #[allow(dead_code)]
@@ -237,7 +232,6 @@ impl MessageManager {
             retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
-            lid_pn_map: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -267,7 +261,6 @@ impl MessageManager {
             retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
-            lid_pn_map: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -297,7 +290,6 @@ impl MessageManager {
             retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
-            lid_pn_map: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -326,7 +318,6 @@ impl MessageManager {
             retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
-            lid_pn_map: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 

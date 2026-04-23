@@ -712,8 +712,7 @@ impl MessageManager {
                 // variants without requiring an exact match.
                 let stored = self.msg_store.lookup(&msg.key.remote_jid, reply_to_id)
                     .or_else(|| {
-                        let alt = self.lid_pn_map.lock().ok()?
-                            .get(&bare_user_jid(&msg.key.remote_jid)).cloned()?;
+                        let alt = self.signal.alias_of(&bare_user_jid(&msg.key.remote_jid))?;
                         self.msg_store.lookup(&alt, reply_to_id)
                     })
                     .or_else(|| {

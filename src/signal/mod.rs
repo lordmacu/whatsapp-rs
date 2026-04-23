@@ -146,6 +146,15 @@ impl SignalRepository {
             .flatten()
             .map(|b| sender_key::SenderKeyStore::from_bytes(&b))
             .unwrap_or_default();
+        // Rehydrate the LID↔PN alias map so a restart doesn't lose the
+        // mappings we learned from `sender_pn` stanzas. Critical when the
+        // first incoming msg after a restart is from a LID-addressed peer
+        // before any fresh stanza teaches us the mapping again.
+        let jid_alias = store.load_jid_alias()
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice::<HashMap<String, String>>(&b).ok())
+            .unwrap_or_default();
         Self {
             identity: creds.signed_identity_key.clone(),
             signed_pre_key: creds.signed_pre_key.clone(),
@@ -155,7 +164,7 @@ impl SignalRepository {
             sender_keys: Arc::new(Mutex::new(sender_keys)),
             store,
             pkmsg_count: Arc::new(AtomicU32::new(0)),
-            jid_alias: Arc::new(Mutex::new(HashMap::new())),
+            jid_alias: Arc::new(Mutex::new(jid_alias)),
         }
     }
 
@@ -172,9 +181,18 @@ impl SignalRepository {
     /// correct PN session. If the peer needs to re-establish, they'll
     /// re-send via pkmsg which lands under PN via `resolve_session_key`.
     pub fn set_jid_alias(&self, a: &str, b: &str) {
-        if let Ok(mut map) = self.jid_alias.lock() {
+        {
+            let mut map = match self.jid_alias.lock() { Ok(m) => m, Err(_) => return };
+            let existed_a = map.get(a).map(|v| v == b).unwrap_or(false);
+            let existed_b = map.get(b).map(|v| v == a).unwrap_or(false);
             map.insert(a.to_string(), b.to_string());
             map.insert(b.to_string(), a.to_string());
+            if !existed_a || !existed_b {
+                // Persist on real change only — avoids disk I/O on every recv.
+                if let Ok(data) = serde_json::to_vec(&*map) {
+                    let _ = self.store.save_jid_alias(&data);
+                }
+            }
         }
         // Determine which side is LID (if any) and drop all its sessions.
         let lid_bare = if a.ends_with("@lid") { Some(a) }
@@ -211,6 +229,13 @@ impl SignalRepository {
     /// Return the alias of a bare user jid if known.
     fn aliased_bare(&self, bare_jid: &str) -> Option<String> {
         self.jid_alias.lock().ok()?.get(bare_jid).cloned()
+    }
+
+    /// Public accessor: LID↔PN alias of a bare user jid. Returns `None` if
+    /// no mapping has been learned yet. Used by higher layers (Chat,
+    /// Session) to unify peer identity across addressings.
+    pub fn alias_of(&self, bare_jid: &str) -> Option<String> {
+        self.aliased_bare(bare_jid)
     }
 
     /// Translate a canonical session jid into the best-known session key.
