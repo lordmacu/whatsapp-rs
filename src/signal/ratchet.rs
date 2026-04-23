@@ -43,16 +43,23 @@ pub struct RatchetSession {
 }
 
 impl RatchetSession {
-    /// Sender-side init after X3DH.
-    /// their_ratchet_pub = receiver's signed pre-key (first ratchet public key)
-    pub fn init_sender(root_key: [u8; 32], their_ratchet_pub: [u8; 32]) -> Self {
+    /// Sender-side init after X3DH. `init_chain_key` = second half of the
+    /// X3DH KDF; seeds the RECEIVER chain so the peer's first reply (still
+    /// on `their_ratchet_pub` = their signed pre key, no DH step yet) is
+    /// decryptable without an initial `dh_ratchet`. This matches libsignal:
+    /// `AddReceiverChain(theirRatchetKey, derivedKeys.ChainKey)`.
+    pub fn init_sender(
+        root_key: [u8; 32],
+        init_chain_key: [u8; 32],
+        their_ratchet_pub: [u8; 32],
+    ) -> Self {
         let send_kp = KeyPair::generate();
         let dh = x25519_dh(&send_kp.private, &their_ratchet_pub);
         let (root2, send_chain_key) = kdf_rk(root_key, dh);
         Self {
             root_key: root2,
             send_chain: ChainKey::new(send_chain_key),
-            recv_chain: None,
+            recv_chain: Some(ChainKey::new(init_chain_key)),
             dh_send: send_kp,
             dh_recv: Some(their_ratchet_pub),
             prev_send_count: 0,
@@ -60,12 +67,18 @@ impl RatchetSession {
         }
     }
 
-    /// Receiver-side init after X3DH.
-    /// our_ratchet_key = our signed pre-key pair (used in X3DH)
-    pub fn init_receiver(root_key: [u8; 32], our_ratchet_key: KeyPair) -> Self {
+    /// Receiver-side init after X3DH. `init_chain_key` seeds the SENDER
+    /// chain — matches libsignal `SetSenderChain(ourRatchetKey, derivedKeys.ChainKey)`
+    /// so Bob's first reply uses a chain Alice already has mirrored as her
+    /// initial receiver chain, skipping the first ratchet step.
+    pub fn init_receiver(
+        root_key: [u8; 32],
+        init_chain_key: [u8; 32],
+        our_ratchet_key: KeyPair,
+    ) -> Self {
         Self {
             root_key,
-            send_chain: ChainKey::new([0u8; 32]),
+            send_chain: ChainKey::new(init_chain_key),
             recv_chain: None,
             dh_send: our_ratchet_key,
             dh_recv: None,
@@ -76,6 +89,13 @@ impl RatchetSession {
 
     pub fn encrypt(&mut self, plaintext: &[u8], ad: &[u8]) -> Result<RatchetMessage> {
         let counter = self.send_chain.index;
+        tracing::debug!(
+            "ratchet.encrypt: counter={} root={} send_ck={} dh_send_pub={}",
+            counter,
+            hex::encode(&self.root_key[..8]),
+            hex::encode(&self.send_chain.key[..8]),
+            hex::encode(&self.dh_send.public[..8]),
+        );
         let (next, mk) = self.send_chain.advance();
         self.send_chain = next;
         let ciphertext = msg_encrypt(
@@ -97,10 +117,20 @@ impl RatchetSession {
     pub fn decrypt(&mut self, msg: &RatchetMessage, ad: &[u8]) -> Result<Vec<u8>> {
         // Check skipped cache
         if let Some(mk) = self.skipped.remove(&(msg.ratchet_key, msg.counter)) {
+            tracing::debug!("decrypt: skipped-cache hit for counter={}", msg.counter);
             return msg_decrypt(&mk, &msg.ciphertext, ad);
         }
 
         let need_ratchet = self.dh_recv.map_or(true, |r| r != msg.ratchet_key);
+        tracing::debug!(
+            "decrypt: pre-state root={} recv_chain_idx={:?} dh_recv={} incoming_rk={} counter={} need_ratchet={}",
+            hex::encode(&self.root_key[..8]),
+            self.recv_chain.as_ref().map(|c| c.index),
+            self.dh_recv.map(|b| hex::encode(&b[..8])).unwrap_or_else(|| "none".into()),
+            hex::encode(&msg.ratchet_key[..8]),
+            msg.counter,
+            need_ratchet,
+        );
         if need_ratchet {
             // Skip remaining messages in current recv chain
             if let Some(recv_chain) = self.recv_chain.clone() {
@@ -117,8 +147,13 @@ impl RatchetSession {
         self.skip_until(&recv_chain, msg.counter)?;
 
         let recv_chain = self.recv_chain.as_mut().unwrap();
+        let chain_key_at_n = hex::encode(&recv_chain.key[..8]);
         let (next, mk) = recv_chain.advance();
         *recv_chain = next;
+        tracing::debug!(
+            "decrypt: using mk_{} from chain_key={} (next chain idx={})",
+            msg.counter, chain_key_at_n, self.recv_chain.as_ref().unwrap().index,
+        );
 
         msg_decrypt(&mk, &msg.ciphertext, ad)
     }
@@ -142,6 +177,9 @@ impl RatchetSession {
     fn dh_ratchet(&mut self, their_ratchet_pub: [u8; 32]) -> Result<()> {
         self.prev_send_count = self.send_chain.index;
 
+        let old_dh_recv = self.dh_recv;
+        let old_root = self.root_key;
+
         // Recv ratchet step
         let dh1 = x25519_dh(&self.dh_send.private, &their_ratchet_pub);
         let (new_root, recv_ck) = kdf_rk(self.root_key, dh1);
@@ -150,6 +188,17 @@ impl RatchetSession {
         let new_dh = KeyPair::generate();
         let dh2 = x25519_dh(&new_dh.private, &their_ratchet_pub);
         let (new_root2, send_ck) = kdf_rk(new_root, dh2);
+
+        tracing::debug!(
+            "dh_ratchet: old_dh_recv={} their_new={} our_dh_send_pub={} old_root={} dh1={} new_root={} recv_ck={}",
+            old_dh_recv.map(|b| hex::encode(&b[..8])).unwrap_or_else(|| "none".into()),
+            hex::encode(&their_ratchet_pub[..8]),
+            hex::encode(&self.dh_send.public[..8]),
+            hex::encode(&old_root[..8]),
+            hex::encode(&dh1[..8]),
+            hex::encode(&new_root[..8]),
+            hex::encode(&recv_ck[..8]),
+        );
 
         self.root_key = new_root2;
         self.recv_chain = Some(ChainKey::new(recv_ck));

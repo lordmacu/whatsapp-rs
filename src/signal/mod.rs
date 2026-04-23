@@ -37,7 +37,15 @@ struct PersistedSkipped {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedEntry {
-    ad: Vec<u8>,
+    /// Legacy field — older on-disk sessions stored a 66-byte direction-
+    /// specific AD. Ignored on load (we key MAC by `peer_identity` now).
+    #[serde(default, skip_serializing)]
+    ad: Option<Vec<u8>>,
+    /// Peer's identity public key (32 bytes). Added after the direction-aware
+    /// MAC fix; sessions persisted before that land with `None` and must be
+    /// recreated.
+    #[serde(default)]
+    peer_identity: Option<Vec<u8>>,
     root_key: Vec<u8>,
     send_chain: PersistedChain,
     recv_chain: Option<PersistedChain>,
@@ -50,6 +58,8 @@ struct PersistedEntry {
     /// wraps it into a pkmsg. Persisted so a restart doesn't lose it.
     #[serde(default)]
     pending_pre_key: Option<PersistedPendingPreKey>,
+    #[serde(default)]
+    init_base_key: Option<Vec<u8>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -64,11 +74,24 @@ struct PersistedPendingPreKey {
 
 struct SessionEntry {
     session: RatchetSession,
-    ad: [u8; 66],
+    /// The remote peer's identity key (pub). Kept instead of a pre-baked AD
+    /// because libsignal's MAC over `senderIdentity || receiverIdentity || wire`
+    /// is direction-aware: the sender's identity comes first, so encrypt and
+    /// decrypt must build opposite orderings. A single cached AD can only
+    /// serve one direction; bug symptom was the peer-side MAC failing on our
+    /// echo even though the ratchet state was correct.
+    peer_identity: [u8; 32],
     /// Pre-key data we need to carry until the first outgoing encrypt, after
     /// which the peer knows our session and we can switch to regular Whisper
     /// messages. `None` once the session is established.
     pending_pre_key: Option<PendingPreKey>,
+    /// Receiver-side: the peer's X3DH base key (from the pkmsg that created
+    /// this session). If a duplicate pkmsg arrives with the same base key —
+    /// Signal's canonical "peer didn't see our ack, retrying" path —
+    /// re-running X3DH would derive a divergent root and the new session
+    /// wouldn't match the peer. Libsignal handles this by indexing session
+    /// states by baseKey and reusing the matching one. We do the same.
+    init_base_key: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -258,11 +281,15 @@ impl SignalRepository {
     }
 
     pub async fn encrypt_message(&self, jid: &str, plaintext: &[u8]) -> Result<EncryptedMessage> {
+        let jid = canonical_session_jid(jid);
+        let jid = jid.as_str();
         let mut sessions = self.sessions.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let entry = sessions
             .get_mut(jid)
             .ok_or_else(|| anyhow::anyhow!("no Signal session for {jid}"))?;
-        let msg = entry.session.encrypt(plaintext, &entry.ad)?;
+        // Encrypt direction: we are sender, peer is receiver.
+        let ad_encrypt = make_ad(&self.identity.public, &entry.peer_identity);
+        let msg = entry.session.encrypt(plaintext, &ad_encrypt)?;
         let inner_wire = encode_signal_wire(&msg)?;
 
         // If this is the first outgoing on the session, wrap it in a
@@ -279,10 +306,10 @@ impl SignalRepository {
             (inner_wire, "msg")
         };
 
-        let ad = entry.ad;
+        let peer_identity = entry.peer_identity;
         let snap = entry.session.snapshot();
         drop(sessions);
-        self.persist_session(jid, &ad, &snap);
+        self.persist_session(jid, &peer_identity, &snap);
         Ok(EncryptedMessage { ciphertext: wire, msg_type })
     }
 
@@ -292,17 +319,24 @@ impl SignalRepository {
         ciphertext: &[u8],
         msg_type: &str,
     ) -> Result<Vec<u8>> {
+        let jid = canonical_session_jid(jid);
         match msg_type {
-            "pkmsg" => self.decrypt_pre_key_message(jid, ciphertext),
-            "msg" => self.decrypt_normal_message(jid, ciphertext),
+            "pkmsg" => self.decrypt_pre_key_message(&jid, ciphertext),
+            "msg" => self.decrypt_normal_message(&jid, ciphertext),
             other => bail!("unknown msg type: {other}"),
         }
     }
 
     pub fn create_sender_session(&self, jid: &str, bundle: &PreKeyBundle) -> Result<Vec<u8>> {
+        let jid = canonical_session_jid(jid);
+        let jid = jid.as_str();
         let result = x3dh::x3dh_sender(&self.identity, bundle);
-        let session = RatchetSession::init_sender(result.root_key, bundle.signed_pre_key);
-        let ad = make_ad(&self.identity.public, &bundle.identity_key);
+        let session = RatchetSession::init_sender(
+            result.root_key,
+            result.chain_key,
+            bundle.signed_pre_key,
+        );
+        let peer_identity = bundle.identity_key;
         let snap = session.snapshot();
         let pending = PendingPreKey {
             base_key_pub: result.ephemeral_key.public,
@@ -315,15 +349,17 @@ impl SignalRepository {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .insert(jid.to_string(), SessionEntry {
                 session,
-                ad,
+                peer_identity,
                 pending_pre_key: Some(pending),
+                init_base_key: None,
             });
-        self.persist_session(jid, &ad, &snap);
+        self.persist_session(jid, &peer_identity, &snap);
         Ok(result.ephemeral_key.public.to_vec())
     }
 
     pub fn has_session(&self, jid: &str) -> bool {
-        self.sessions.lock().map(|s| s.contains_key(jid)).unwrap_or(false)
+        let jid = canonical_session_jid(jid);
+        self.sessions.lock().map(|s| s.contains_key(&jid)).unwrap_or(false)
     }
 
     /// Return all session-store JIDs whose user part matches `user_jid`'s
@@ -374,20 +410,51 @@ fn split_user_server(jid: &str) -> (&str, &str) {
     (user, server)
 }
 
+/// Canonicalize a jid for session keying: device `:0` ≡ bare (Baileys'
+/// `jidEncode` omits `:0` because it's the primary device). Keeping them as
+/// separate session entries makes pkmsg-from-bare and fanout-to-`:0` use
+/// different sessions for the same peer device — the peer accepts only one,
+/// so the other diverges and MAC fails on the next round-trip.
+fn canonical_session_jid(jid: &str) -> String {
+    let Some(at) = jid.find('@') else { return jid.to_string() };
+    let (left, server) = (&jid[..at], &jid[at..]);
+    match left.split_once(':') {
+        Some((user, "0")) => format!("{}{}", user, server),
+        _ => jid.to_string(),
+    }
+}
+
 // ── Decrypt ───────────────────────────────────────────────────────────────────
 
 impl SignalRepository {
     fn decrypt_normal_message(&self, jid: &str, data: &[u8]) -> Result<Vec<u8>> {
         let (msg, _) = decode_signal_wire(data)?;
         let mut sessions = self.sessions.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let session_keys: Vec<String> = sessions.keys().cloned().collect();
         let entry = sessions
             .get_mut(jid)
-            .ok_or_else(|| anyhow::anyhow!("no session for {jid}"))?;
-        let plaintext = entry.session.decrypt(&msg, &entry.ad)?;
-        let ad = entry.ad;
+            .ok_or_else(|| anyhow::anyhow!("no session for {jid} (have: {session_keys:?})"))?;
+        tracing::debug!(
+            "decrypt msg: jid={} ratchet_key_incoming={} counter={} prev_counter={}",
+            jid, hex::encode(msg.ratchet_key), msg.counter, msg.prev_counter,
+        );
+
+        // Decrypt direction: peer is sender, we are receiver.
+        let ad_decrypt = make_ad(&entry.peer_identity, &self.identity.public);
+        // Snapshot before MAC check — state mutates before MAC verify.
+        let pre_snap = entry.session.snapshot();
+        let result = entry.session.decrypt(&msg, &ad_decrypt);
+        let plaintext = match result {
+            Ok(pt) => pt,
+            Err(e) => {
+                entry.session = RatchetSession::from_snapshot(pre_snap);
+                return Err(e);
+            }
+        };
+        let peer_identity = entry.peer_identity;
         let snap = entry.session.snapshot();
         drop(sessions);
-        self.persist_session(jid, &ad, &snap);
+        self.persist_session(jid, &peer_identity, &snap);
         Ok(plaintext)
     }
 
@@ -398,25 +465,81 @@ impl SignalRepository {
         let pkm = decode_pre_key_message(&data[1..])
             .ok_or_else(|| anyhow::anyhow!("could not parse pre-key message"))?;
 
-        // Load and consume the one-time pre-key if the sender used one
-        let otk = if let Some(kid) = pkm.pre_key_id {
+        tracing::info!(
+            "decrypt_pkmsg: jid={} base_key={} identity={} signed_pre_key_id={} pre_key_id={:?}",
+            jid,
+            hex::encode(&pkm.base_key[..8]),
+            hex::encode(&pkm.identity_key[..8]),
+            pkm.signed_pre_key_id,
+            pkm.pre_key_id,
+        );
+
+        // libsignal `HasSessionState(version, baseKey)`: if a session for
+        // this peer already exists with the exact same X3DH baseKey, the
+        // sender is re-delivering (didn't see our ack yet). Re-running X3DH
+        // would pick a fresh (or zeroed, if already consumed) OTK and derive
+        // a divergent root_key → guaranteed MAC fail. Reuse the existing
+        // session: its recv chain has already advanced past counter 0, so
+        // the retried message (typically counter ≥ 1) decrypts cleanly.
+        {
+            let mut sessions = self.sessions.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let Some(entry) = sessions.get_mut(jid) {
+                if entry.init_base_key == Some(pkm.base_key) {
+                    tracing::info!(
+                        "decrypt_pkmsg: reusing session for {jid} (base_key match — peer retry, skipping X3DH + OTK consume)"
+                    );
+                    let (msg, _) = decode_signal_wire(&pkm.message)?;
+                    let ad_decrypt = make_ad(&entry.peer_identity, &self.identity.public);
+                    let peer_identity = entry.peer_identity;
+                    let pre_snap = entry.session.snapshot();
+                    let result = entry.session.decrypt(&msg, &ad_decrypt);
+                    let plaintext = match result {
+                        Ok(pt) => pt,
+                        Err(e) => {
+                            entry.session = RatchetSession::from_snapshot(pre_snap);
+                            return Err(e);
+                        }
+                    };
+                    let snap = entry.session.snapshot();
+                    drop(sessions);
+                    self.persist_session(jid, &peer_identity, &snap);
+                    return Ok(plaintext);
+                }
+                if let Some(prev_bk) = entry.init_base_key {
+                    tracing::warn!(
+                        "decrypt_pkmsg: fresh base_key for {jid} (prev={} new={}) — archiving old session, starting X3DH",
+                        hex::encode(&prev_bk[..8]),
+                        hex::encode(&pkm.base_key[..8]),
+                    );
+                }
+            }
+        }
+
+        // Fresh session: load OTK (priv half must be non-zero to be usable).
+        // libsignal only removes the OTK AFTER successful decrypt — we match
+        // that so a MAC failure here doesn't leave a dangling zeroed slot.
+        let (otk, otk_was_zeroed) = if let Some(kid) = pkm.pre_key_id {
             match self.store.load_prekey(kid) {
-                Ok(Some(bytes)) if bytes.len() == 64 => {
+                Ok(Some(bytes)) if bytes.len() == 64 && bytes[..32] != [0u8; 32] => {
                     let mut priv_b = [0u8; 32];
                     let mut pub_b = [0u8; 32];
                     priv_b.copy_from_slice(&bytes[..32]);
                     pub_b.copy_from_slice(&bytes[32..64]);
-                    // Consume: overwrite with zeros so it can't be reused
-                    let _ = self.store.save_prekey(kid, &[0u8; 64]);
-                    Some(KeyPair { private: priv_b, public: pub_b })
+                    (Some(KeyPair { private: priv_b, public: pub_b }), false)
+                }
+                Ok(Some(bytes)) if bytes.len() == 64 => {
+                    // Already consumed (priv zeroed). Fresh baseKey + consumed
+                    // OTK means we can't reproduce the peer's X3DH — MAC will
+                    // fail. Log loudly; the session will not establish.
+                    (None, true)
                 }
                 _ => {
-                    debug!("OTK id={kid} not found, proceeding without it");
-                    None
+                    debug!("OTK id={kid} not found");
+                    (None, false)
                 }
             }
         } else {
-            None
+            (None, false)
         };
 
         let pre_msg = PreKeyMessage {
@@ -425,25 +548,47 @@ impl SignalRepository {
             signed_pre_key_id: pkm.signed_pre_key_id,
             one_time_pre_key_id: pkm.pre_key_id,
         };
-        let root_key = x3dh_receiver(
+        let (root_key, chain_key) = x3dh_receiver(
             &self.identity,
             &self.signed_pre_key.key_pair,
             otk.as_ref(),
             &pre_msg,
         );
 
-        let mut session =
-            RatchetSession::init_receiver(root_key, self.signed_pre_key.key_pair.clone());
-        let ad = make_ad(&pkm.identity_key, &self.identity.public);
+        tracing::info!(
+            "decrypt_pkmsg: x3dh_root={} x3dh_chain={} our_spk_pub={} otk_present={} otk_was_zeroed={}",
+            hex::encode(&root_key[..8]),
+            hex::encode(&chain_key[..8]),
+            hex::encode(&self.signed_pre_key.key_pair.public[..8]),
+            otk.is_some(),
+            otk_was_zeroed,
+        );
+        let mut session = RatchetSession::init_receiver(
+            root_key,
+            chain_key,
+            self.signed_pre_key.key_pair.clone(),
+        );
+        let peer_identity = pkm.identity_key;
+        let ad_decrypt = make_ad(&peer_identity, &self.identity.public);
         let (msg, _) = decode_signal_wire(&pkm.message)?;
-        let plaintext = session.decrypt(&msg, &ad)?;
+        let plaintext = session.decrypt(&msg, &ad_decrypt)?;
+
+        // Decrypt succeeded — NOW consume the OTK (libsignal semantics).
+        if let (Some(kid), true) = (pkm.pre_key_id, otk.is_some()) {
+            let _ = self.store.save_prekey(kid, &[0u8; 64]);
+        }
 
         let snap = session.snapshot();
         self.sessions
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?
-            .insert(jid.to_string(), SessionEntry { session, ad, pending_pre_key: None });
-        self.persist_session(jid, &ad, &snap);
+            .insert(jid.to_string(), SessionEntry {
+                session,
+                peer_identity,
+                pending_pre_key: None,
+                init_base_key: Some(pkm.base_key),
+            });
+        self.persist_session(jid, &peer_identity, &snap);
         self.pkmsg_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(plaintext)
@@ -453,14 +598,22 @@ impl SignalRepository {
 // ── Persistence ───────────────────────────────────────────────────────────────
 
 impl SignalRepository {
-    fn persist_session(&self, jid: &str, ad: &[u8; 66], snap: &RatchetSnapshot) {
+    fn persist_session(&self, jid: &str, peer_identity: &[u8; 32], snap: &RatchetSnapshot) {
         // Look up the still-in-memory entry so we can capture any
-        // pending_pre_key before flushing to disk.
-        let pending = self.sessions.lock().ok()
-            .and_then(|m| m.get(jid).and_then(|e| e.pending_pre_key.as_ref().cloned()));
+        // pending_pre_key / init_base_key before flushing to disk.
+        let (pending, init_base_key) = self.sessions.lock().ok()
+            .map(|m| {
+                let e = m.get(jid);
+                (
+                    e.and_then(|e| e.pending_pre_key.as_ref().cloned()),
+                    e.and_then(|e| e.init_base_key.map(|b| b.to_vec())),
+                )
+            })
+            .unwrap_or((None, None));
 
         let entry = PersistedEntry {
-            ad: ad.to_vec(),
+            ad: None,
+            peer_identity: Some(peer_identity.to_vec()),
             root_key: snap.root_key.to_vec(),
             send_chain: PersistedChain {
                 key: snap.send_chain_key.to_vec(),
@@ -489,6 +642,7 @@ impl SignalRepository {
                 pre_key_id: p.pre_key_id,
                 registration_id: p.registration_id,
             }),
+            init_base_key,
         };
 
         // Load current bulk map, insert/update this entry, re-save
@@ -532,10 +686,13 @@ fn load_sessions_from_store(store: &dyn SessionStore) -> HashMap<String, Session
             }
         };
         let session = RatchetSession::from_snapshot(snap);
-        let ad = match p.ad.as_slice().try_into() as Result<[u8; 66], _> {
-            Ok(a) => a,
-            Err(_) => {
-                warn!("bad AD length for {jid}, skipping");
+        let peer_identity: [u8; 32] = match p.peer_identity
+            .as_ref()
+            .and_then(|b| b.as_slice().try_into().ok())
+        {
+            Some(id) => id,
+            None => {
+                warn!("session for {jid} has no peer_identity — skipping (legacy pre-fix format, re-pair required)");
                 continue;
             }
         };
@@ -548,7 +705,9 @@ fn load_sessions_from_store(store: &dyn SessionStore) -> HashMap<String, Session
                 registration_id: pp.registration_id,
             })
         });
-        out.insert(jid, SessionEntry { session, ad, pending_pre_key: pending });
+        let init_base_key = p.init_base_key.as_ref()
+            .and_then(|b| b.as_slice().try_into().ok());
+        out.insert(jid, SessionEntry { session, peer_identity, pending_pre_key: pending, init_base_key });
     }
     debug!("loaded {} Signal sessions from disk", out.len());
     out
@@ -585,13 +744,14 @@ fn persisted_to_snapshot(p: &PersistedEntry) -> Option<RatchetSnapshot> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// libsignal MAC associated data: `0x05 || sender_pub || 0x05 || receiver_pub`.
-fn make_ad(initiator_ik: &[u8; 32], responder_ik: &[u8; 32]) -> [u8; 66] {
+/// libsignal MAC associated data. Order is direction-aware:
+/// `sender_identity || receiver_identity`, each as `0x05 || pub32`.
+fn make_ad(sender_pub: &[u8; 32], receiver_pub: &[u8; 32]) -> [u8; 66] {
     let mut ad = [0u8; 66];
     ad[0] = 0x05;
-    ad[1..33].copy_from_slice(initiator_ik);
+    ad[1..33].copy_from_slice(sender_pub);
     ad[33] = 0x05;
-    ad[34..].copy_from_slice(responder_ik);
+    ad[34..].copy_from_slice(receiver_pub);
     ad
 }
 

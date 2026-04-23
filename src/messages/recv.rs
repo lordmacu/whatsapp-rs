@@ -6,6 +6,18 @@ use crate::messages::{
 use anyhow::Result;
 use tracing::debug;
 
+/// Ensure a JID carries an explicit device slot. `user@server` → `user:0@server`.
+/// Canonicalising on recv avoids having two disjoint Signal sessions for the
+/// same peer (one keyed on bare, another on `:0`) — which is exactly what
+/// happens when the primary phone sends to us without a device suffix in the
+/// `from` attr, but we separately initiate a session using the explicit `:0`
+/// form.
+fn normalize_device_jid(jid: &str) -> String {
+    let at = match jid.find('@') { Some(i) => i, None => return jid.to_string() };
+    let (before, server) = (&jid[..at], &jid[at..]);
+    if before.contains(':') { jid.to_string() } else { format!("{before}:0{server}") }
+}
+
 /// Extract the server's remaining OTK count from an encrypt-namespaced IQ node.
 /// Returns `Some(count)` if the node is an encrypt IQ with a `<count>` child,
 /// or `None` if the node doesn't contain this information.
@@ -92,7 +104,7 @@ impl MessageManager {
         use crate::signal::wa_proto::decode_skmsg_header;
         let hdr = decode_skmsg_header(enc_bytes)?;
         match self.signal.decrypt_sender_key_message(sender_jid, group_jid, hdr.iteration, &hdr.ciphertext).await {
-            Ok(plaintext) => Some(decode_plaintext(&plaintext)),
+            Ok(plaintext) => Some(decode_plaintext(unpad_wa(&plaintext))),
             Err(e) => {
                 debug!("skmsg decrypt failed from {sender_jid} in {group_jid}: {e}");
                 Some(DecodedPayload::Message(MessageContent::Text {
@@ -106,8 +118,20 @@ impl MessageManager {
     /// Check decrypted WAProto bytes for an embedded SKDM and process it.
     fn maybe_process_skdm(&self, sender_jid: &str, plaintext: &[u8]) {
         use crate::signal::wa_proto::{decode_axolotl_skdm, decode_wa_skdm};
-        if let Some((group_jid, axolotl_bytes)) = decode_wa_skdm(plaintext) {
-            if let Some(skdm) = decode_axolotl_skdm(&axolotl_bytes) {
+        let wa = decode_wa_skdm(plaintext);
+        debug!(
+            "maybe_process_skdm: sender={sender_jid} plaintext_len={} decoded_wa={}",
+            plaintext.len(),
+            wa.is_some(),
+        );
+        if let Some((group_jid, axolotl_bytes)) = wa {
+            let ax = decode_axolotl_skdm(&axolotl_bytes);
+            debug!(
+                "maybe_process_skdm: group={group_jid} axolotl_len={} decoded_ax={}",
+                axolotl_bytes.len(),
+                ax.is_some(),
+            );
+            if let Some(skdm) = ax {
                 if skdm.chain_key.len() == 32 {
                     let mut ck = [0u8; 32];
                     ck.copy_from_slice(&skdm.chain_key);
@@ -117,9 +141,13 @@ impl MessageManager {
                         skdm.iteration,
                         ck,
                     );
-                    debug!("stored SKDM from {sender_jid} for group {group_jid}");
+                    debug!("stored SKDM from {sender_jid} for group {group_jid} iter={}", skdm.iteration);
+                } else {
+                    debug!("SKDM chain_key wrong size: {}", skdm.chain_key.len());
                 }
             }
+        } else {
+            debug!("maybe_process_skdm: first 32 bytes hex={}", hex::encode(&plaintext[..plaintext.len().min(32)]));
         }
     }
 
@@ -182,13 +210,18 @@ impl MessageManager {
         let from = node.attr("from").unwrap_or("").to_string();
         let id = node.attr("id").unwrap_or("").to_string();
         let participant = node.attr("participant").map(|s| s.to_string());
+        // `offline=N` means the message was queued on the server while we
+        // were disconnected and is being replayed now. Retrying every one of
+        // these causes a massive burst of receipt traffic on reconnect,
+        // which trips WA's abuse detection and silently drops us from
+        // routing. Only send retry-receipts for live traffic.
+        let is_offline_replay = node.attr("offline").is_some();
         let push_name = node.attr("notify").map(|s| s.to_string());
         let t: u64 = node.attr("t").and_then(|s| s.parse().ok()).unwrap_or_else(unix_now);
 
-        // Ack immediately so the server doesn't redeliver on reconnect.
-        // Baileys always ACKs every incoming <message>; a delivery <receipt>
-        // is a separate signal to the sender and not a substitute for this.
-        self.send_message_ack(node).await;
+        // Ack is deferred until after decrypt: success → plain ack, failure →
+        // retry-receipt then ack with error code. Sending a success-ack first
+        // tells the server the message was delivered and retry is ignored.
 
         // For group messages, Signal session is keyed on the sender (participant),
         // not the group JID.
@@ -205,12 +238,60 @@ impl MessageManager {
             participant: participant.clone(),
         };
 
+        // Group messages can ship BOTH a pkmsg (SKDM bootstrap) and a skmsg
+        // (actual text). Decrypt the pkmsg first so the SKDM registers the
+        // sender key, then fall through to the skmsg for the content.
+        let all_enc = extract_all_enc(node);
+        let has_skmsg = all_enc.iter().any(|(_, t)| t == "skmsg");
+        if from.ends_with("@g.us") && has_skmsg {
+            for (bytes, t) in &all_enc {
+                if t == "pkmsg" || t == "msg" {
+                    if let Ok(pt) = self.signal.decrypt_message(&decrypt_jid, bytes, t).await {
+                        let pt = unpad_wa(&pt);
+                        self.maybe_process_skdm(&decrypt_jid, pt);
+                    }
+                }
+            }
+        }
+
         // Decrypt Signal-encrypted content if present
-        let decoded = if let Some((enc_bytes, enc_type)) = extract_enc(node) {
+        let decoded = if let Some((enc_bytes, enc_type)) = all_enc.iter()
+            .find(|(_, t)| t == "skmsg")
+            .cloned()
+            .or_else(|| all_enc.into_iter().next()) {
             match enc_type.as_str() {
                 "skmsg" => {
-                    // Group SenderKey message
-                    self.decrypt_skmsg(&from, &decrypt_jid, &enc_bytes).await
+                    let r = self.decrypt_skmsg(&from, &decrypt_jid, &enc_bytes).await;
+                    // If no sender key yet, ask sender to re-ship SKDM. For
+                    // group msgs the retry is addressed to the participant
+                    // (actual sender), not the group JID.
+                    let failed = matches!(&r, Some(DecodedPayload::Message(
+                        MessageContent::Text { text, .. })) if text == "<skmsg decrypt failed>");
+                    if failed && !is_offline_replay {
+                        // Retry-receipt only, one attempt per msg id. PDO
+                        // placeholder-resend (Baileys' second recovery lane)
+                        // works — phone acks peer_msg — but the response
+                        // triggers a Double-Ratchet bidirectional path whose
+                        // MAC we still can't verify, and spamming PDOs got our
+                        // device dropped from routing once. Groups will
+                        // recover naturally when the sender rotates the sender
+                        // key (member add/remove, admin change).
+                        let already = self.retry_ids.lock().unwrap().contains(&id);
+                        if !already {
+                            self.retry_ids.lock().unwrap().insert(id.clone());
+                            debug!("skmsg recovery: id={id} from={from} — retry-receipt");
+                            send_retry_receipt_inner(
+                                &self.socket, node, &from, &id, t,
+                                self.signal.registration_id(),
+                                self.signal.identity_public(),
+                                self.signal.signed_prekey_fields(),
+                                self.signal.pick_unused_prekey(),
+                                self.signal.account_identity_bytes(),
+                                true,
+                            ).await;
+                        }
+                    }
+                    r
                 }
                 _ => {
                     // 1:1 Signal message (msg / pkmsg). We do NOT retry on
@@ -219,23 +300,28 @@ impl MessageManager {
                     // candidates corrupts every session we touch.
                     match self.signal.decrypt_message(&decrypt_jid, &enc_bytes, &enc_type).await {
                         Ok(plaintext) => {
-                            self.maybe_process_skdm(&decrypt_jid, &plaintext);
-                            Some(decode_plaintext(&plaintext))
+                            let plaintext = unpad_wa(&plaintext);
+                            self.maybe_process_skdm(&decrypt_jid, plaintext);
+                            Some(decode_plaintext(plaintext))
                         }
                         Err(e) => {
                             debug!("signal decrypt failed for {from}: {e}");
-                            // Do NOT drop the session — if the message was a
-                            // replay of a long-stale queue item, the session
-                            // may still be valid for fresh traffic. Only the
-                            // sender's retry response creates a new pkmsg.
-                            send_retry_receipt_fn(
-                                &self.socket, node, &from, &id, t,
-                                self.signal.registration_id(),
-                                self.signal.identity_public(),
-                                self.signal.signed_prekey_fields(),
-                                self.signal.pick_unused_prekey(),
-                                self.signal.account_identity_bytes(),
-                            ).await;
+                            // Keep the session: dropping it nukes the
+                            // established ratchet state, and the sender's
+                            // retry response may arrive as a plain msg (not
+                            // pkmsg) so there's nothing to rebuild from.
+                            // A retry-receipt asks the sender to redeliver;
+                            // that path is what actually unsticks things.
+                            if !is_offline_replay {
+                                send_retry_receipt_fn(
+                                    &self.socket, node, &from, &id, t,
+                                    self.signal.registration_id(),
+                                    self.signal.identity_public(),
+                                    self.signal.signed_prekey_fields(),
+                                    self.signal.pick_unused_prekey(),
+                                    self.signal.account_identity_bytes(),
+                                ).await;
+                            }
                             Some(DecodedPayload::Message(MessageContent::Text {
                                 text: "<decrypt failed>".to_string(),
                                 mentioned_jids: Vec::new(),
@@ -247,6 +333,19 @@ impl MessageManager {
         } else {
             decode_message_content(node).map(DecodedPayload::Message)
         };
+
+        // Send ack: plain on success, with error code on decrypt failure so
+        // server schedules a resend after our retry-receipt.
+        let decrypt_failed = matches!(
+            &decoded,
+            Some(DecodedPayload::Message(MessageContent::Text { text, .. }))
+                if text == "<decrypt failed>" || text == "<skmsg decrypt failed>"
+        );
+        if decrypt_failed {
+            self.send_message_ack_with(node, Some(1)).await;
+        } else {
+            self.send_message_ack(node).await;
+        }
 
         // Cache the sender's display name
         if let Some(ref name) = push_name {
@@ -453,6 +552,10 @@ impl MessageManager {
     /// Baileys' `buildAckStanza` — the server relies on this to stop
     /// redelivering the message on reconnect.
     async fn send_message_ack(&self, node: &BinaryNode) {
+        self.send_message_ack_with(node, None).await;
+    }
+
+    async fn send_message_ack_with(&self, node: &BinaryNode, error: Option<u32>) {
         let id = match node.attr("id") { Some(v) => v.to_string(), None => return };
         let from = match node.attr("from") { Some(v) => v.to_string(), None => return };
 
@@ -461,6 +564,9 @@ impl MessageManager {
             ("to".to_string(), from),
             ("class".to_string(), node.tag.clone()),
         ];
+        if let Some(e) = error {
+            attrs.push(("error".into(), e.to_string()));
+        }
         if let Some(t) = node.attr("type")        { attrs.push(("type".into(), t.to_string())); }
         if let Some(p) = node.attr("participant") { attrs.push(("participant".into(), p.to_string())); }
         if let Some(r) = node.attr("recipient")   { attrs.push(("recipient".into(), r.to_string())); }
@@ -582,6 +688,19 @@ pub enum DecodedPayload {
     PollVoteRaw(crate::signal::wa_proto::PollVoteInfo),
 }
 
+/// Strip WhatsApp's `writeRandomPadMax16` trailing pad: last byte is pad_len
+/// (1..=16), strip that many bytes from the end. Applied to plaintext AFTER
+/// Signal/PKCS7 decrypt, BEFORE WAProto parsing.
+fn unpad_wa(data: &[u8]) -> &[u8] {
+    if let Some(&last) = data.last() {
+        let n = last as usize;
+        if n >= 1 && n <= 16 && n <= data.len() {
+            return &data[..data.len() - n];
+        }
+    }
+    data
+}
+
 /// Decode decrypted WAProto bytes.
 fn decode_plaintext(data: &[u8]) -> DecodedPayload {
     use crate::messages::MediaInfo;
@@ -662,6 +781,21 @@ fn decode_plaintext(data: &[u8]) -> DecodedPayload {
         return DecodedPayload::Message(MessageContent::Text { text, mentioned_jids });
     }
 
+    // Nothing matched — dump the proto fields so we can see which variant
+    // we need to decode next. Only at debug level to avoid log spam.
+    if let Some(fields) = wa_proto::parse_proto_fields(data) {
+        let mut keys: Vec<u64> = fields.keys().copied().collect();
+        keys.sort();
+        let sample: Vec<String> = keys.iter().take(10).map(|k| {
+            let v = &fields[k];
+            let preview = if v.len() > 40 { format!("{}B", v.len()) } else { hex::encode(v) };
+            format!("{k}={preview}")
+        }).collect();
+        debug!("unrecognized message proto ({}B), fields=[{}]", data.len(), sample.join(", "));
+    } else {
+        let head = &data[..data.len().min(64)];
+        debug!("unrecognized payload, not proto ({}B), head={}", data.len(), hex::encode(head));
+    }
     DecodedPayload::Message(MessageContent::Text {
         text: format!("<binary {}B>", data.len()),
         mentioned_jids: Vec::new(),
@@ -709,6 +843,25 @@ async fn send_retry_receipt_fn(
     one_time_prekey: Option<(u32, [u8; 32])>,
     device_identity: &[u8],
 ) {
+    send_retry_receipt_inner(
+        socket, orig, to, msg_id, t, registration_id,
+        identity_pub, signed_prekey, one_time_prekey, device_identity, true,
+    ).await;
+}
+
+async fn send_retry_receipt_inner(
+    socket: &crate::socket::SocketSender,
+    orig: &BinaryNode,
+    to: &str,
+    msg_id: &str,
+    t: u64,
+    registration_id: u16,
+    identity_pub: &[u8; 32],
+    signed_prekey: (u32, [u8; 32], Vec<u8>),
+    one_time_prekey: Option<(u32, [u8; 32])>,
+    device_identity: &[u8],
+    include_keys: bool,
+) {
     let mut attrs = vec![
         ("id".to_string(), msg_id.to_string()),
         ("type".to_string(), "retry".to_string()),
@@ -739,9 +892,12 @@ async fn send_retry_receipt_fn(
 
     // Build <keys> block
     let (spk_id, spk_pub, spk_sig) = signed_prekey;
+    // Baileys uses raw 32-byte pubkeys in identity, key.value, skey.value.
+    // Only the <type> block carries the 0x05 key-bundle-type marker.
+    let _ = prefixed;
     let mut keys_children: Vec<BinaryNode> = vec![
         bytes_node("type", vec![0x05]),
-        bytes_node("identity", prefixed(identity_pub)),
+        bytes_node("identity", identity_pub.to_vec()),
     ];
     if let Some((otk_id, otk_pub)) = one_time_prekey {
         keys_children.push(BinaryNode {
@@ -749,7 +905,7 @@ async fn send_retry_receipt_fn(
             attrs: vec![],
             content: NodeContent::List(vec![
                 bytes_node("id", u24_be(otk_id)),
-                bytes_node("value", prefixed(&otk_pub)),
+                bytes_node("value", otk_pub.to_vec()),
             ]),
         });
     }
@@ -758,34 +914,37 @@ async fn send_retry_receipt_fn(
         attrs: vec![],
         content: NodeContent::List(vec![
             bytes_node("id", u24_be(spk_id)),
-            bytes_node("value", prefixed(&spk_pub)),
+            bytes_node("value", spk_pub.to_vec()),
             bytes_node("signature", spk_sig),
         ]),
     });
     keys_children.push(bytes_node("device-identity", device_identity.to_vec()));
 
+    let mut children = vec![
+        BinaryNode {
+            tag: "retry".to_string(),
+            attrs: vec![
+                ("count".to_string(), "1".to_string()),
+                ("id".to_string(), msg_id.to_string()),
+                ("t".to_string(), t.to_string()),
+                ("v".to_string(), "1".to_string()),
+                ("error".to_string(), "0".to_string()),
+            ],
+            content: NodeContent::None,
+        },
+        bytes_node("registration", reg_id_be),
+    ];
+    if include_keys {
+        children.push(BinaryNode {
+            tag: "keys".to_string(),
+            attrs: vec![],
+            content: NodeContent::List(keys_children),
+        });
+    }
     let node = BinaryNode {
         tag: "receipt".to_string(),
         attrs,
-        content: NodeContent::List(vec![
-            BinaryNode {
-                tag: "retry".to_string(),
-                attrs: vec![
-                    ("count".to_string(), "1".to_string()),
-                    ("id".to_string(), msg_id.to_string()),
-                    ("t".to_string(), t.to_string()),
-                    ("v".to_string(), "1".to_string()),
-                    ("error".to_string(), "0".to_string()),
-                ],
-                content: NodeContent::None,
-            },
-            bytes_node("registration", reg_id_be),
-            BinaryNode {
-                tag: "keys".to_string(),
-                attrs: vec![],
-                content: NodeContent::List(keys_children),
-            },
-        ]),
+        content: NodeContent::List(children),
     };
     if let Err(e) = socket.send_node(&node).await {
         tracing::debug!("retry receipt failed: {e}");
@@ -913,17 +1072,26 @@ fn extract_participant_jids(node: &BinaryNode) -> Vec<String> {
 
 /// Extract enc node bytes + type from message node.
 pub fn extract_enc(node: &BinaryNode) -> Option<(Vec<u8>, String)> {
+    extract_all_enc(node).into_iter().next()
+}
+
+/// Return every `<enc>` child as (ciphertext, msg_type). Groups ship both
+/// `pkmsg` (SKDM bootstrap, no text) and `skmsg` (actual text encrypted with
+/// sender key); we need both so callers can consume SKDM first, then decrypt
+/// the skmsg for the content.
+pub fn extract_all_enc(node: &BinaryNode) -> Vec<(Vec<u8>, String)> {
+    let mut out = Vec::new();
     if let NodeContent::List(children) = &node.content {
         for child in children {
             if child.tag == "enc" {
                 let msg_type = child.attr("type").unwrap_or("msg").to_string();
                 if let NodeContent::Bytes(data) = &child.content {
-                    return Some((data.clone(), msg_type));
+                    out.push((data.clone(), msg_type));
                 }
             }
         }
     }
-    None
+    out
 }
 
 /// Extract the list of collection names from a `<notification type="server_sync">`.

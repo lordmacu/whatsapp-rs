@@ -13,6 +13,17 @@ fn ensure_device(jid: &str) -> String {
     }
 }
 
+/// Drop the `:0` primary-device suffix from a JID — matches Baileys'
+/// `jidEncode` which omits device=0 on the wire. Other `:N` suffixes stay.
+fn strip_zero_device(jid: &str) -> String {
+    let at = match jid.find('@') { Some(i) => i, None => return jid.to_string() };
+    let (left, server) = (&jid[..at], &jid[at..]);
+    match left.split_once(':') {
+        Some((user, "0")) => format!("{}{}", user, server),
+        _ => jid.to_string(),
+    }
+}
+
 /// Strip any `:device` suffix from a JID, leaving the bare user form.
 fn bare_user_jid(jid: &str) -> String {
     let at = match jid.find('@') { Some(i) => i, None => return jid.to_string() };
@@ -54,9 +65,117 @@ use crate::messages::{
     MessageStatus, ReceiptType, WAMessage,
 };
 use anyhow::Result;
+use std::sync::Arc;
+
+/// Free-function form of `send_placeholder_resend` so callers can `tokio::spawn`
+/// it without needing an `Arc<MessageManager>` handle. Takes cloned handles.
+pub async fn placeholder_resend_send(
+    socket: Arc<crate::socket::SocketSender>,
+    signal: Arc<crate::signal::SignalRepository>,
+    our_jid: String,
+    key: MessageKey,
+) -> Result<()> {
+    use crate::signal::wa_proto::{proto_bytes, proto_varint};
+
+    let mut mk = Vec::new();
+    mk.extend(proto_bytes(1, key.remote_jid.as_bytes()));
+    mk.extend(proto_varint(2, if key.from_me { 1 } else { 0 }));
+    mk.extend(proto_bytes(3, key.id.as_bytes()));
+    if let Some(p) = &key.participant {
+        mk.extend(proto_bytes(4, p.as_bytes()));
+    }
+    let pmrr = proto_bytes(1, &mk);
+    let mut pdo = Vec::new();
+    pdo.extend(proto_varint(1, 4));
+    pdo.extend(proto_bytes(5, &pmrr));
+    let mut pm = Vec::new();
+    pm.extend(proto_varint(2, 16));
+    pm.extend(proto_bytes(16, &pdo));
+    let message_bytes = proto_bytes(12, &pm);
+
+    // Session key = bare user JID, because incoming peer msgs from our phone
+    // arrive with `from=bare`. Always create a FRESH session via a new prekey
+    // fetch: any pre-existing bare session may be out of sync with the phone
+    // (they may have a different derivation from an earlier X3DH). A fresh
+    // pkmsg forces both sides onto the same root.
+    let our_user = bare_user_jid(&our_jid);
+    let phone_jid_for_prekey = ensure_device(&our_user);
+    let session_jid = our_user.clone();
+
+    let bundle = crate::socket::prekey::fetch_pre_key_bundle(&socket, &phone_jid_for_prekey).await?;
+    tracing::info!(
+        "PDO: fetched bundle for {} (spk_id={}, otk={})",
+        phone_jid_for_prekey, bundle.signed_pre_key_id,
+        bundle.one_time_pre_key_id.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
+    );
+    signal.create_sender_session(&session_jid, &bundle)?;
+
+    let plaintext = pad_wa(&message_bytes);
+    let enc = signal.encrypt_message(&session_jid, &plaintext).await?;
+    tracing::info!(
+        "PDO: encrypted {}B plaintext → {}B {} (session key={})",
+        plaintext.len(), enc.ciphertext.len(), enc.msg_type, session_jid,
+    );
+
+    let mut children = vec![BinaryNode {
+        tag: "enc".to_string(),
+        attrs: vec![
+            ("v".to_string(), "2".to_string()),
+            ("type".to_string(), enc.msg_type.to_string()),
+        ],
+        content: NodeContent::Bytes(enc.ciphertext),
+    }];
+    if enc.msg_type == "pkmsg" {
+        let account_id = signal.account_identity_bytes().to_vec();
+        if !account_id.is_empty() {
+            children.push(BinaryNode {
+                tag: "device-identity".to_string(),
+                attrs: vec![],
+                content: NodeContent::Bytes(account_id),
+            });
+        }
+    }
+    children.push(BinaryNode {
+        tag: "meta".to_string(),
+        attrs: vec![("appdata".to_string(), "default".to_string())],
+        content: NodeContent::None,
+    });
+
+    let stanza = BinaryNode {
+        tag: "message".to_string(),
+        attrs: vec![
+            ("to".to_string(), our_user),
+            ("id".to_string(), generate_message_id()),
+            ("type".to_string(), "text".to_string()),
+            ("category".to_string(), "peer".to_string()),
+            ("push_priority".to_string(), "high_force".to_string()),
+            ("t".to_string(), unix_now().to_string()),
+        ],
+        content: NodeContent::List(children),
+    };
+    socket.send_node(&stanza).await
+}
 
 #[allow(dead_code)]
 impl MessageManager {
+    /// Send a PeerDataOperationRequestMessage (PLACEHOLDER_MESSAGE_RESEND) to
+    /// our own user JID. This is what Baileys does alongside retry-receipts
+    /// when an incoming group message fails to decrypt: it asks the primary
+    /// phone to re-ship the missing SKDM/message for this new device slot.
+    ///
+    /// WA server reuses the category=peer routing to deliver the PDO to the
+    /// primary phone only. The phone's protocolMessage handler sees the
+    /// PLACEHOLDER_MESSAGE_RESEND request and re-broadcasts the referenced
+    /// message with SKDM bundled, so future skmsg from that sender decrypt.
+    pub async fn send_placeholder_resend(&self, key: &MessageKey) -> Result<()> {
+        placeholder_resend_send(
+            self.socket.clone(),
+            self.signal.clone(),
+            self.our_jid.clone(),
+            key.clone(),
+        ).await
+    }
+
     pub async fn send_text(&self, jid: &str, text: &str) -> Result<String> {
         let id = generate_message_id();
         let content = MessageContent::Text { text: text.to_string(), mentioned_jids: Vec::new() };
@@ -454,8 +573,13 @@ impl MessageManager {
 
             // Each target gets the same outermost Message padded fresh per
             // encrypt to match the peer's `unpadRandomMax16` trim.
-            for (dev_jid, plaintext) in recipient_devs.iter().map(|d| (d.clone(), pad_wa(&wa_bytes)))
-                .chain(own_other_devs.iter().map(|d| (d.clone(), pad_wa(&dsm_bytes))))
+            // Baileys' `jidEncode` drops `:0` from the wire JID (primary
+            // device), so `<to jid="X@lid">` is semantically the same as
+            // `<to jid="X:0@lid">`. We strip `:0` to match — keeping the
+            // explicit `:0` form triggers retry receipts from the primary
+            // device even when our session state is correct.
+            for (dev_jid, plaintext) in recipient_devs.iter().map(|d| (strip_zero_device(d), pad_wa(&wa_bytes)))
+                .chain(own_other_devs.iter().map(|d| (strip_zero_device(d), pad_wa(&dsm_bytes))))
             {
                 if !self.signal.has_session(&dev_jid) {
                     match crate::socket::prekey::fetch_pre_key_bundle(&self.socket, &dev_jid).await {

@@ -157,9 +157,13 @@ pub fn process_pair_success(
     let device_sig = creds.signed_identity_key.sign_xeddsa(&device_msg);
     account.device_signature = Some(device_sig.to_vec());
 
-    // Re-encode the ADVSignedDeviceIdentity WITHOUT accountSignatureKey
-    // (Baileys strips it before sending back).
-    let account_enc = encode_signed_device_identity(&account, /*include_sig_key*/ false);
+    // Two encodings: the IQ reply back to the server omits the signature key
+    // (Baileys does the same). Everything we send later — pkmsg bundles AND
+    // retry receipts — uses the FULL version, with accountSignatureKey
+    // included. If we sent the stripped blob in a retry, the receiver's
+    // client silently rejects it and never re-ships the SKDM.
+    let account_enc_stripped = encode_signed_device_identity(&account, /*include_sig_key*/ false);
+    let account_enc_full = encode_signed_device_identity(&account, /*include_sig_key*/ true);
 
     let reply = BinaryNode {
         tag: "iq".into(),
@@ -174,7 +178,7 @@ pub fn process_pair_success(
             content: NodeContent::List(vec![BinaryNode {
                 tag: "device-identity".into(),
                 attrs: vec![("key-index".into(), device.key_index.to_string())],
-                content: NodeContent::Bytes(account_enc.clone()),
+                content: NodeContent::Bytes(account_enc_stripped),
             }]),
         }]),
     };
@@ -186,7 +190,7 @@ pub fn process_pair_success(
             platform,
             business_name: biz,
             key_index: device.key_index,
-            account_enc,
+            account_enc: account_enc_full,
             account_signature_key: account_sig_key.to_vec(),
         },
         reply,

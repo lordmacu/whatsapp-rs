@@ -28,8 +28,9 @@ fn test_ratchet_encrypt_decrypt_roundtrip() {
     let shared_root = [0xABu8; 32];
     let bob_ratchet = KeyPair::generate();
 
-    let mut alice = RatchetSession::init_sender(shared_root, bob_ratchet.public);
-    let mut bob = RatchetSession::init_receiver(shared_root, bob_ratchet);
+    let shared_chain = [0x55u8; 32];
+    let mut alice = RatchetSession::init_sender(shared_root, shared_chain, bob_ratchet.public);
+    let mut bob = RatchetSession::init_receiver(shared_root, shared_chain, bob_ratchet);
 
     let ad = b"associated-data-alice-bob";
 
@@ -45,8 +46,9 @@ fn test_ratchet_multiple_messages() {
     let shared_root = [0x11u8; 32];
     let bob_ratchet = KeyPair::generate();
 
-    let mut alice = RatchetSession::init_sender(shared_root, bob_ratchet.public);
-    let mut bob = RatchetSession::init_receiver(shared_root, bob_ratchet);
+    let shared_chain = [0x55u8; 32];
+    let mut alice = RatchetSession::init_sender(shared_root, shared_chain, bob_ratchet.public);
+    let mut bob = RatchetSession::init_receiver(shared_root, shared_chain, bob_ratchet);
 
     let ad = b"ad";
 
@@ -63,8 +65,9 @@ fn test_ratchet_bidirectional() {
     let shared_root = [0x22u8; 32];
     let bob_ratchet = KeyPair::generate();
 
-    let mut alice = RatchetSession::init_sender(shared_root, bob_ratchet.public);
-    let mut bob = RatchetSession::init_receiver(shared_root, bob_ratchet);
+    let shared_chain = [0x55u8; 32];
+    let mut alice = RatchetSession::init_sender(shared_root, shared_chain, bob_ratchet.public);
+    let mut bob = RatchetSession::init_receiver(shared_root, shared_chain, bob_ratchet);
 
     let ad = b"ad";
 
@@ -109,6 +112,7 @@ fn test_x3dh_shared_secret() {
         one_time_pre_key_id: None,
     };
 
-    let bob_root = x3dh_receiver(&bob_identity, &bob_signed_pre_key, None, &pre_key_msg);
-    assert_eq!(result.root_key, bob_root, "X3DH shared secret must match");
+    let (bob_root, bob_chain) = x3dh_receiver(&bob_identity, &bob_signed_pre_key, None, &pre_key_msg);
+    assert_eq!(result.root_key, bob_root, "X3DH shared root must match");
+    assert_eq!(result.chain_key, bob_chain, "X3DH shared chain must match");
 }

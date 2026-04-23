@@ -183,6 +183,10 @@ pub struct MessageManager {
     /// are logged and ignored.
     pub(crate) app_state_keys: Option<Arc<crate::app_state::AppStateKeyStore>>,
     pub(crate) app_state_sync: Option<Arc<crate::app_state::AppStateSync>>,
+    /// Message ids we've already sent a retry receipt for. Second occurrence
+    /// escalates from no-keys retry to a full `<keys>` retry (Baileys' count>1
+    /// path) so the sender recreates the pairwise session.
+    pub(crate) retry_ids: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[allow(dead_code)]
@@ -194,7 +198,7 @@ impl MessageManager {
         let msg_store = Arc::new(crate::message_store::MessageStore::new(p).expect("msg store"));
         let poll_store = Arc::new(crate::poll_store::PollStore::new(p).expect("poll store"));
         let outbox = Arc::new(crate::outbox::OutboxStore::new(p).expect("outbox store"));
-        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None }
+        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None, retry_ids: std::sync::Mutex::new(std::collections::HashSet::new()) }
     }
 
     pub fn with_tx(
@@ -208,7 +212,7 @@ impl MessageManager {
         let msg_store = Arc::new(crate::message_store::MessageStore::new(p).expect("msg store"));
         let poll_store = Arc::new(crate::poll_store::PollStore::new(p).expect("poll store"));
         let outbox = Arc::new(crate::outbox::OutboxStore::new(p).expect("outbox store"));
-        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None }
+        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None, retry_ids: std::sync::Mutex::new(std::collections::HashSet::new()) }
     }
 
     pub fn with_tx_and_contacts(
@@ -222,7 +226,7 @@ impl MessageManager {
         let msg_store = Arc::new(crate::message_store::MessageStore::new(p).expect("msg store"));
         let poll_store = Arc::new(crate::poll_store::PollStore::new(p).expect("poll store"));
         let outbox = Arc::new(crate::outbox::OutboxStore::new(p).expect("outbox store"));
-        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None }
+        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None, retry_ids: std::sync::Mutex::new(std::collections::HashSet::new()) }
     }
 
     pub fn with_stores(
@@ -235,7 +239,7 @@ impl MessageManager {
         poll_store: Arc<crate::poll_store::PollStore>,
         outbox: Arc<crate::outbox::OutboxStore>,
     ) -> Self {
-        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None }
+        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None, retry_ids: std::sync::Mutex::new(std::collections::HashSet::new()) }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MessageEvent> {
