@@ -30,6 +30,7 @@ Commands:
   send-group <jid> <text>               Send a text message to a group and exit
   send-file <jid> <path> [caption]      Send an image/video/audio/document from disk and exit
   sticker <jid> <path>                  Send a sticker from disk and exit
+  send-voice <jid> <path.ogg>           Send a push-to-talk voice note (Opus/OGG recommended)
   download <jid> <msg-id> [path]        Download received media to a file (default: ./<msg-id>)
   reply <jid> <msg-id> <text>           Reply to a specific message and exit
   react <jid> <msg-id> <emoji>          Send a reaction and exit
@@ -122,6 +123,12 @@ async fn main() -> Result<()> {
                 bail!("Usage: whatsapp-rs sticker <jid> <path>");
             }
             cmd_send_sticker(&args[1], &args[2]).await
+        }
+        "send-voice" => {
+            if args.len() < 3 {
+                bail!("Usage: whatsapp-rs send-voice <jid> <path.ogg>  (Opus-in-OGG recommended)");
+            }
+            cmd_send_voice(&args[1], &args[2]).await
         }
         "download" => {
             if args.len() < 3 {
@@ -582,6 +589,41 @@ fn mime_for_ext(ext: &str) -> &'static str {
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         _      => "application/octet-stream",
     }
+}
+
+async fn cmd_send_voice(jid: &str, path: &str) -> Result<()> {
+    use base64::Engine as _;
+    let data = std::fs::read(path)?;
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "ogg" | "opus" => "audio/ogg; codecs=opus",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        _ => "audio/ogg; codecs=opus",
+    };
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    // Route through daemon first so the CLI doesn't race its own WA socket
+    // against the live daemon. Falls back to a one-shot session otherwise.
+    let req = daemon::Request::SendVoiceNote {
+        jid: jid.to_string(),
+        data_b64,
+        mimetype: mime.to_string(),
+    };
+    if let Some(v) = daemon::try_daemon_request(req).await? {
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        println!("sent: {id}");
+        return Ok(());
+    }
+    let client = client::Client::new()?;
+    let session = client.connect().await?;
+    let id = session.send_voice_note(jid, &data, mime).await?;
+    println!("sent: {id}");
+    Ok(())
 }
 
 async fn cmd_send_sticker(jid: &str, path: &str) -> Result<()> {

@@ -46,6 +46,7 @@ pub enum Request {
     SendImage { jid: String, data_b64: String, caption: Option<String> },
     SendVideo { jid: String, data_b64: String, caption: Option<String> },
     SendAudio { jid: String, data_b64: String, mimetype: String },
+    SendVoiceNote { jid: String, data_b64: String, mimetype: String },
     SendDocument { jid: String, data_b64: String, mimetype: String, file_name: String },
     Shutdown,
 }
@@ -395,6 +396,17 @@ async fn dispatch(
                 Err(e) => return Response::Err { error: format!("bad base64: {e}") },
             };
             match session.send_audio(&jid, &data, &mimetype).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendVoiceNote { jid, data_b64, mimetype } => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let data = match STANDARD.decode(&data_b64) {
+                Ok(b) => b,
+                Err(e) => return Response::Err { error: format!("bad base64: {e}") },
+            };
+            match session.send_voice_note(&jid, &data, &mimetype).await {
                 Ok(id) => Response::Ok(serde_json::json!({"id": id})),
                 Err(e) => Response::Err { error: e.to_string() },
             }
