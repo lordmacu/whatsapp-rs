@@ -272,6 +272,73 @@ impl SignalRepository {
         self.sessions.lock().unwrap().remove(jid);
     }
 
+    /// Drop every session belonging to a user, across all device slots and
+    /// across both LID and PN addressings (via the alias map). Used as a
+    /// last-resort auto-recovery when decrypt-retry-with-keys doesn't
+    /// unstick the peer: by clearing our local state we force our next
+    /// outgoing send to fetch fresh prekeys and X3DH from scratch, and
+    /// the peer's next send will no longer match our (empty) session so
+    /// our retry-receipt-with-keys path takes over.
+    ///
+    /// `user_jid` is the bare user jid (no `:device` slot). Both the user
+    /// itself and its aliased counterpart are cleared.
+    pub fn drop_sessions_for_user(&self, user_jid: &str) -> usize {
+        let mut targets: Vec<String> = vec![user_jid.to_string()];
+        if let Some(alt) = self.aliased_bare(user_jid) {
+            targets.push(alt);
+        }
+        let mut victims = Vec::new();
+        if let Ok(sessions) = self.sessions.lock() {
+            for key in sessions.keys() {
+                let (user, server, _) = split_user_server_device(key);
+                let bare = format!("{user}{server}");
+                if targets.iter().any(|t| t == &bare) {
+                    victims.push(key.clone());
+                }
+            }
+        }
+        if victims.is_empty() {
+            return 0;
+        }
+        if let Ok(mut sessions) = self.sessions.lock() {
+            for v in &victims {
+                sessions.remove(v);
+                tracing::info!("drop_sessions_for_user: removed {v}");
+            }
+        }
+        // Persist the purge so a daemon restart doesn't revive stale state.
+        if let Ok(sessions) = self.sessions.lock() {
+            let map: HashMap<String, PersistedEntry> = sessions.iter()
+                .filter_map(|(jid, e)| {
+                    let snap = e.session.snapshot();
+                    Some((jid.clone(), PersistedEntry {
+                        ad: None,
+                        peer_identity: Some(e.peer_identity.to_vec()),
+                        root_key: snap.root_key.to_vec(),
+                        send_chain: PersistedChain { key: snap.send_chain_key.to_vec(), index: snap.send_chain_index },
+                        recv_chain: snap.recv_chain_key.map(|k| PersistedChain { key: k.to_vec(), index: snap.recv_chain_index.unwrap_or(0) }),
+                        dh_send_pub: snap.dh_send_pub.to_vec(),
+                        dh_send_priv: snap.dh_send_priv.to_vec(),
+                        dh_recv: snap.dh_recv.map(|k| k.to_vec()),
+                        prev_send_count: snap.prev_send_count,
+                        skipped: snap.skipped.iter().map(|(rk, idx, mk)| PersistedSkipped { rk: rk.to_vec(), idx: *idx, mk: mk.to_vec() }).collect(),
+                        pending_pre_key: e.pending_pre_key.as_ref().map(|p| PersistedPendingPreKey {
+                            base_key_pub: p.base_key_pub.to_vec(),
+                            signed_pre_key_id: p.signed_pre_key_id,
+                            pre_key_id: p.pre_key_id,
+                            registration_id: p.registration_id,
+                        }),
+                        init_base_key: e.init_base_key.map(|b| b.to_vec()),
+                    }))
+                })
+                .collect();
+            if let Ok(data) = serde_json::to_vec(&map) {
+                let _ = self.store.save_all_sessions(&data);
+            }
+        }
+        victims.len()
+    }
+
     pub fn identity_public(&self) -> &[u8; 32] { &self.identity.public }
 
     /// Signed pre-key for retry receipts: (keyId, pub32, signature64).

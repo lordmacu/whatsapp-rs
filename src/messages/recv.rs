@@ -497,6 +497,26 @@ impl MessageManager {
                                     *count
                                 };
                                 let include_keys = retry_count > 1;
+                                // Auto-recovery: if peer hasn't honoured the
+                                // count=2-with-keys retry after a few tries,
+                                // our and their session states are truly
+                                // diverged. Drop every session for this user
+                                // so the peer's next send or our next outgoing
+                                // fetch_pre_key_bundle → X3DH → pkmsg path
+                                // can rebuild from scratch. Matches the
+                                // manual `jq | rm sessions` recovery we've
+                                // been doing by hand.
+                                if retry_count >= 3 {
+                                    let peer_bare = bare_user_jid(sender_jid);
+                                    let removed = self.signal.drop_sessions_for_user(&peer_bare);
+                                    tracing::warn!(
+                                        "auto-recovery: {retry_count} consecutive decrypt failures \
+                                         from {peer_bare} — dropped {removed} session(s). Peer or \
+                                         our next send will re-X3DH."
+                                    );
+                                    self.retry_ids.lock().unwrap()
+                                        .remove(&sender_retry_key(sender_jid));
+                                }
                                 send_retry_receipt_fn(
                                     &self.socket, node, &from, &id, t,
                                     self.signal.registration_id(),
