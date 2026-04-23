@@ -6,6 +6,7 @@ pub mod client;
 pub mod contacts;
 pub mod daemon;
 pub mod device_cache;
+pub mod event_print;
 pub mod install;
 pub mod media;
 pub mod message_store;

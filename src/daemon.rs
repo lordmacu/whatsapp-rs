@@ -34,6 +34,19 @@ pub enum Request {
     SendText { jid: String, text: String },
     History { jid: String, n: Option<usize> },
     Contacts,
+    /// Stream incoming messages + status updates as JSON lines until the
+    /// client disconnects. Designed for long-running consumers (eg. an AI
+    /// agent) that want to react to messages in real time.
+    Subscribe,
+    SendTyping { jid: String, composing: bool },
+    MarkRead { jid: String, id: String, participant: Option<String> },
+    /// Download media for a previously-received message by (jid, msg id).
+    /// Response: `{"data_b64": "..."}` with the decrypted media bytes.
+    DownloadMedia { jid: String, id: String },
+    SendImage { jid: String, data_b64: String, caption: Option<String> },
+    SendVideo { jid: String, data_b64: String, caption: Option<String> },
+    SendAudio { jid: String, data_b64: String, mimetype: String },
+    SendDocument { jid: String, data_b64: String, mimetype: String, file_name: String },
     Shutdown,
 }
 
@@ -117,6 +130,22 @@ pub async fn run_daemon() -> Result<()> {
     let session = Arc::new(client.connect().await?);
     tracing::info!("daemon: connected as {}", session.our_jid);
 
+    // Print every event to stdout so `journalctl --user -u whatsapp-rs -f`
+    // works as a live monitor while the daemon is running.
+    let print_sess = session.clone();
+    let mut print_rx = session.events();
+    tokio::spawn(async move {
+        loop {
+            match print_rx.recv().await {
+                Ok(ev) => crate::event_print::print_event(&print_sess, ev).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("daemon: dropped {n} events");
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let token = random_token();
@@ -191,11 +220,102 @@ async fn handle_client(
             }
         };
 
+        // `Subscribe` is a long-lived request: ack once, then stream events
+        // until the client disconnects. No further requests honoured on this
+        // connection after that.
+        if matches!(req, Request::Subscribe) {
+            let ok = Response::Ok(serde_json::json!({"subscribed": true}));
+            tx.write_all(serde_json::to_vec(&ok)?.as_slice()).await?;
+            tx.write_all(b"\n").await?;
+            stream_events(&session, &mut tx).await;
+            break;
+        }
+
         let resp = dispatch(&session, req, &shutdown_tx).await;
         tx.write_all(serde_json::to_vec(&resp)?.as_slice()).await?;
         tx.write_all(b"\n").await?;
     }
     Ok(())
+}
+
+/// Pump `session.events()` onto `tx` as JSON lines. One line per event.
+/// Loops until the peer disconnects or the event channel closes.
+async fn stream_events(session: &Session, tx: &mut tokio::net::tcp::OwnedWriteHalf) {
+    let mut rx = session.events();
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let Some(json) = event_to_json(session, &ev) else { continue };
+                let mut line = match serde_json::to_vec(&json) { Ok(b) => b, Err(_) => continue };
+                line.push(b'\n');
+                if tx.write_all(&line).await.is_err() { return; }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+fn event_to_json(session: &Session, ev: &MessageEvent) -> Option<serde_json::Value> {
+    use crate::MessageContent;
+    match ev {
+        MessageEvent::NewMessage { msg } => {
+            let name = msg.push_name.clone()
+                .or_else(|| session.contact_name(
+                    msg.key.participant.as_deref().unwrap_or(&msg.key.remote_jid)
+                ));
+            let content = msg.message.as_ref().map(|c| match c {
+                MessageContent::Text { text, mentioned_jids } =>
+                    serde_json::json!({"type": "text", "text": text, "mentions": mentioned_jids}),
+                MessageContent::Image { info, caption } =>
+                    serde_json::json!({"type": "image", "caption": caption, "media": info}),
+                MessageContent::Video { info, caption } =>
+                    serde_json::json!({"type": "video", "caption": caption, "media": info}),
+                MessageContent::Audio { info } =>
+                    serde_json::json!({"type": "audio", "media": info}),
+                MessageContent::Document { info, file_name } =>
+                    serde_json::json!({"type": "document", "file_name": file_name, "media": info}),
+                MessageContent::Sticker { info } =>
+                    serde_json::json!({"type": "sticker", "media": info}),
+                MessageContent::Reaction { target_id, emoji } =>
+                    serde_json::json!({"type": "reaction", "target_id": target_id, "emoji": emoji}),
+                MessageContent::Reply { reply_to_id, text } =>
+                    serde_json::json!({"type": "reply", "reply_to_id": reply_to_id, "text": text}),
+                MessageContent::Poll { question, options, selectable_count } =>
+                    serde_json::json!({"type": "poll", "question": question, "options": options, "selectable_count": selectable_count}),
+                MessageContent::LinkPreview { text, url, title, description, .. } =>
+                    serde_json::json!({"type": "link_preview", "text": text, "url": url, "title": title, "description": description}),
+            });
+            Some(serde_json::json!({
+                "event": "message",
+                "key": msg.key,
+                "push_name": name,
+                "timestamp": msg.message_timestamp,
+                "content": content,
+            }))
+        }
+        MessageEvent::MessageUpdate { key, status } => Some(serde_json::json!({
+            "event": "message_status", "key": key, "status": format!("{status:?}"),
+        })),
+        MessageEvent::MessageRevoke { key } => Some(serde_json::json!({
+            "event": "message_revoke", "key": key,
+        })),
+        MessageEvent::MessageEdit { key, new_text } => Some(serde_json::json!({
+            "event": "message_edit", "key": key, "text": new_text,
+        })),
+        MessageEvent::Typing { jid, composing } => Some(serde_json::json!({
+            "event": "typing", "jid": jid, "composing": composing,
+        })),
+        MessageEvent::Presence { jid, available } => Some(serde_json::json!({
+            "event": "presence", "jid": jid, "available": available,
+        })),
+        MessageEvent::Disconnected { reason, reconnect } => Some(serde_json::json!({
+            "event": "disconnected", "reason": reason, "reconnect": reconnect,
+        })),
+        // Ignore connection lifecycle, history sync, app-state, etc — not
+        // useful to agents. Add more if needed.
+        _ => None,
+    }
 }
 
 async fn dispatch(
@@ -220,6 +340,79 @@ async fn dispatch(
         }
         Request::Contacts => {
             Response::Ok(serde_json::json!({"contacts": session.contacts_snapshot()}))
+        }
+        Request::SendTyping { jid, composing } => {
+            match session.send_typing(&jid, composing).await {
+                Ok(()) => Response::Ok(serde_json::json!({"ok": true})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::MarkRead { jid, id, participant } => {
+            let key = crate::messages::MessageKey {
+                remote_jid: jid,
+                from_me: false,
+                id,
+                participant,
+            };
+            match session.mark_read(&[key]).await {
+                Ok(()) => Response::Ok(serde_json::json!({"ok": true})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::DownloadMedia { jid, id } => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            match session.download_media_by_id(&jid, &id).await {
+                Ok(bytes) => Response::Ok(serde_json::json!({"data_b64": STANDARD.encode(&bytes)})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendImage { jid, data_b64, caption } => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let data = match STANDARD.decode(&data_b64) {
+                Ok(b) => b,
+                Err(e) => return Response::Err { error: format!("bad base64: {e}") },
+            };
+            match session.send_image(&jid, &data, caption.as_deref()).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendVideo { jid, data_b64, caption } => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let data = match STANDARD.decode(&data_b64) {
+                Ok(b) => b,
+                Err(e) => return Response::Err { error: format!("bad base64: {e}") },
+            };
+            match session.send_video(&jid, &data, caption.as_deref()).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendAudio { jid, data_b64, mimetype } => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let data = match STANDARD.decode(&data_b64) {
+                Ok(b) => b,
+                Err(e) => return Response::Err { error: format!("bad base64: {e}") },
+            };
+            match session.send_audio(&jid, &data, &mimetype).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendDocument { jid, data_b64, mimetype, file_name } => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let data = match STANDARD.decode(&data_b64) {
+                Ok(b) => b,
+                Err(e) => return Response::Err { error: format!("bad base64: {e}") },
+            };
+            match session.send_document(&jid, &data, &mimetype, &file_name).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::Subscribe => {
+            // Handled earlier in handle_client; unreachable here.
+            Response::Err { error: "subscribe handled out-of-band".into() }
         }
         Request::Shutdown => {
             let _ = shutdown_tx.send(()).await;
