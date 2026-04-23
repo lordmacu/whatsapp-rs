@@ -102,6 +102,41 @@ pub enum MessageContent {
         /// to build a minimal one from name + phone.
         vcard: String,
     },
+    /// Interactive message with up to 3 inline buttons. Modern consumer WA
+    /// may render as plain text (buttons are reliable only for Business
+    /// accounts); the `text` field duplicates into `contentText` so the
+    /// fallback still looks right.
+    Buttons {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        footer: Option<String>,
+        /// `(id, label)` pairs. `id` is what comes back in the response.
+        buttons: Vec<(String, String)>,
+    },
+    /// Interactive "tap to open" list with titled sections of rows.
+    List {
+        title: String,
+        description: String,
+        /// Label of the button that opens the selection sheet.
+        button_text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        footer: Option<String>,
+        sections: Vec<ListSection>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListSection {
+    pub title: String,
+    pub rows: Vec<ListRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListRow {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 impl MessageContent {

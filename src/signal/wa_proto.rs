@@ -330,6 +330,91 @@ pub fn encode_wa_poll_message(
     (proto_message(49, &poll), enc_key)
 }
 
+/// Encode WAProto.Message.buttonsMessage = field 42.
+///
+/// ButtonsMessage proto (canonical, text-header variant):
+///   1  header.text (string)       ← `text` goes here
+///   6  contentText (string)       ← same text, duplicated so legacy clients render
+///   7  footerText (string, opt)
+///   9  buttons (repeated Button) — Button: 1=buttonID, 2=ButtonText{1=displayText}, 3=type (RESPONSE=1)
+///   10 headerType (varint) — TEXT = 2
+///
+/// WA business accounts see the inline pills; consumer WA falls back to
+/// plain text (the `contentText` field). Up to 3 buttons in practice.
+pub fn encode_wa_buttons_message(
+    text: &str,
+    footer: Option<&str>,
+    buttons: &[(&str, &str)],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    // header oneof = text at field 1
+    body.extend(proto_bytes(1, text.as_bytes()));
+    body.extend(proto_bytes(6, text.as_bytes()));
+    if let Some(f) = footer {
+        if !f.is_empty() { body.extend(proto_bytes(7, f.as_bytes())); }
+    }
+    for (id, label) in buttons {
+        let mut btn = Vec::new();
+        btn.extend(proto_bytes(1, id.as_bytes()));
+        // ButtonText { 1 = displayText }
+        let bt = proto_bytes(1, label.as_bytes());
+        btn.extend(proto_message(2, &bt));
+        btn.extend(proto_varint(3, 1)); // type = RESPONSE
+        body.extend(proto_message(9, &btn));
+    }
+    body.extend(proto_varint(10, 2)); // headerType = TEXT
+    proto_message(42, &body)
+}
+
+/// Encode WAProto.Message.listMessage = field 36.
+///
+/// ListMessage proto:
+///   1 title, 2 description, 3 buttonText, 4 listType (SINGLE_SELECT=1),
+///   5 sections (repeated Section), 7 footerText.
+///   Section: 1 title, 2 rows (repeated Row).
+///   Row: 1 title, 2 description, 3 rowID.
+///
+/// `button_text` is the label of the "select" button that opens the sheet.
+pub fn encode_wa_list_message(
+    title: &str,
+    description: &str,
+    button_text: &str,
+    footer: Option<&str>,
+    sections: &[(String, Vec<ListRow>)],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend(proto_bytes(1, title.as_bytes()));
+    body.extend(proto_bytes(2, description.as_bytes()));
+    body.extend(proto_bytes(3, button_text.as_bytes()));
+    body.extend(proto_varint(4, 1)); // SINGLE_SELECT
+    for (sec_title, rows) in sections {
+        let mut sec = Vec::new();
+        sec.extend(proto_bytes(1, sec_title.as_bytes()));
+        for row in rows {
+            let mut r = Vec::new();
+            r.extend(proto_bytes(1, row.title.as_bytes()));
+            if !row.description.is_empty() {
+                r.extend(proto_bytes(2, row.description.as_bytes()));
+            }
+            r.extend(proto_bytes(3, row.id.as_bytes()));
+            sec.extend(proto_message(2, &r));
+        }
+        body.extend(proto_message(5, &sec));
+    }
+    if let Some(f) = footer {
+        if !f.is_empty() { body.extend(proto_bytes(7, f.as_bytes())); }
+    }
+    proto_message(36, &body)
+}
+
+/// One entry inside a ListMessage section.
+#[derive(Debug, Clone)]
+pub struct ListRow {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+}
+
 /// Wrap a normal WAProto.Message blob (image/video) in a `viewOnceMessage`
 /// envelope so the receiver's WA client deletes the media after first open.
 ///

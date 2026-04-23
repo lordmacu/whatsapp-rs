@@ -96,6 +96,10 @@ fn summarize_message(message: Option<&MessageContent>) -> Option<String> {
             name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
         )),
         MessageContent::Contact { display_name, .. } => Some(format!("<contact: {display_name}>")),
+        MessageContent::Buttons { text, buttons, .. } => Some(format!(
+            "{text}  [buttons: {}]", buttons.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(" / ")
+        )),
+        MessageContent::List { title, .. } => Some(format!("<list: {title}>")),
     }
 }
 

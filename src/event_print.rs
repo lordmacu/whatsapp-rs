@@ -36,6 +36,11 @@ fn summarize_message(message: Option<&MessageContent>) -> Option<String> {
             name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
         )),
         MessageContent::Contact { display_name, .. } => Some(format!("<contact: {display_name}>")),
+        MessageContent::Buttons { text, buttons, .. } => Some(format!(
+            "{text}  [buttons: {}]",
+            buttons.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(" / ")
+        )),
+        MessageContent::List { title, .. } => Some(format!("<list: {title}>")),
     }
 }
 
@@ -123,6 +128,14 @@ pub async fn print_event(session: &Session, event: MessageEvent) {
                 }
                 Some(MessageContent::Contact { display_name, .. }) => {
                     println!("{prefix} <contact: {display_name}>");
+                    let _ = session.mark_read(&[msg.key]).await;
+                }
+                Some(MessageContent::Buttons { text, .. }) => {
+                    println!("{prefix} <buttons> {text}");
+                    let _ = session.mark_read(&[msg.key]).await;
+                }
+                Some(MessageContent::List { title, .. }) => {
+                    println!("{prefix} <list: {title}>");
                     let _ = session.mark_read(&[msg.key]).await;
                 }
                 None => {}

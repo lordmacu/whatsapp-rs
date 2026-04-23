@@ -842,6 +842,26 @@ impl MessageManager {
                 ),
             Some(MessageContent::Contact { display_name, vcard }) =>
                 crate::signal::wa_proto::encode_wa_contact_message(display_name, vcard),
+            Some(MessageContent::Buttons { text, footer, buttons }) => {
+                let refs: Vec<(&str, &str)> = buttons.iter()
+                    .map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                crate::signal::wa_proto::encode_wa_buttons_message(
+                    text, footer.as_deref(), &refs,
+                )
+            }
+            Some(MessageContent::List { title, description, button_text, footer, sections }) => {
+                let proto_sections: Vec<(String, Vec<crate::signal::wa_proto::ListRow>)> =
+                    sections.iter().map(|s| (s.title.clone(),
+                        s.rows.iter().map(|r| crate::signal::wa_proto::ListRow {
+                            id: r.id.clone(),
+                            title: r.title.clone(),
+                            description: r.description.clone(),
+                        }).collect()
+                    )).collect();
+                crate::signal::wa_proto::encode_wa_list_message(
+                    title, description, button_text, footer.as_deref(), &proto_sections,
+                )
+            }
             None => anyhow::bail!("send_message called with no content"),
         };
         Ok(bytes)
@@ -1407,6 +1427,40 @@ impl MessageManager {
             title: title.to_string(),
             description: description.to_string(),
             thumbnail_jpeg,
+        }).await?;
+        Ok(id)
+    }
+
+    /// Send an inline-buttons message. `buttons` is `[(id, label), …]`.
+    /// Up to 3 entries in practice; modern consumer WA may render the
+    /// fallback text only — see [`MessageContent::Buttons`].
+    pub async fn send_buttons(
+        &self, jid: &str, text: &str, footer: Option<&str>,
+        buttons: &[(String, String)],
+    ) -> Result<String> {
+        let id = generate_message_id();
+        self.send_message(jid, id.clone(), MessageContent::Buttons {
+            text: text.to_string(),
+            footer: footer.map(|s| s.to_string()),
+            buttons: buttons.to_vec(),
+        }).await?;
+        Ok(id)
+    }
+
+    /// Send a "tap to open" list. See [`MessageContent::List`].
+    pub async fn send_list(
+        &self, jid: &str,
+        title: &str, description: &str, button_text: &str,
+        footer: Option<&str>,
+        sections: Vec<crate::messages::ListSection>,
+    ) -> Result<String> {
+        let id = generate_message_id();
+        self.send_message(jid, id.clone(), MessageContent::List {
+            title: title.to_string(),
+            description: description.to_string(),
+            button_text: button_text.to_string(),
+            footer: footer.map(|s| s.to_string()),
+            sections,
         }).await?;
         Ok(id)
     }

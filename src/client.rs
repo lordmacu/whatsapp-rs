@@ -1216,6 +1216,27 @@ impl Session {
             .await.map_err(Into::into)
     }
 
+    /// Send an inline-buttons message (up to 3 buttons; consumer WA may
+    /// render only the fallback text).
+    pub async fn send_buttons(
+        &self, jid: &str, text: &str, footer: Option<&str>,
+        buttons: &[(String, String)],
+    ) -> Result<String> {
+        self.mgr.read().await.send_buttons(jid, text, footer, buttons).await.map_err(Into::into)
+    }
+
+    /// Send a list (tap-to-open) with sections of rows.
+    pub async fn send_list(
+        &self, jid: &str,
+        title: &str, description: &str, button_text: &str,
+        footer: Option<&str>,
+        sections: Vec<crate::messages::ListSection>,
+    ) -> Result<String> {
+        self.mgr.read().await
+            .send_list(jid, title, description, button_text, footer, sections)
+            .await.map_err(Into::into)
+    }
+
     /// Send text and auto-attach a link preview if the body contains a URL.
     /// Fetches OG metadata + thumbnail with a short timeout; degrades to
     /// plain text on fetch failure.

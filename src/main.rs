@@ -43,6 +43,8 @@ Commands:
   send-contact <jid> <display-name> <phone-E164>     Share a contact card
   send-text-preview <jid> <text>        Send text + auto-fetched link preview (detects URL)
   send-viewonce <jid> <path> [caption]  Send a one-shot image/video (receiver's WA wipes after open)
+  send-buttons <jid> <text> <id:label>... Send inline-buttons message (up to 3 id:label pairs)
+  send-list <jid> <title> <desc> <btn> <section>...  Send list; section: 'Title|id:title:desc|id:title'
   download <jid> <msg-id> [path]        Download received media to a file (default: ./<msg-id>)
   reply <jid> <msg-id> <text>           Reply to a specific message and exit
   react <jid> <msg-id> <emoji>          Send a reaction and exit
@@ -172,6 +174,22 @@ async fn main() -> Result<()> {
                 bail!("Usage: whatsapp-rs send-text-preview <jid> <text>");
             }
             cmd_send_text_preview(&args[1], &args[2]).await
+        }
+        "send-buttons" => {
+            if args.len() < 4 {
+                bail!("Usage: whatsapp-rs send-buttons <jid> <text> <id1:label1> [id2:label2] [id3:label3]");
+            }
+            let buttons: Vec<(String, String)> = args[3..].iter().filter_map(|s| {
+                s.split_once(':').map(|(id, label)| (id.to_string(), label.to_string()))
+            }).collect();
+            if buttons.is_empty() { bail!("need at least one button in id:label form"); }
+            cmd_send_buttons(&args[1], &args[2], &buttons).await
+        }
+        "send-list" => {
+            if args.len() < 6 {
+                bail!("Usage: whatsapp-rs send-list <jid> <title> <desc> <button-text> <sectionSpec>...\n  sectionSpec: 'Section Title|id1:title1:desc1|id2:title2'");
+            }
+            cmd_send_list(&args[1], &args[2], &args[3], &args[4], &args[5..]).await
         }
         "send-viewonce" => {
             if args.len() < 3 {
@@ -920,6 +938,38 @@ async fn cmd_status() -> Result<()> {
     println!("connected as {}", session.our_jid);
     let contacts = session.contacts_snapshot();
     println!("{} cached contacts", contacts.len());
+    Ok(())
+}
+
+async fn cmd_send_buttons(jid: &str, text: &str, buttons: &[(String, String)]) -> Result<()> {
+    let client = client::Client::new()?;
+    let session = client.connect().await?;
+    let id = session.send_buttons(jid, text, None, buttons).await?;
+    println!("sent: {id}");
+    Ok(())
+}
+
+async fn cmd_send_list(
+    jid: &str, title: &str, description: &str, button_text: &str, section_specs: &[String],
+) -> Result<()> {
+    let sections: Vec<crate::messages::ListSection> = section_specs.iter().map(|spec| {
+        // Spec: "Section Title|id1:title1:desc1|id2:title2"
+        let mut parts = spec.split('|');
+        let sec_title = parts.next().unwrap_or("").to_string();
+        let rows: Vec<crate::messages::ListRow> = parts.map(|r| {
+            let mut p = r.splitn(3, ':');
+            let id = p.next().unwrap_or("").to_string();
+            let title = p.next().unwrap_or("").to_string();
+            let description = p.next().unwrap_or("").to_string();
+            crate::messages::ListRow { id, title, description }
+        }).collect();
+        crate::messages::ListSection { title: sec_title, rows }
+    }).collect();
+
+    let client = client::Client::new()?;
+    let session = client.connect().await?;
+    let id = session.send_list(jid, title, description, button_text, None, sections).await?;
+    println!("sent: {id}");
     Ok(())
 }
 

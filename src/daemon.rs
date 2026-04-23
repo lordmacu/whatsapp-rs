@@ -358,6 +358,15 @@ fn event_to_json(session: &Session, ev: &MessageEvent) -> Option<serde_json::Val
                     serde_json::json!({"type": "link_preview", "text": text, "url": url, "title": title, "description": description}),
                 MessageContent::Location { latitude, longitude, name, address } =>
                     serde_json::json!({"type": "location", "lat": latitude, "lon": longitude, "name": name, "address": address}),
+                MessageContent::Buttons { text, buttons, .. } =>
+                    serde_json::json!({"type": "buttons", "text": text,
+                        "buttons": buttons.iter().map(|(id,l)| serde_json::json!({"id":id,"label":l})).collect::<Vec<_>>()}),
+                MessageContent::List { title, description, sections, .. } =>
+                    serde_json::json!({"type": "list", "title": title, "description": description,
+                        "sections": sections.iter().map(|s| serde_json::json!({
+                            "title": s.title,
+                            "rows": s.rows.iter().map(|r| serde_json::json!({"id":r.id,"title":r.title,"description":r.description})).collect::<Vec<_>>()
+                        })).collect::<Vec<_>>()}),
                 MessageContent::Contact { display_name, vcard } =>
                     serde_json::json!({"type": "contact", "display_name": display_name, "vcard": vcard}),
             });
