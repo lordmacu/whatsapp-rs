@@ -118,6 +118,7 @@ impl Scheduler {
     /// new list before returning.
     pub fn take_due(&self, now: u64) -> Vec<ScheduledItem> {
         let mut items = self.items.lock().unwrap();
+        #[allow(unused_mut)]
         let (due, mut remaining): (Vec<_>, Vec<_>) =
             items.drain(..).partition(|i| i.send_at_unix <= now);
         // Requeue recurring items with their next fire time so the id stays
@@ -230,7 +231,7 @@ fn next_daily(after: u64, hour: u8, minute: u8) -> u64 {
 fn next_weekly(after: u64, weekday: u8, hour: u8, minute: u8) -> u64 {
     // Unix epoch (1970-01-01) was a Thursday — day-of-week = 4.
     let today_dow = ((after / 86_400) + 4) % 7;
-    let mut days = ((weekday as u64 + 7) - today_dow) % 7;
+    let days = ((weekday as u64 + 7) - today_dow) % 7;
     let today_at = next_daily(after, hour, minute);
     if days == 0 {
         // Same weekday — use the already-correct daily computation.

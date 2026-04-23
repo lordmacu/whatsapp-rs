@@ -33,6 +33,7 @@ Usage: whatsapp-rs <command> [args]
 Commands:
   listen                                Connect and print all incoming messages (default)
   send <jid> <text>                     Send a text message and exit
+  broadcast <jids|file> <text>          Send <text> to a comma-list of JIDs or a file with one per line
   send-group <jid> <text>               Send a text message to a group and exit
   send-file <jid> <path> [caption]      Send an image/video/audio/document from disk and exit
   sticker <jid> <path>                  Send a sticker from disk and exit
@@ -270,6 +271,12 @@ async fn main() -> Result<()> {
         }
         "status" => cmd_status().await,
         "metrics" => cmd_metrics().await,
+        "broadcast" => {
+            if args.len() < 3 {
+                bail!("Usage: whatsapp-rs broadcast <jid1,jid2,...> <text>\n  (or <file> with one JID per line)");
+            }
+            cmd_broadcast(&args[1], &args[2]).await
+        }
         "schedule" => {
             if args.len() < 4 {
                 bail!("Usage: whatsapp-rs schedule <when> <jid> <text>\n  <when>: 30s | 15m | 2h | 1d | <unix-seconds> | 2026-04-24T09:00:00");
@@ -905,6 +912,44 @@ async fn cmd_status() -> Result<()> {
     println!("connected as {}", session.our_jid);
     let contacts = session.contacts_snapshot();
     println!("{} cached contacts", contacts.len());
+    Ok(())
+}
+
+async fn cmd_broadcast(jids_spec: &str, text: &str) -> Result<()> {
+    // Accept either a comma-separated list or a path to a file with one JID
+    // per line. Lines starting with '#' are skipped so you can comment them.
+    let jids: Vec<String> = if std::path::Path::new(jids_spec).is_file() {
+        std::fs::read_to_string(jids_spec)?
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    } else {
+        jids_spec.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+    };
+    if jids.is_empty() { bail!("no JIDs to broadcast to"); }
+
+    let mut ok = 0usize;
+    let err = 0usize;
+    // Sent via daemon so the internal send-path rate limiter applies
+    // naturally — we don't need to sleep in the CLI, the daemon paces.
+    for jid in &jids {
+        let req = daemon::Request::SendText { jid: jid.clone(), text: text.to_string() };
+        match daemon::try_daemon_request(req).await? {
+            Some(v) => {
+                let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+                println!("✓ {jid}  {id}");
+                ok += 1;
+            }
+            None => bail!("no daemon running"),
+        }
+    }
+    let _ = err; // kept for future richer error handling
+    // Count up any per-JID Err responses the daemon returned. For now
+    // try_daemon_request turns daemon-side `Err {error}` into an Err(anyhow)
+    // and we bail above, so err stays 0 — future work: accumulate instead.
+    println!("\nsent {ok}/{} (errors: {err})", jids.len());
     Ok(())
 }
 
