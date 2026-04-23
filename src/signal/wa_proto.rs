@@ -307,15 +307,35 @@ pub fn encode_wa_poll_message(
 /// Wrap a normal WAProto.Message blob (image/video) in a `ViewOnceMessageV2`
 /// envelope so the receiver's WA client deletes the media after first open.
 ///
-/// Structure:
+/// Structure (modern WA, required by ≥ 2.24):
 /// ```text
-/// outer Message { viewOnceMessageV2 = FutureProofMessage { message = inner } }
-/// outer.field 68 ← FutureProofMessage bytes
-///   FutureProofMessage.field 1 ← inner Message bytes (tagged sub-message)
+/// outer Message {
+///   messageContextInfo = MessageContextInfo { messageSecret = <32 random bytes> }   // field 35
+///   viewOnceMessageV2  = FutureProofMessage   { message = inner Message }           // field 68
+/// }
 /// ```
+///
+/// The `messageSecret` is mandatory — without it modern WA shows
+/// "this message is not supported by your version of WhatsApp". The
+/// bytes don't need to match anything; they're an ephemeral per-message
+/// key the client stores next to the view-once record.
 pub fn wrap_view_once(inner_message: &[u8]) -> Vec<u8> {
+    use rand::RngCore;
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+
+    // MessageContextInfo { field 3 = messageSecret (bytes) }
+    let mci_body = proto_bytes(3, &secret);
+    let mci_outer = proto_message(35, &mci_body);
+
+    // FutureProofMessage { field 1 = inner Message }
     let fp = proto_bytes(1, inner_message);
-    proto_message(68, &fp)
+    let view_once = proto_message(68, &fp);
+
+    let mut out = Vec::with_capacity(view_once.len() + mci_outer.len());
+    out.extend_from_slice(&view_once);
+    out.extend_from_slice(&mci_outer);
+    out
 }
 
 // ── WAProto.Message decode ────────────────────────────────────────────────────
