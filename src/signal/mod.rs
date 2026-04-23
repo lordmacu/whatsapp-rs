@@ -596,6 +596,9 @@ impl SignalRepository {
                 }
             }
         }
+        tracing::info!(
+            "decrypt msg: jid={jid} primary={primary} candidates={candidates:?}"
+        );
         let mut last_err: Option<anyhow::Error> = None;
         for candidate in &candidates {
             match self.decrypt_normal_for_jid(candidate, &msg, data) {
@@ -609,7 +612,12 @@ impl SignalRepository {
                     }
                     return Ok(pt);
                 }
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    tracing::info!(
+                        "decrypt msg: candidate {candidate} failed: {e}"
+                    );
+                    last_err = Some(e);
+                }
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no sessions for {jid}")))
