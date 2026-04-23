@@ -3,6 +3,37 @@ use tracing::info;
 use crate::client::Session;
 use crate::{MessageContent, MessageEvent};
 
+fn summarize_message(message: Option<&MessageContent>) -> Option<String> {
+    match message? {
+        MessageContent::Text { text, mentioned_jids } => {
+            if mentioned_jids.is_empty() {
+                Some(text.clone())
+            } else {
+                Some(format!("{text}  (mentions: {})", mentioned_jids.join(", ")))
+            }
+        }
+        MessageContent::Image { caption, .. } => {
+            Some(format!("<image: {}>", caption.as_deref().unwrap_or("")))
+        }
+        MessageContent::Video { caption, .. } => {
+            Some(format!("<video: {}>", caption.as_deref().unwrap_or("")))
+        }
+        MessageContent::Audio { .. } => Some("<audio>".to_string()),
+        MessageContent::Document { file_name, .. } => Some(format!("<document: {file_name}>")),
+        MessageContent::Sticker { .. } => Some("<sticker>".to_string()),
+        MessageContent::Reaction { emoji, target_id } => {
+            Some(format!("reacted {emoji} to {target_id}"))
+        }
+        MessageContent::Reply { text, reply_to_id } => {
+            Some(format!("(reply to {reply_to_id}) {text}"))
+        }
+        MessageContent::Poll { question, options, .. } => {
+            Some(format!("poll: {question} — {}", options.join(" / ")))
+        }
+        MessageContent::LinkPreview { text, url, .. } => Some(format!("{text}  [{url}]")),
+    }
+}
+
 pub async fn print_event(session: &Session, event: MessageEvent) {
     match event {
         MessageEvent::NewMessage { msg } => {
@@ -14,6 +45,27 @@ pub async fn print_event(session: &Session, event: MessageEvent) {
                 .unwrap_or_else(|| sender.to_string());
             let is_status = from == "status@broadcast";
             let prefix = if is_status { format!("[status {name}]") } else { format!("[{name}]") };
+            let summary = summarize_message(msg.message.as_ref());
+
+            if from.ends_with("@g.us") {
+                let group_name = session.contact_name(from).unwrap_or_else(|| from.to_string());
+                info!(
+                    group_jid = %from,
+                    group_name = %group_name,
+                    sender_jid = %sender,
+                    sender_name = %name,
+                    summary = %summary.as_deref().unwrap_or("<empty>"),
+                    "group message",
+                );
+            } else {
+                info!(
+                    jid = %from,
+                    sender_jid = %sender,
+                    sender_name = %name,
+                    summary = %summary.as_deref().unwrap_or("<empty>"),
+                    "message",
+                );
+            }
 
             match &msg.message {
                 Some(MessageContent::Text { text, mentioned_jids }) => {

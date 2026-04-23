@@ -7,7 +7,7 @@
 use crate::auth::{AuthManager, AuthState, FileStore};
 use crate::contacts::ContactStore;
 use crate::message_store::MessageStore;
-use crate::messages::{MessageEvent, MessageKey, MessageManager};
+use crate::messages::{MessageEvent, MessageKey, MessageManager, MessageStatus};
 use crate::outbox::OutboxStore;
 use crate::poll_store::PollStore;
 use crate::signal::SignalRepository;
@@ -70,6 +70,7 @@ impl Client {
 
     async fn start_session(&self, auth_mgr: AuthManager) -> Result<Session> {
         let our_jid = auth_mgr.creds().me.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+        let our_lid = auth_mgr.creds().me.as_ref().and_then(|c| c.lid.clone());
 
         // Shared state — survives reconnects
         let base = self.store.base_dir();
@@ -103,6 +104,7 @@ impl Client {
                 sender, signal, our_jid.clone(), event_tx.clone(),
                 contacts.clone(), msg_store.clone(), poll_store.clone(), outbox.clone(),
             )
+            .with_our_lid(our_lid.clone())
             .with_app_state(app_state_keys.clone(), app_state_sync.clone()),
         );
         let current_mgr: Arc<RwLock<Arc<MessageManager>>> = Arc::new(RwLock::new(mgr.clone()));
@@ -138,7 +140,7 @@ impl Client {
         let bg_handle = tokio::spawn(async move {
             run_session_loop(
                 receiver, mgr, bg_mgr, bg_tx, bg_creds, bg_store, bg_jid,
-                bg_contacts, bg_msgs, bg_polls, bg_outbox,
+                our_lid.clone(), bg_contacts, bg_msgs, bg_polls, bg_outbox,
             ).await;
         });
 
@@ -623,6 +625,7 @@ async fn run_session_loop(
     creds: SharedCreds,
     store: Arc<FileStore>,
     our_jid: String,
+    our_lid: Option<String>,
     contacts: Arc<ContactStore>,
     msg_store: Arc<MessageStore>,
     poll_store: Arc<PollStore>,
@@ -667,6 +670,7 @@ async fn run_session_loop(
                 sender, signal, our_jid.clone(), event_tx.clone(),
                 contacts.clone(), msg_store.clone(), poll_store.clone(), outbox.clone(),
             )
+            .with_our_lid(our_lid.clone())
             .with_app_state(app_state_keys, app_state_sync),
         );
 
@@ -795,6 +799,16 @@ async fn run_one_connection(
                 match node_result {
                     Ok(Some(node)) => {
                         tracing::debug!(tag = %node.tag, attrs = ?node.attrs, "← node");
+                        if node.tag == "message" {
+                            info!(
+                                from = %node.attr("from").unwrap_or(""),
+                                id = %node.attr("id").unwrap_or(""),
+                                participant = %node.attr("participant").unwrap_or(""),
+                                kind = %node.attr("type").unwrap_or(""),
+                                offline = %node.attr("offline").unwrap_or(""),
+                                "client received message node",
+                            );
+                        }
 
                         // Login confirmation — session is authenticated and
                         // usable NOW. Emit Connected immediately so send-path
@@ -860,7 +874,7 @@ async fn run_one_connection(
                             }
                         }
                         if let Err(e) = mgr.handle_node(&node).await {
-                            debug!("handle_node: {e}");
+                            warn!(tag = %node.tag, from = %node.attr("from").unwrap_or(""), id = %node.attr("id").unwrap_or(""), "handle_node failed: {e}");
                         }
                     }
                     Ok(None) => break,
@@ -1299,5 +1313,216 @@ impl Session {
 
     pub async fn set_profile_picture(&self, jpeg_data: &[u8]) -> Result<()> {
         self.mgr.read().await.set_profile_picture(jpeg_data).await
+    }
+
+    // ── Chat handle ───────────────────────────────────────────────────────────
+
+    /// Return a handle scoped to a single chat (user or group).
+    ///
+    /// Lets agent-style callers skip repeating the JID:
+    /// `session.chat(jid).text("hi").await?;`
+    /// `session.chat(jid).react(msg_id, "👍").await?;`
+    pub fn chat(&self, jid: impl Into<String>) -> Chat<'_> {
+        Chat { session: self, jid: jid.into() }
+    }
+}
+
+/// Ergonomic wrapper over [`Session`] scoped to one chat JID. Mirrors the
+/// send/receipt-style APIs on `Session` but removes the repeated JID arg.
+/// Obtain via [`Session::chat`].
+#[allow(dead_code)]
+pub struct Chat<'a> {
+    session: &'a Session,
+    jid: String,
+}
+
+#[allow(dead_code)]
+impl<'a> Chat<'a> {
+    pub fn jid(&self) -> &str { &self.jid }
+
+    pub fn name(&self) -> Option<String> {
+        self.session.contact_name(&self.jid)
+    }
+
+    pub async fn text(&self, text: &str) -> Result<String> {
+        self.session.send_text(&self.jid, text).await
+    }
+
+    pub async fn reply(&self, reply_to_id: &str, text: &str) -> Result<String> {
+        self.session.send_reply(&self.jid, reply_to_id, text).await
+    }
+
+    pub async fn react(&self, target_id: &str, emoji: &str) -> Result<()> {
+        self.session.send_reaction(&self.jid, target_id, emoji).await
+    }
+
+    pub async fn mention(&self, text: &str, mention_jids: &[&str]) -> Result<String> {
+        self.session.send_mention(&self.jid, text, mention_jids).await
+    }
+
+    pub async fn revoke(&self, msg_id: &str) -> Result<()> {
+        self.session.send_revoke(&self.jid, msg_id).await
+    }
+
+    pub async fn edit(&self, msg_id: &str, new_text: &str) -> Result<()> {
+        self.session.send_edit(&self.jid, msg_id, new_text).await
+    }
+
+    pub async fn image(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
+        self.session.send_image(&self.jid, data, caption).await
+    }
+
+    pub async fn video(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
+        self.session.send_video(&self.jid, data, caption).await
+    }
+
+    pub async fn audio(&self, data: &[u8], mimetype: &str) -> Result<String> {
+        self.session.send_audio(&self.jid, data, mimetype).await
+    }
+
+    pub async fn document(&self, data: &[u8], mimetype: &str, file_name: &str) -> Result<String> {
+        self.session.send_document(&self.jid, data, mimetype, file_name).await
+    }
+
+    pub async fn sticker(&self, data: &[u8]) -> Result<String> {
+        self.session.send_sticker(&self.jid, data).await
+    }
+
+    pub async fn poll(
+        &self, question: &str, options: &[&str], selectable_count: u32,
+    ) -> Result<String> {
+        self.session.send_poll(&self.jid, question, options, selectable_count).await
+    }
+
+    pub async fn poll_vote(&self, poll_msg_id: &str, selected: &[&str]) -> Result<()> {
+        self.session.send_poll_vote(&self.jid, poll_msg_id, selected).await
+    }
+
+    pub async fn link_preview(
+        &self,
+        text: &str,
+        url: &str,
+        title: &str,
+        description: &str,
+        thumbnail_jpeg: Option<Vec<u8>>,
+    ) -> Result<String> {
+        self.session
+            .send_link_preview(&self.jid, text, url, title, description, thumbnail_jpeg)
+            .await
+    }
+
+    pub async fn typing(&self, composing: bool) -> Result<()> {
+        self.session.send_typing(&self.jid, composing).await
+    }
+
+    pub async fn mark_read(&self, keys: &[MessageKey]) -> Result<()> {
+        self.session.mark_read(keys).await
+    }
+
+    pub async fn forward_from(&self, from_jid: &str, msg_id: &str) -> Result<String> {
+        self.session.forward_message(&self.jid, from_jid, msg_id).await
+    }
+
+    pub async fn set_ephemeral(&self, expiration_secs: u32) -> Result<()> {
+        self.session.set_ephemeral_duration(&self.jid, expiration_secs).await
+    }
+
+    pub fn history(&self, n: usize) -> Vec<crate::message_store::StoredMessage> {
+        self.session.message_history(&self.jid, n)
+    }
+
+    /// Send a text and block until its status reaches `min_status`
+    /// (typically [`MessageStatus::Delivered`] or [`MessageStatus::Read`]),
+    /// or until `timeout` elapses.
+    ///
+    /// Subscribes to events *before* sending so no update is missed in a
+    /// race with a fast ack. Returns `(msg_id, final_observed_status)`.
+    /// On timeout the status reflects the last update seen (defaults to
+    /// [`MessageStatus::Sent`] when no update arrived).
+    pub async fn text_and_wait(
+        &self,
+        text: &str,
+        min_status: MessageStatus,
+        timeout: std::time::Duration,
+    ) -> Result<(String, MessageStatus)> {
+        let mut rx = self.session.events();
+        let id = self.text(text).await?;
+        let status = wait_for_status(&mut rx, &id, min_status, timeout).await;
+        Ok((id, status))
+    }
+
+    /// Block until a specific message id's status reaches `min_status`, or
+    /// `timeout` elapses. Use when you already have the id from a prior
+    /// send. Note there is a race window between send and subscribe — prefer
+    /// [`Self::text_and_wait`] for send-then-wait flows.
+    pub async fn wait_status(
+        &self,
+        msg_id: &str,
+        min_status: MessageStatus,
+        timeout: std::time::Duration,
+    ) -> MessageStatus {
+        let mut rx = self.session.events();
+        wait_for_status(&mut rx, msg_id, min_status, timeout).await
+    }
+
+    /// Block until the next incoming (non-self) message in this chat, or
+    /// until `timeout`. For Q&A-style bots.
+    pub async fn wait_for_reply(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<crate::messages::WAMessage> {
+        let mut rx = self.session.events();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() { return None; }
+            match tokio::time::timeout(rem, rx.recv()).await {
+                Err(_) => return None,
+                Ok(Err(_)) => return None,
+                Ok(Ok(MessageEvent::NewMessage { msg }))
+                    if !msg.key.from_me && msg.key.remote_jid == self.jid =>
+                {
+                    return Some(msg);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn status_rank(s: MessageStatus) -> u8 {
+    match s {
+        MessageStatus::Pending   => 0,
+        MessageStatus::Sent      => 1,
+        MessageStatus::Delivered => 2,
+        MessageStatus::Read      => 3,
+        MessageStatus::Played    => 4,
+    }
+}
+
+async fn wait_for_status(
+    rx: &mut broadcast::Receiver<MessageEvent>,
+    msg_id: &str,
+    min: MessageStatus,
+    timeout: std::time::Duration,
+) -> MessageStatus {
+    let mut current = MessageStatus::Sent;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() { return current; }
+        match tokio::time::timeout(rem, rx.recv()).await {
+            Err(_) => return current,
+            Ok(Err(_)) => return current,
+            Ok(Ok(MessageEvent::MessageUpdate { key, status })) if key.id == msg_id => {
+                if status_rank(status) > status_rank(current) {
+                    current = status;
+                }
+                if status_rank(current) >= status_rank(min) {
+                    return current;
+                }
+            }
+            _ => {}
+        }
     }
 }

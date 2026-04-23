@@ -242,15 +242,29 @@ fn parse_media_sub(data: &[u8]) -> Option<WaMediaFields> {
 
 /// Encode WAProto.Message reaction (field 85 = ReactionMessage).
 /// `remote_jid` = conversation JID, `target_id` = message being reacted to.
-pub fn encode_wa_reaction_message(remote_jid: &str, target_id: &str, emoji: &str) -> Vec<u8> {
+pub fn encode_wa_reaction_message(
+    remote_jid: &str,
+    target_id: &str,
+    emoji: &str,
+    target_from_me: bool,
+) -> Vec<u8> {
     let mut key = Vec::new();
     key.extend(proto_bytes(1, remote_jid.as_bytes()));
-    key.extend(proto_varint(2, 0)); // fromMe = false (reacting to their message)
+    key.extend(proto_varint(2, if target_from_me { 1 } else { 0 }));
     key.extend(proto_bytes(3, target_id.as_bytes()));
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     let mut react = Vec::new();
     react.extend(proto_message(1, &key));
     react.extend(proto_bytes(2, emoji.as_bytes()));
-    proto_message(85, &react)
+    // Field 4 = senderTimestampMs (int64). Without this Baileys/WA clients
+    // silently drop the reaction from the UI even though the server accepted.
+    react.extend(proto_varint(4, now_ms));
+    // Message.reactionMessage = field 46 (WAProto). Previous code used 85
+    // which is `eventCoverImage` — WA silently ignored the reaction.
+    proto_message(46, &react)
 }
 
 /// Decode poll creation from WAProto.Message field 49 = PollCreationMessage.
@@ -320,10 +334,10 @@ pub struct PollVoteInfo {
     pub enc_iv: Vec<u8>,
 }
 
-/// Decode PollUpdateMessage (field 46) from a decrypted WAProto.Message blob.
+/// Decode PollUpdateMessage (field 50) from a decrypted WAProto.Message blob.
 pub fn decode_wa_poll_vote(data: &[u8]) -> Option<PollVoteInfo> {
     let outer = parse_proto_fields(data)?;
-    let vote_bytes = outer.get(&46)?;
+    let vote_bytes = outer.get(&50)?;
     let vf = parse_proto_fields(vote_bytes)?;
 
     let key_bytes = vf.get(&1)?;
@@ -437,14 +451,16 @@ pub fn encode_wa_poll_vote(
     pum.extend(proto_message(2, &enc_val));
     pum.extend(proto_varint(3, now_ms));
 
-    proto_message(46, &pum)
+    // Message.pollUpdateMessage = field 50 (WAProto). Previous code used 46
+    // which is reactionMessage — WA silently dropped the vote.
+    proto_message(50, &pum)
 }
 
-/// Decode reaction from WAProto.Message field 85 = ReactionMessage.
+/// Decode reaction from WAProto.Message field 46 = ReactionMessage.
 /// Returns `(target_message_id, emoji)` — emoji is empty string for reaction removal.
 pub fn decode_wa_reaction(data: &[u8]) -> Option<(String, String)> {
     let fields = parse_proto_fields(data)?;
-    let react = fields.get(&85)?;
+    let react = fields.get(&46)?;
     let rf = parse_proto_fields(react)?;
     let emoji = rf.get(&2).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
     let kf = rf.get(&1).and_then(|b| parse_proto_fields(b))?;
@@ -460,37 +476,57 @@ pub struct AxolotlSkdm {
 }
 
 /// Encode axolotlSenderKeyDistributionMessage bytes (Signal SKDM binary).
-/// Wire: 0x35 version byte || proto { id(1), iteration(2), chainKey(3), signingKey(4) }
+/// Wire: version byte || proto { id(1), iteration(2), chainKey(3), signingKey(4) }
+/// libsignal serializes the version as `strconv.Itoa(3)` → ASCII '3' = 0x33
+/// (high nibble = current version 3, low nibble = min version 3). We had
+/// 0x35 hardcoded, which the official WA client silently rejects — SKDM
+/// never registers on the peer, so subsequent skmsg always retries.
 pub fn encode_axolotl_skdm(key_id: u32, iteration: u32, chain_key: &[u8; 32], signing_pub: &[u8; 32]) -> Vec<u8> {
+    // libsignal SKDM `signingKey` is an EC point in DJB serialization:
+    // `0x05 || pub32`. Sending bare 32 bytes makes `ecc.DecodePoint` parse
+    // the first key byte as the type tag (typically 0xeb etc.), which isn't
+    // 0x05 → peer drops the SKDM silently and subsequent skmsg retry forever.
+    let mut signing_pub_djb = Vec::with_capacity(33);
+    signing_pub_djb.push(0x05);
+    signing_pub_djb.extend_from_slice(signing_pub);
     let mut body = Vec::new();
     body.extend(proto_varint(1, key_id as u64));
     body.extend(proto_varint(2, iteration as u64));
     body.extend(proto_bytes(3, chain_key));
-    body.extend(proto_bytes(4, signing_pub));
-    let mut out = vec![0x35]; // version byte
+    body.extend(proto_bytes(4, &signing_pub_djb));
+    let mut out = vec![0x33];
     out.extend(body);
     out
 }
 
-/// Encode WAProto.Message with embedded SKDM in field 35.
+/// Encode WAProto.Message with embedded SKDM. Per WAProto:
+///   Message.senderKeyDistributionMessage = 2
+///   Message.SenderKeyDistributionMessage.groupId = 1
+///   Message.SenderKeyDistributionMessage.axolotlSenderKeyDistributionMessage = 2
+/// We had the outer wrap at field 35, which the official client silently
+/// ignores — peers never register our sender key, so every outgoing skmsg
+/// reads as "esperando mensaje" and every incoming skmsg retries forever.
 pub fn encode_wa_skdm_message(group_jid: &str, axolotl_bytes: &[u8]) -> Vec<u8> {
     let mut skdm = Vec::new();
     skdm.extend(proto_bytes(1, group_jid.as_bytes()));
     skdm.extend(proto_bytes(2, axolotl_bytes));
-    proto_message(35, &skdm)
+    proto_message(2, &skdm)
 }
 
 /// Encode + sign a SenderKeyMessage (skmsg).
-/// Wire: 0x35 version byte || proto { id(1), iteration(2), ciphertext(3) } || Ed25519 signature
+/// Wire: version byte || proto { id(1), iteration(2), ciphertext(3) } || XEdDSA signature.
+/// libsignal version byte is `fmt.Sprint(3)` → ASCII '3' = 0x33 (high nibble =
+/// current version, low nibble = min version). We had 0x35 which the peer
+/// treats as "unsupported version 5" and drops silently.
 pub fn encode_skmsg_signed(key_id: u32, iteration: u32, ciphertext: &[u8], signing_priv: &[u8; 32]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend(proto_varint(1, key_id as u64));
     body.extend(proto_varint(2, iteration as u64));
     body.extend(proto_bytes(3, ciphertext));
-    let mut msg = vec![0x35]; // version byte
+    let mut msg = vec![0x33];
     msg.extend(&body);
-    use ed25519_dalek::{Signer, SigningKey};
-    let sig = SigningKey::from_bytes(signing_priv).sign(&msg).to_bytes();
+    use xeddsa::{xed25519, Sign};
+    let sig: [u8; 64] = xed25519::PrivateKey::from(signing_priv).sign(&msg, rand::rngs::OsRng);
     msg.extend_from_slice(&sig);
     msg
 }
@@ -507,15 +543,36 @@ pub fn decode_axolotl_skdm(data: &[u8]) -> Option<AxolotlSkdm> {
     Some(AxolotlSkdm { iteration, chain_key })
 }
 
-/// Decode WAProto.Message.senderKeyDistributionMessage (field 35).
+/// Decode WAProto.Message sender-key distribution payload.
+/// Supports:
+///   - senderKeyDistributionMessage (field 2)
+///   - fastRatchetKeySenderKeyDistributionMessage (field 15)
+///   - deviceSentMessage wrapper (field 31) with inner Message field 2
 /// Returns `(group_jid, axolotl_bytes)`.
 pub fn decode_wa_skdm(data: &[u8]) -> Option<(String, Vec<u8>)> {
     let outer = parse_proto_fields(data)?;
-    let skdm = outer.get(&35)?;
-    let sf = parse_proto_fields(skdm)?;
-    let group_id = sf.get(&1).and_then(|b| String::from_utf8(b.clone()).ok())?;
-    let axolotl = sf.get(&2)?.clone();
-    Some((group_id, axolotl))
+
+    // Message.deviceSentMessage { destinationJid=1, message=2 }
+    if let Some(dsm) = outer.get(&31) {
+        if let Some(dsm_fields) = parse_proto_fields(dsm) {
+            if let Some(inner) = dsm_fields.get(&2) {
+                if let Some(found) = decode_wa_skdm(inner) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    for field_no in [2u64, 15u64] {
+        if let Some(skdm) = outer.get(&field_no) {
+            let sf = parse_proto_fields(skdm)?;
+            let group_id = sf.get(&1).and_then(|b| String::from_utf8(b.clone()).ok())?;
+            let axolotl = sf.get(&2)?.clone();
+            return Some((group_id, axolotl));
+        }
+    }
+
+    None
 }
 
 pub struct SkmsgHeader {
@@ -528,7 +585,7 @@ pub struct SkmsgHeader {
 pub fn decode_skmsg_header(data: &[u8]) -> Option<SkmsgHeader> {
     if data.len() < 2 { return None; }
     let inner = &data[1..]; // skip version byte
-    // Strip trailing 64-byte Ed25519 signature so proto parser sees only the body
+    // Strip trailing 64-byte XEdDSA signature so proto parser sees only the body
     let body = if inner.len() > 64 { &inner[..inner.len() - 64] } else { inner };
     let fields = parse_proto_fields(body)?;
     let iteration = read_varint_from_bytes(fields.get(&2)?)? as u32;
@@ -798,6 +855,7 @@ pub enum ProtocolMessagePayload {
     EphemeralSetting { expiration_secs: u32 },
     HistorySync(HistorySyncNotification),
     MessageEdit { key: RevokeKey, new_text: String },
+    PeerDataOperationResponse { stanza_id: Option<String>, messages: Vec<HistoryMessage>, result_types: Vec<u32> },
     /// Primary device shared app-state sync keys with us. Each entry is
     /// `(keyId, keyData, timestamp_ms)`.
     AppStateSyncKeyShare(Vec<(Vec<u8>, Vec<u8>, i64)>),
@@ -858,6 +916,78 @@ pub fn decode_protocol_message(data: &[u8]) -> Option<ProtocolMessagePayload> {
                 .unwrap_or_default();
             Some(ProtocolMessagePayload::MessageEdit { key, new_text })
         }
+        17 => {
+            // PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE — field 17
+            let response_bytes = pm.get(&17)?;
+            let response = parse_proto_fields(response_bytes)?;
+            let response_type = response.get(&1).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0);
+            let stanza_id = response.get(&2).and_then(|b| String::from_utf8(b.clone()).ok());
+            let mut messages = Vec::new();
+            let mut result_count = 0usize;
+            let mut result_types = Vec::new();
+            for (field, bytes) in parse_proto_repeated(response_bytes)? {
+                if field != 3 {
+                    continue;
+                }
+                result_count += 1;
+                let result = match parse_proto_fields(&bytes) {
+                    Some(v) => v,
+                    None => {
+                        tracing::debug!("pdo decode: could not parse peerDataOperationResult");
+                        continue;
+                    }
+                };
+                let result_fields = parse_proto_repeated(&bytes)
+                    .map(|entries| {
+                        entries.into_iter()
+                            .map(|(f, v)| format!("{f}({}B)", v.len()))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let result_type = result.get(&1).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0);
+                result_types.push(result_type as u32);
+                let placeholder = match result.get(&4).and_then(|b| parse_proto_fields(b)) {
+                    Some(v) => v,
+                    None => {
+                        tracing::debug!(
+                            "pdo decode: result without placeholderMessageResendResponse result_type={} fields={result_fields}",
+                            result_type,
+                        );
+                        continue;
+                    }
+                };
+                let web_message_info = match placeholder.get(&1) {
+                    Some(v) => v,
+                    None => {
+                        tracing::debug!("pdo decode: placeholderMessageResendResponse without webMessageInfoBytes");
+                        continue;
+                    }
+                };
+                if let Some(msg) = parse_web_message_info_partial(web_message_info) {
+                    if msg.remote_jid.is_empty() {
+                        tracing::debug!(
+                            "pdo decode: accepted partial webMessageInfo id={} participant={:?} raw_message_len={}",
+                            msg.id,
+                            msg.participant,
+                            msg.raw_message.as_ref().map(|b| b.len()).unwrap_or(0),
+                        );
+                    }
+                    messages.push(msg);
+                } else {
+                    tracing::debug!(
+                        "pdo decode: could not decode webMessageInfo len={}",
+                        web_message_info.len(),
+                    );
+                }
+            }
+            tracing::debug!(
+                "pdo decode: type={} stanza_id={stanza_id:?} results={result_count} decoded_messages={}",
+                response_type,
+                messages.len(),
+            );
+            Some(ProtocolMessagePayload::PeerDataOperationResponse { stanza_id, messages, result_types })
+        }
         other => Some(ProtocolMessagePayload::Unknown(other)),
     }
 }
@@ -906,6 +1036,7 @@ pub struct HistoryMessage {
     pub timestamp: u64,
     pub push_name: Option<String>,
     pub content: Option<crate::messages::MessageContent>,
+    pub raw_message: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -999,21 +1130,32 @@ fn parse_media_info(data: &[u8]) -> Option<crate::messages::MediaInfo> {
 }
 
 fn parse_web_message_info(data: &[u8]) -> Option<HistoryMessage> {
+    parse_web_message_info_inner(data, false)
+}
+
+fn parse_web_message_info_partial(data: &[u8]) -> Option<HistoryMessage> {
+    parse_web_message_info_inner(data, true)
+}
+
+fn parse_web_message_info_inner(data: &[u8], allow_missing_remote_jid: bool) -> Option<HistoryMessage> {
     let fields = parse_proto_fields(data)?;
 
     // field 1 = MessageKey
     let key_bytes = fields.get(&1)?;
     let key = parse_proto_fields(key_bytes)?;
     let remote_jid = key.get(&1).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
-    if remote_jid.is_empty() { return None; }
     let from_me = key.get(&2).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0) != 0;
     let id = key.get(&3).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
     let participant = key.get(&4).and_then(|b| String::from_utf8(b.clone()).ok());
+    if remote_jid.is_empty() && !allow_missing_remote_jid {
+        return None;
+    }
 
     let timestamp = fields.get(&3).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0);
     let push_name = fields.get(&19).and_then(|b| String::from_utf8(b.clone()).ok());
 
     // field 2 = Message
+    let raw_message = fields.get(&2).cloned();
     let content = fields.get(&2).and_then(|msg_bytes| {
         let mf = parse_proto_fields(msg_bytes)?;
 
@@ -1083,7 +1225,11 @@ fn parse_web_message_info(data: &[u8]) -> Option<HistoryMessage> {
         None
     });
 
-    Some(HistoryMessage { remote_jid, from_me, id, participant, timestamp, push_name, content })
+    if remote_jid.is_empty() && participant.is_none() && id.is_empty() && raw_message.is_none() {
+        return None;
+    }
+
+    Some(HistoryMessage { remote_jid, from_me, id, participant, timestamp, push_name, content, raw_message })
 }
 
 // ── Forward helpers ───────────────────────────────────────────────────────────

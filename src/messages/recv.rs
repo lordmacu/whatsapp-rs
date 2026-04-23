@@ -1,10 +1,12 @@
 use crate::binary::{BinaryNode, NodeContent};
 use crate::messages::{
     unix_now, ChatInfo, MessageContent, MessageEvent, MessageKey, MessageManager, MessageStatus,
-    PushName, ReceiptType, WAMessage,
+    PendingPdoRetry, PushName, ReceiptType, WAMessage,
 };
 use anyhow::Result;
-use tracing::debug;
+use tracing::{debug, info};
+
+const NACK_UNHANDLED_ERROR: u32 = 500;
 
 /// Ensure a JID carries an explicit device slot. `user@server` → `user:0@server`.
 /// Canonicalising on recv avoids having two disjoint Signal sessions for the
@@ -16,6 +18,18 @@ fn normalize_device_jid(jid: &str) -> String {
     let at = match jid.find('@') { Some(i) => i, None => return jid.to_string() };
     let (before, server) = (&jid[..at], &jid[at..]);
     if before.contains(':') { jid.to_string() } else { format!("{before}:0{server}") }
+}
+
+fn bare_user_jid(jid: &str) -> String {
+    let at = match jid.find('@') { Some(i) => i, None => return jid.to_string() };
+    let before = &jid[..at];
+    let server = &jid[at..];
+    let user = before.split(':').next().unwrap_or(before);
+    format!("{user}{server}")
+}
+
+fn retry_cache_key(id: &str, sender: &str) -> String {
+    format!("{id}:{sender}")
 }
 
 /// Extract the server's remaining OTK count from an encrypt-namespaced IQ node.
@@ -36,6 +50,64 @@ pub fn extract_encrypt_count(node: &BinaryNode) -> Option<u32> {
         NodeContent::Text(s) => s.parse().ok(),
         NodeContent::Bytes(b) => String::from_utf8(b.clone()).ok()?.parse().ok(),
         _ => None,
+    }
+}
+
+fn summarize_message(message: Option<&MessageContent>) -> Option<String> {
+    match message? {
+        MessageContent::Text { text, mentioned_jids } => {
+            if mentioned_jids.is_empty() {
+                Some(text.clone())
+            } else {
+                Some(format!("{text}  (mentions: {})", mentioned_jids.join(", ")))
+            }
+        }
+        MessageContent::Image { caption, .. } => {
+            Some(format!("<image: {}>", caption.as_deref().unwrap_or("")))
+        }
+        MessageContent::Video { caption, .. } => {
+            Some(format!("<video: {}>", caption.as_deref().unwrap_or("")))
+        }
+        MessageContent::Audio { .. } => Some("<audio>".to_string()),
+        MessageContent::Document { file_name, .. } => Some(format!("<document: {file_name}>")),
+        MessageContent::Sticker { .. } => Some("<sticker>".to_string()),
+        MessageContent::Reaction { emoji, target_id } => {
+            Some(format!("reacted {emoji} to {target_id}"))
+        }
+        MessageContent::Reply { text, reply_to_id } => {
+            Some(format!("(reply to {reply_to_id}) {text}"))
+        }
+        MessageContent::Poll { question, options, .. } => {
+            Some(format!("poll: {question} — {}", options.join(" / ")))
+        }
+        MessageContent::LinkPreview { text, url, .. } => Some(format!("{text}  [{url}]")),
+    }
+}
+
+fn log_incoming_message(msg: &WAMessage) {
+    let from = msg.key.remote_jid.as_str();
+    let sender = msg.key.participant.as_deref().unwrap_or(from);
+    let sender_name = msg.push_name.as_deref().unwrap_or(sender);
+    let summary = summarize_message(msg.message.as_ref());
+
+    if from.ends_with("@g.us") {
+        info!(
+            group_jid = %from,
+            sender_jid = %sender,
+            sender_name = %sender_name,
+            message_id = %msg.key.id,
+            summary = %summary.as_deref().unwrap_or("<empty>"),
+            "recv group message",
+        );
+    } else {
+        info!(
+            jid = %from,
+            sender_jid = %sender,
+            sender_name = %sender_name,
+            message_id = %msg.key.id,
+            summary = %summary.as_deref().unwrap_or("<empty>"),
+            "recv message",
+        );
     }
 }
 
@@ -141,7 +213,12 @@ impl MessageManager {
                         skdm.iteration,
                         ck,
                     );
-                    debug!("stored SKDM from {sender_jid} for group {group_jid} iter={}", skdm.iteration);
+                    info!(
+                        sender_jid = %sender_jid,
+                        group_jid = %group_jid,
+                        iteration = skdm.iteration,
+                        "stored sender key distribution",
+                    );
                 } else {
                     debug!("SKDM chain_key wrong size: {}", skdm.chain_key.len());
                 }
@@ -230,10 +307,16 @@ impl MessageManager {
         } else {
             from.clone()
         };
+        let sender_jid = participant.as_deref().unwrap_or(from.as_str());
+        let sender_bare = bare_user_jid(sender_jid);
+        let mut from_me = sender_bare == bare_user_jid(&self.our_jid);
+        if let Some(our_lid) = &self.our_lid {
+            from_me |= sender_bare == bare_user_jid(our_lid);
+        }
 
         let key = MessageKey {
             remote_jid: from.clone(),
-            from_me: false,
+            from_me,
             id: id.clone(),
             participant: participant.clone(),
         };
@@ -247,6 +330,29 @@ impl MessageManager {
             participant,
             all_enc.iter().map(|(b, t)| format!("{t}({}B)", b.len())).collect::<Vec<_>>(),
         );
+        let enc_summary = all_enc.iter()
+            .map(|(b, t)| format!("{t}({}B)", b.len()))
+            .collect::<Vec<_>>()
+            .join(",");
+        if from.ends_with("@g.us") {
+            info!(
+                group_jid = %from,
+                participant = %participant.as_deref().unwrap_or(""),
+                message_id = %id,
+                enc_types = %enc_summary,
+                offline = %node.attr("offline").unwrap_or(""),
+                "incoming group stanza",
+            );
+        } else {
+            info!(
+                jid = %from,
+                participant = %participant.as_deref().unwrap_or(""),
+                message_id = %id,
+                enc_types = %enc_summary,
+                offline = %node.attr("offline").unwrap_or(""),
+                "incoming message stanza",
+            );
+        }
         let has_skmsg = all_enc.iter().any(|(_, t)| t == "skmsg");
         if from.ends_with("@g.us") && has_skmsg {
             for (bytes, t) in &all_enc {
@@ -273,35 +379,57 @@ impl MessageManager {
                     let failed = matches!(&r, Some(DecodedPayload::Message(
                         MessageContent::Text { text, .. })) if text == "<skmsg decrypt failed>");
                     if failed && !is_offline_replay {
-                        // Two-lane recovery (matches Baileys `sendRetryRequest`):
-                        //  1. retry-receipt to the group → sender redistributes
-                        //     SKDM on their next send.
-                        //  2. PlaceholderMessageResend peer-msg to our own
-                        //     primary phone → phone re-delivers the missed
-                        //     message with a fresh SKDM bundled, fixing this
-                        //     msg immediately without waiting for the sender.
-                        let already = self.retry_ids.lock().unwrap().contains(&id);
-                        if !already {
-                            self.retry_ids.lock().unwrap().insert(id.clone());
-                            debug!("skmsg recovery: id={id} from={from} — retry + PDO");
-                            send_retry_receipt_inner(
-                                &self.socket, node, &from, &id, t,
-                                self.signal.registration_id(),
-                                self.signal.identity_public(),
-                                self.signal.signed_prekey_fields(),
-                                self.signal.pick_unused_prekey(),
-                                self.signal.account_identity_bytes(),
-                                true,
-                            ).await;
+                        let retry_key = retry_cache_key(&id, sender_jid);
+                        let retry_count = {
+                            let mut retries = self.retry_ids.lock().unwrap();
+                            let count = retries.entry(retry_key.clone()).or_insert(0);
+                            *count += 1;
+                            *count
+                        };
+                        let include_keys = retry_count > 1;
+                        debug!(
+                            "skmsg recovery: id={id} from={from} retry_count={retry_count} include_keys={include_keys} + PDO"
+                        );
+                        send_retry_receipt_inner(
+                            &self.socket, node, &from, &id, t,
+                            self.signal.registration_id(),
+                            self.signal.identity_public(),
+                            self.signal.signed_prekey_fields(),
+                            self.signal.pick_unused_prekey(),
+                            self.signal.account_identity_bytes(),
+                            include_keys,
+                            retry_count,
+                        ).await;
+                        if retry_count <= 2 {
                             let socket = self.socket.clone();
                             let signal = self.signal.clone();
                             let our_jid = self.our_jid.clone();
                             let pdo_key = key.clone();
+                            let pending_pdo_retries = self.pending_pdo_retries.clone();
+                            let retry_key_for_pdo = retry_key.clone();
+                            let orig_node = node.clone();
+                            let to = from.clone();
+                            let msg_id = id.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = crate::messages::send::placeholder_resend_send(
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                match crate::messages::send::placeholder_resend_send(
                                     socket, signal, our_jid, pdo_key,
                                 ).await {
-                                    tracing::debug!("PDO send failed: {e}");
+                                    Ok(request_id) => {
+                                        pending_pdo_retries.lock().unwrap().insert(
+                                            request_id,
+                                            PendingPdoRetry {
+                                                retry_key: retry_key_for_pdo,
+                                                orig: orig_node,
+                                                to,
+                                                msg_id,
+                                                t,
+                                            },
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("PDO send failed: {e}");
+                                    }
                                 }
                             });
                         }
@@ -328,6 +456,14 @@ impl MessageManager {
                             // A retry-receipt asks the sender to redeliver;
                             // that path is what actually unsticks things.
                             if !is_offline_replay {
+                                let retry_key = retry_cache_key(&id, sender_jid);
+                                let retry_count = {
+                                    let mut retries = self.retry_ids.lock().unwrap();
+                                    let count = retries.entry(retry_key).or_insert(0);
+                                    *count += 1;
+                                    *count
+                                };
+                                let include_keys = retry_count > 1;
                                 send_retry_receipt_fn(
                                     &self.socket, node, &from, &id, t,
                                     self.signal.registration_id(),
@@ -335,6 +471,8 @@ impl MessageManager {
                                     self.signal.signed_prekey_fields(),
                                     self.signal.pick_unused_prekey(),
                                     self.signal.account_identity_bytes(),
+                                    retry_count,
+                                    include_keys,
                                 ).await;
                             }
                             Some(DecodedPayload::Message(MessageContent::Text {
@@ -357,7 +495,35 @@ impl MessageManager {
                 if text == "<decrypt failed>" || text == "<skmsg decrypt failed>"
         );
         if decrypt_failed {
-            self.send_message_ack_with(node, Some(1)).await;
+            if from.ends_with("@g.us") {
+                info!(
+                    group_jid = %from,
+                    participant = %participant.as_deref().unwrap_or(""),
+                    message_id = %id,
+                    "group message decrypt failed",
+                );
+            } else {
+                info!(
+                    jid = %from,
+                    participant = %participant.as_deref().unwrap_or(""),
+                    message_id = %id,
+                    "message decrypt failed",
+                );
+            }
+            if is_offline_replay {
+                // Historical backlog can contain messages whose sender-key/session
+                // material is no longer recoverable locally. Asking the server to
+                // retry those again keeps the offline queue alive and WA eventually
+                // tears down the stream. Drain them with a plain ack instead.
+                info!(
+                    jid = %from,
+                    message_id = %id,
+                    "offline decrypt failure: acking without retry to drain backlog",
+                );
+                self.send_message_ack(node).await;
+            } else {
+                self.send_message_ack_with(node, Some(NACK_UNHANDLED_ERROR)).await;
+            }
         } else {
             self.send_message_ack(node).await;
         }
@@ -373,7 +539,7 @@ impl MessageManager {
                 let _ = self.event_tx.send(MessageEvent::Reaction {
                     key,
                     emoji,
-                    from_me: false,
+                    from_me,
                 });
             }
             Some(DecodedPayload::Protocol(proto)) => {
@@ -414,6 +580,89 @@ impl MessageManager {
                             process_history_sync(hsn, event_tx, contacts, msg_store).await;
                         });
                     }
+                    ProtocolMessagePayload::PeerDataOperationResponse { stanza_id, messages, result_types } => {
+                        debug!(
+                            "peer data operation response: stanza_id={:?} messages={}",
+                            stanza_id,
+                            messages.len(),
+                        );
+                        let pending_retry = stanza_id
+                            .as_ref()
+                            .and_then(|request_id| self.pending_pdo_retries.lock().unwrap().remove(request_id));
+                        if messages.is_empty() && result_types.iter().any(|t| *t == 2) {
+                            if let Some(pending) = pending_retry {
+                                let retry_count = {
+                                    let mut retries = self.retry_ids.lock().unwrap();
+                                    let count = retries.entry(pending.retry_key.clone()).or_insert(1);
+                                    if *count < 2 {
+                                        *count = 2;
+                                    }
+                                    *count
+                                };
+                                if retry_count == 2 {
+                                    info!(
+                                        "PDO returned NOT_FOUND for request {:?}; escalating retry with keys for message {}",
+                                        stanza_id,
+                                        pending.msg_id,
+                                    );
+                                    send_retry_receipt_inner(
+                                        &self.socket,
+                                        &pending.orig,
+                                        &pending.to,
+                                        &pending.msg_id,
+                                        pending.t,
+                                        self.signal.registration_id(),
+                                        self.signal.identity_public(),
+                                        self.signal.signed_prekey_fields(),
+                                        self.signal.pick_unused_prekey(),
+                                        self.signal.account_identity_bytes(),
+                                        true,
+                                        retry_count,
+                                    ).await;
+                                }
+                            }
+                        }
+                        for resent in messages {
+                            let sender_jid = resent
+                                .participant
+                                .as_deref()
+                                .unwrap_or(resent.remote_jid.as_str())
+                                .to_string();
+                            if let Some(raw) = resent.raw_message.as_deref() {
+                                if sender_jid.is_empty() {
+                                    debug!(
+                                        "peer data operation response: skipping SKDM processing for id={} because sender is unknown",
+                                        resent.id
+                                    );
+                                } else {
+                                    self.maybe_process_skdm(&sender_jid, raw);
+                                }
+                            }
+                            if resent.remote_jid.is_empty() {
+                                debug!(
+                                    "peer data operation response: processed partial resent payload id={} participant={:?} without remote_jid",
+                                    resent.id,
+                                    resent.participant,
+                                );
+                                continue;
+                            }
+                            let resent_msg = WAMessage {
+                                key: MessageKey {
+                                    remote_jid: resent.remote_jid.clone(),
+                                    from_me: resent.from_me,
+                                    id: resent.id.clone(),
+                                    participant: resent.participant.clone(),
+                                },
+                                message: resent.content.clone(),
+                                message_timestamp: resent.timestamp,
+                                status: MessageStatus::Delivered,
+                                push_name: resent.push_name.clone(),
+                            };
+                            self.msg_store.push(&resent_msg);
+                            log_incoming_message(&resent_msg);
+                            let _ = self.event_tx.send(MessageEvent::NewMessage { msg: resent_msg });
+                        }
+                    }
                     ProtocolMessagePayload::AppStateSyncKeyShare(shares) => {
                         if let Some(ks) = self.app_state_keys.as_ref() {
                             for (key_id, key_data, ts) in &shares {
@@ -449,6 +698,7 @@ impl MessageManager {
                     push_name,
                 };
                 self.msg_store.push(&msg);
+                log_incoming_message(&msg);
                 let _ = self.event_tx.send(MessageEvent::NewMessage { msg });
             }
             Some(DecodedPayload::PollVoteRaw(info)) => {
@@ -479,6 +729,7 @@ impl MessageManager {
                     push_name,
                 };
                 self.msg_store.push(&msg);
+                log_incoming_message(&msg);
                 let _ = self.event_tx.send(MessageEvent::NewMessage { msg });
             }
         }
@@ -515,6 +766,28 @@ impl MessageManager {
         let id = node.attr("id").unwrap_or("").to_string();
         let from = node.attr("from").unwrap_or("").to_string();
         let receipt_type_str = node.attr("type").unwrap_or("delivered");
+
+        // Retry receipt: peer device asks us to resend the named message.
+        // Delegate to send.rs handler which looks up cached plaintext and
+        // ships a fresh pkmsg/msg to the requesting device, then still ack.
+        if receipt_type_str == "retry" {
+            if let Err(e) = self.handle_incoming_retry_receipt(node).await {
+                tracing::warn!("handle_incoming_retry_receipt {from}/{id}: {e}");
+            }
+            let to = from.clone();
+            let ack = BinaryNode {
+                tag: "ack".to_string(),
+                attrs: vec![
+                    ("id".to_string(), id),
+                    ("to".to_string(), to),
+                    ("class".to_string(), "receipt".to_string()),
+                    ("type".to_string(), "retry".to_string()),
+                ],
+                content: NodeContent::None,
+            };
+            self.socket.send_node(&ack).await?;
+            return Ok(());
+        }
 
         let receipt_type = match receipt_type_str {
             "read" => ReceiptType::Read,
@@ -857,10 +1130,12 @@ async fn send_retry_receipt_fn(
     signed_prekey: (u32, [u8; 32], Vec<u8>),
     one_time_prekey: Option<(u32, [u8; 32])>,
     device_identity: &[u8],
+    retry_count: u32,
+    include_keys: bool,
 ) {
     send_retry_receipt_inner(
         socket, orig, to, msg_id, t, registration_id,
-        identity_pub, signed_prekey, one_time_prekey, device_identity, true,
+        identity_pub, signed_prekey, one_time_prekey, device_identity, include_keys, retry_count,
     ).await;
 }
 
@@ -876,6 +1151,7 @@ async fn send_retry_receipt_inner(
     one_time_prekey: Option<(u32, [u8; 32])>,
     device_identity: &[u8],
     include_keys: bool,
+    retry_count: u32,
 ) {
     let mut attrs = vec![
         ("id".to_string(), msg_id.to_string()),
@@ -939,12 +1215,7 @@ async fn send_retry_receipt_inner(
         BinaryNode {
             tag: "retry".to_string(),
             attrs: vec![
-                // Baileys uses `count > 1` as the trigger to recreate the
-                // session / clear sender-key-memory and re-ship SKDM. The
-                // official WA client follows the same heuristic; count=1 is
-                // treated as "session probably still good" and doesn't
-                // redistribute, which leaves group skmsg undecryptable.
-                ("count".to_string(), "2".to_string()),
+                ("count".to_string(), retry_count.to_string()),
                 ("id".to_string(), msg_id.to_string()),
                 ("t".to_string(), t.to_string()),
                 ("v".to_string(), "1".to_string()),
@@ -967,7 +1238,7 @@ async fn send_retry_receipt_inner(
         content: NodeContent::List(children),
     };
     tracing::info!(
-        "→ retry-receipt to={to} id={msg_id} include_keys={include_keys} children={:?} attrs={:?}",
+        "→ retry-receipt to={to} id={msg_id} retry_count={retry_count} include_keys={include_keys} children={:?} attrs={:?}",
         match &node.content {
             NodeContent::List(c) => c.iter().map(|n| n.tag.as_str()).collect::<Vec<_>>(),
             _ => vec![],

@@ -26,14 +26,14 @@ fn test_text_empty_returns_none() {
 
 #[test]
 fn test_encode_decode_reaction() {
-    let encoded = wa_proto::encode_wa_reaction_message("123@s.whatsapp.net", "MSGID99", "👍");
+    let encoded = wa_proto::encode_wa_reaction_message("123@s.whatsapp.net", "MSGID99", "👍", false);
     let decoded = wa_proto::decode_wa_reaction(&encoded);
     assert_eq!(decoded, Some(("MSGID99".to_string(), "👍".to_string())));
 }
 
 #[test]
 fn test_reaction_removal_empty_emoji() {
-    let encoded = wa_proto::encode_wa_reaction_message("123@s.whatsapp.net", "MSGID99", "");
+    let encoded = wa_proto::encode_wa_reaction_message("123@s.whatsapp.net", "MSGID99", "", false);
     let (_, emoji) = wa_proto::decode_wa_reaction(&encoded).expect("should decode");
     assert_eq!(emoji, "");
 }

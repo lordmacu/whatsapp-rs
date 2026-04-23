@@ -17,7 +17,7 @@ pub mod qr;
 pub mod signal;
 pub mod socket;
 
-pub use client::{Client, Session};
+pub use client::{Chat, Client, Session};
 pub use message_store::StoredMessage;
 pub use messages::{ChatInfo, MediaInfo, MessageContent, MessageEvent, MessageKey, MessageStatus, WAMessage};
 pub use socket::group::{GroupInfo, ParticipantInfo, ParticipantResult};

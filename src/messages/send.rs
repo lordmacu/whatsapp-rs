@@ -48,6 +48,80 @@ fn pad_wa(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Parse the `<keys>` child of an incoming retry-receipt into a `PreKeyBundle`.
+/// Layout: `<keys><type/><identity/><key>(id,value)</key><skey>(id,value,signature)</skey><device-identity/></keys>`.
+/// `registration_id` comes from the sibling `<registration>` node at receipt level.
+fn parse_retry_keys_bundle(
+    keys: &BinaryNode,
+    registration_id: u32,
+) -> Result<crate::signal::x3dh::PreKeyBundle> {
+    let kc: &[BinaryNode] = match &keys.content {
+        NodeContent::List(v) => v.as_slice(),
+        _ => anyhow::bail!("keys node without children"),
+    };
+    let bytes_of = |n: &BinaryNode| -> Option<Vec<u8>> {
+        match &n.content {
+            NodeContent::Bytes(b) => Some(b.clone()),
+            _ => None,
+        }
+    };
+    let child = |tag: &str| -> Option<&BinaryNode> { kc.iter().find(|n| n.tag == tag) };
+    let sub_bytes = |parent: &BinaryNode, tag: &str| -> Option<Vec<u8>> {
+        match &parent.content {
+            NodeContent::List(v) => v.iter().find(|n| n.tag == tag).and_then(bytes_of),
+            _ => None,
+        }
+    };
+    let u24_or_u32 = |b: &[u8]| -> Result<u32> {
+        Ok(match b.len() {
+            3 => ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32),
+            4 => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            n => anyhow::bail!("prekey id wrong length: {n}"),
+        })
+    };
+
+    let id_pub = child("identity").and_then(bytes_of)
+        .ok_or_else(|| anyhow::anyhow!("retry keys missing identity"))?;
+    if id_pub.len() != 32 { anyhow::bail!("identity wrong length: {}", id_pub.len()); }
+    let mut identity_key = [0u8; 32];
+    identity_key.copy_from_slice(&id_pub);
+
+    let skey = child("skey").ok_or_else(|| anyhow::anyhow!("retry keys missing skey"))?;
+    let skid = sub_bytes(skey, "id").ok_or_else(|| anyhow::anyhow!("skey.id missing"))?;
+    let signed_pre_key_id = u24_or_u32(&skid)?;
+    let skval = sub_bytes(skey, "value").ok_or_else(|| anyhow::anyhow!("skey.value missing"))?;
+    if skval.len() != 32 { anyhow::bail!("skey.value wrong length: {}", skval.len()); }
+    let mut signed_pre_key = [0u8; 32];
+    signed_pre_key.copy_from_slice(&skval);
+    let sksig = sub_bytes(skey, "signature").ok_or_else(|| anyhow::anyhow!("skey.signature missing"))?;
+    if sksig.len() != 64 { anyhow::bail!("skey.signature wrong length: {}", sksig.len()); }
+    let mut signed_pre_key_sig = [0u8; 64];
+    signed_pre_key_sig.copy_from_slice(&sksig);
+
+    let (one_time_pre_key_id, one_time_pre_key) = if let Some(key) = child("key") {
+        let kid = sub_bytes(key, "id").ok_or_else(|| anyhow::anyhow!("key.id missing"))?;
+        let id = u24_or_u32(&kid)?;
+        let kv = sub_bytes(key, "value").ok_or_else(|| anyhow::anyhow!("key.value missing"))?;
+        if kv.len() != 32 { anyhow::bail!("key.value wrong length: {}", kv.len()); }
+        let mut p = [0u8; 32];
+        p.copy_from_slice(&kv);
+        (Some(id), Some(p))
+    } else {
+        (None, None)
+    };
+
+    Ok(crate::signal::x3dh::PreKeyBundle {
+        registration_id,
+        device_id: 0,
+        identity_key,
+        signed_pre_key_id,
+        signed_pre_key,
+        signed_pre_key_sig,
+        one_time_pre_key_id,
+        one_time_pre_key,
+    })
+}
+
 /// Wrap a serialized `WAMessage` inside `Message.deviceSentMessage` so our
 /// own other devices can display the message as "sent by me". Matches
 /// Baileys `encodeWAMessage({ deviceSentMessage: { destinationJid, message } })`.
@@ -74,7 +148,7 @@ pub async fn placeholder_resend_send(
     signal: Arc<crate::signal::SignalRepository>,
     our_jid: String,
     key: MessageKey,
-) -> Result<()> {
+) -> Result<String> {
     use crate::signal::wa_proto::{proto_bytes, proto_varint};
 
     let mut mk = Vec::new();
@@ -84,6 +158,13 @@ pub async fn placeholder_resend_send(
     if let Some(p) = &key.participant {
         mk.extend(proto_bytes(4, p.as_bytes()));
     }
+    tracing::info!(
+        "PDO request key: remote_jid={} from_me={} id={} participant={:?}",
+        key.remote_jid,
+        key.from_me,
+        key.id,
+        key.participant,
+    );
     let pmrr = proto_bytes(1, &mk);
     let mut pdo = Vec::new();
     pdo.extend(proto_varint(1, 4));
@@ -141,11 +222,12 @@ pub async fn placeholder_resend_send(
         content: NodeContent::None,
     });
 
+    let request_id = generate_message_id();
     let stanza = BinaryNode {
         tag: "message".to_string(),
         attrs: vec![
             ("to".to_string(), our_user),
-            ("id".to_string(), generate_message_id()),
+            ("id".to_string(), request_id.clone()),
             ("type".to_string(), "text".to_string()),
             ("category".to_string(), "peer".to_string()),
             ("push_priority".to_string(), "high_force".to_string()),
@@ -153,7 +235,8 @@ pub async fn placeholder_resend_send(
         ],
         content: NodeContent::List(children),
     };
-    socket.send_node(&stanza).await
+    socket.send_node(&stanza).await?;
+    Ok(request_id)
 }
 
 #[allow(dead_code)]
@@ -167,7 +250,7 @@ impl MessageManager {
     /// primary phone only. The phone's protocolMessage handler sees the
     /// PLACEHOLDER_MESSAGE_RESEND request and re-broadcasts the referenced
     /// message with SKDM bundled, so future skmsg from that sender decrypt.
-    pub async fn send_placeholder_resend(&self, key: &MessageKey) -> Result<()> {
+    pub async fn send_placeholder_resend(&self, key: &MessageKey) -> Result<String> {
         placeholder_resend_send(
             self.socket.clone(),
             self.signal.clone(),
@@ -427,6 +510,10 @@ impl MessageManager {
         let wa_bytes = self.encode_content(&msg)?;
         match self.send_encrypted_bytes(jid, &id, wa_bytes).await {
             Ok(()) => {
+                // Cache for incoming retry-receipts from peer devices that
+                // missed this send (new device, session churn). Key by bare
+                // chat jid + id to match how retry receipts identify the msg.
+                self.recent_sends.insert(jid, &id, msg.clone());
                 // Socket write succeeded; remove from outbox and advance status to Sent
                 self.outbox.remove(&id);
                 self.msg_store.update_status(jid, &id, MessageStatus::Sent);
@@ -440,6 +527,141 @@ impl MessageManager {
         }
     }
 
+    /// Respond to an incoming `<receipt type="retry">` from a peer device that
+    /// missed our original send (new device added post-send, session churn).
+    /// Looks up the cached plaintext, re-encrypts for the requesting device
+    /// using the prekey bundle carried in the retry receipt (or our cached
+    /// session if present), and ships a fresh `<message>` to that device only.
+    ///
+    /// 1:1 only for now — group retries also need SKDM re-distribution which
+    /// is not implemented in this path yet.
+    pub(crate) async fn handle_incoming_retry_receipt(&self, node: &BinaryNode) -> Result<()> {
+        let from = match node.attr("from") {
+            Some(v) => v.to_string(),
+            None => anyhow::bail!("retry receipt without from"),
+        };
+        let msg_id = match node.attr("id") {
+            Some(v) => v.to_string(),
+            None => anyhow::bail!("retry receipt without id"),
+        };
+
+        // Group retries need SKDM re-ship — skip here, handled elsewhere.
+        if from.ends_with("@g.us") {
+            tracing::debug!(
+                "incoming retry-receipt for group {from}/{msg_id} — skipping (no group resend yet)",
+            );
+            return Ok(());
+        }
+
+        let children: &[BinaryNode] = match &node.content {
+            NodeContent::List(v) => v.as_slice(),
+            _ => &[],
+        };
+
+        let retry_count: u32 = children
+            .iter()
+            .find(|n| n.tag == "retry")
+            .and_then(|n| n.attr("count"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+
+        let bare_chat = bare_user_jid(&from);
+        let Some(cached) = self.recent_sends.get(&bare_chat, &msg_id) else {
+            tracing::debug!(
+                "incoming retry-receipt for {from}/{msg_id}: no cached send (cache miss or too old)",
+            );
+            return Ok(());
+        };
+
+        // Target the specific device. Drop `:0` to match wire convention.
+        let device_jid = strip_zero_device(&from);
+
+        let keys_node = children.iter().find(|n| n.tag == "keys");
+        if let Some(keys) = keys_node {
+            let registration_id = children
+                .iter()
+                .find(|n| n.tag == "registration")
+                .and_then(|n| match &n.content {
+                    NodeContent::Bytes(b) if b.len() >= 4 => {
+                        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0);
+            match parse_retry_keys_bundle(keys, registration_id) {
+                Ok(bundle) => {
+                    if let Err(e) = self.signal.create_sender_session(&device_jid, &bundle) {
+                        tracing::warn!("create_sender_session for retry {device_jid}: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("parse retry keys bundle: {e}"),
+            }
+        } else if !self.signal.has_session(&device_jid) {
+            match crate::socket::prekey::fetch_pre_key_bundle(&self.socket, &device_jid).await {
+                Ok(bundle) => {
+                    if let Err(e) = self.signal.create_sender_session(&device_jid, &bundle) {
+                        tracing::warn!(
+                            "create_sender_session (fetched) for retry {device_jid}: {e}",
+                        );
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("fetch_pre_key_bundle for retry {device_jid}: {e}");
+                    return Ok(());
+                }
+            }
+        }
+
+        let wa_bytes = self.encode_content(&cached)?;
+        let padded = pad_wa(&wa_bytes);
+        let enc = self.signal.encrypt_message(&device_jid, &padded).await?;
+        let is_pkmsg = enc.msg_type == "pkmsg";
+
+        let mut out_children = vec![BinaryNode {
+            tag: "enc".to_string(),
+            attrs: vec![
+                ("v".to_string(), "2".to_string()),
+                ("type".to_string(), enc.msg_type.to_string()),
+                ("count".to_string(), retry_count.to_string()),
+            ],
+            content: NodeContent::Bytes(enc.ciphertext),
+        }];
+        if is_pkmsg {
+            let account_id = self.signal.account_identity_bytes().to_vec();
+            if !account_id.is_empty() {
+                out_children.push(BinaryNode {
+                    tag: "device-identity".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Bytes(account_id),
+                });
+            }
+        }
+
+        let mut attrs = vec![
+            ("to".to_string(), device_jid.clone()),
+            ("id".to_string(), msg_id.clone()),
+            ("type".to_string(), "text".to_string()),
+            ("t".to_string(), unix_now().to_string()),
+        ];
+        if let Some(p) = node.attr("participant") {
+            attrs.push(("participant".into(), p.to_string()));
+        }
+        if let Some(r) = node.attr("recipient") {
+            attrs.push(("recipient".into(), r.to_string()));
+        }
+        let stanza = BinaryNode {
+            tag: "message".to_string(),
+            attrs,
+            content: NodeContent::List(out_children),
+        };
+        tracing::info!(
+            "→ retry-resend id={msg_id} to={device_jid} pkmsg={is_pkmsg} count={retry_count}",
+        );
+        self.socket.send_node(&stanza).await?;
+        Ok(())
+    }
+
     /// Retry a single outbox entry (re-encodes + re-encrypts with fresh ratchet step).
     /// Called from the reconnect loop for every entry still in the outbox.
     pub(crate) async fn retry_outbox_entry(&self, jid: &str, msg: WAMessage) {
@@ -450,6 +672,7 @@ impl MessageManager {
         };
         match self.send_encrypted_bytes(jid, &id, wa_bytes).await {
             Ok(()) => {
+                self.recent_sends.insert(jid, &id, msg.clone());
                 self.outbox.remove(&id);
                 self.msg_store.update_status(jid, &id, MessageStatus::Sent);
                 let _ = self.event_tx.send(MessageEvent::MessageUpdate {
@@ -489,8 +712,24 @@ impl MessageManager {
             Some(MessageContent::Document { info, file_name }) =>
                 encode_wa_document_message(info, file_name),
             Some(MessageContent::Sticker { info }) => encode_wa_sticker_message(info),
-            Some(MessageContent::Reaction { target_id, emoji }) =>
-                encode_wa_reaction_message(&msg.key.remote_jid, target_id, emoji),
+            Some(MessageContent::Reaction { target_id, emoji }) => {
+                // The target msg's `fromMe` flag in the reaction key must
+                // match the peer's record, otherwise they can't locate the
+                // target and drop the reaction silently. Look it up in our
+                // message store; default to fromMe=false when unknown (most
+                // common case: reacting to a received msg).
+                let target_from_me = self
+                    .msg_store
+                    .lookup(&msg.key.remote_jid, target_id)
+                    .map(|m| m.from_me)
+                    .unwrap_or(false);
+                encode_wa_reaction_message(
+                    &msg.key.remote_jid,
+                    target_id,
+                    emoji,
+                    target_from_me,
+                )
+            }
             Some(MessageContent::Poll { question, options, selectable_count }) => {
                 let opts: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
                 let (bytes, enc_key) = crate::signal::wa_proto::encode_wa_poll_message(
@@ -516,26 +755,49 @@ impl MessageManager {
         // copy) the outer Message is `deviceSentMessage{destinationJid,message}`
         // with an UNPADDED inner. Helper `pad_wa` does per-target padding
         // right before `signal.encrypt_message`.
-        let (message_content, any_pkmsg) = if jid.ends_with("@g.us") {
+        let (message_content, any_pkmsg, skdm_distributed) = if jid.ends_with("@g.us") {
             let participants =
                 crate::socket::group::fetch_group_participants(&self.socket, jid).await?;
-            self.distribute_sender_key(jid, &participants).await?;
+            let (sender_key_nodes, distributed, sender_key_pkmsg) =
+                self.build_group_sender_key_distribution(jid, &participants).await?;
             let skmsg = self.signal.encrypt_group_message(jid, &pad_wa(&wa_bytes)).await?;
-            let enc_child = BinaryNode {
+            let mut children = vec![BinaryNode {
                 tag: "enc".to_string(),
                 attrs: vec![
                     ("v".to_string(), "2".to_string()),
                     ("type".to_string(), "skmsg".to_string()),
                 ],
                 content: NodeContent::Bytes(skmsg),
-            };
-            (NodeContent::List(vec![enc_child]), false)
+            }];
+            if !sender_key_nodes.is_empty() {
+                children.push(BinaryNode {
+                    tag: "participants".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::List(sender_key_nodes),
+                });
+            }
+            if sender_key_pkmsg {
+                let account_id = self.signal.account_identity_bytes().to_vec();
+                if !account_id.is_empty() {
+                    children.push(BinaryNode {
+                        tag: "device-identity".to_string(),
+                        attrs: vec![],
+                        content: NodeContent::Bytes(account_id),
+                    });
+                }
+            }
+            (NodeContent::List(children), sender_key_pkmsg, distributed)
         } else {
             // 1:1 flow — send to recipient's devices AND our own other
             // devices so the message also shows up as "sent" in our phone
             // (DeviceSentMessage).
-            let our_user_jid = bare_user_jid(&self.our_jid);
-            let our_device_jid = self.our_jid.clone();
+            let own_address_jid = if jid.ends_with("@lid") {
+                self.our_lid.as_deref().unwrap_or(&self.our_jid)
+            } else {
+                &self.our_jid
+            };
+            let our_user_jid = bare_user_jid(own_address_jid);
+            let our_device_jid = own_address_jid.to_string();
 
             let cache = crate::device_cache::DeviceCache::new(std::path::Path::new("."));
 
@@ -633,7 +895,7 @@ impl MessageManager {
                     });
                 }
             }
-            (NodeContent::List(children), any_pkmsg)
+            (NodeContent::List(children), any_pkmsg, Vec::new())
         };
 
         let is_pkmsg = any_pkmsg;
@@ -656,7 +918,13 @@ impl MessageManager {
                 _ => String::new(),
             },
         );
-        self.socket.send_node(&stanza).await
+        self.socket.send_node(&stanza).await?;
+        if jid.ends_with("@g.us") {
+            for dev_jid in skdm_distributed {
+                self.signal.mark_skdm_distributed(jid, &dev_jid);
+            }
+        }
+        Ok(())
     }
 
     /// Encrypt and upload media, returning a filled-in `MediaInfo`.
@@ -753,19 +1021,11 @@ impl MessageManager {
         const STATUS_JID: &str = "status@broadcast";
 
         let contacts: Vec<String> = self.contacts.snapshot().into_keys().collect();
-        self.distribute_sender_key(STATUS_JID, &contacts).await?;
+        let (sender_key_nodes, distributed, sender_key_pkmsg) =
+            self.build_group_sender_key_distribution(STATUS_JID, &contacts).await?;
 
         let skmsg = self.signal.encrypt_group_message(STATUS_JID, &wa_bytes).await?;
         let id = generate_message_id();
-
-        let to_nodes: Vec<BinaryNode> = contacts
-            .iter()
-            .map(|jid| BinaryNode {
-                tag: "to".to_string(),
-                attrs: vec![("jid".to_string(), jid.to_string())],
-                content: NodeContent::None,
-            })
-            .collect();
 
         let mut content_nodes = vec![BinaryNode {
             tag: "enc".to_string(),
@@ -775,7 +1035,23 @@ impl MessageManager {
             ],
             content: NodeContent::Bytes(skmsg),
         }];
-        content_nodes.extend(to_nodes);
+        if !sender_key_nodes.is_empty() {
+            content_nodes.push(BinaryNode {
+                tag: "participants".to_string(),
+                attrs: vec![],
+                content: NodeContent::List(sender_key_nodes),
+            });
+        }
+        if sender_key_pkmsg {
+            let account_id = self.signal.account_identity_bytes().to_vec();
+            if !account_id.is_empty() {
+                content_nodes.push(BinaryNode {
+                    tag: "device-identity".to_string(),
+                    attrs: vec![],
+                    content: NodeContent::Bytes(account_id),
+                });
+            }
+        }
 
         self.socket.send_node(&BinaryNode {
             tag: "message".to_string(),
@@ -787,6 +1063,9 @@ impl MessageManager {
             ],
             content: NodeContent::List(content_nodes),
         }).await?;
+        for dev_jid in distributed {
+            self.signal.mark_skdm_distributed(STATUS_JID, &dev_jid);
+        }
         Ok(id)
     }
 
@@ -795,42 +1074,117 @@ impl MessageManager {
         self.send_text(group_jid, text).await
     }
 
-    /// Send our SenderKey to any participant who hasn't received it yet.
-    async fn distribute_sender_key(&self, group_jid: &str, participants: &[String]) -> Result<()> {
-        let skdm_proto = self.signal.get_skdm_proto(group_jid);
+    /// Build `<participants><to><enc/></to>...` nodes that distribute our
+    /// SenderKey to every group device missing it. This must ride on the same
+    /// group stanza as the `skmsg`; sending separate 1:1 stanzas can leave
+    /// other devices without the key, which is exactly how official clients
+    /// end up stuck on "esperando mensaje".
+    async fn build_group_sender_key_distribution(
+        &self,
+        group_jid: &str,
+        participants: &[String],
+    ) -> Result<(Vec<BinaryNode>, Vec<String>, bool)> {
+        use std::collections::{HashMap, HashSet};
+
+        let cache = crate::device_cache::DeviceCache::new(std::path::Path::new("."));
+        let mut participant_devices = Vec::new();
+        let mut uncached = Vec::new();
 
         for jid in participants {
-            // Skip ourselves and those already distributed to
-            if jid == &self.our_jid || self.signal.is_skdm_distributed(group_jid, jid) {
+            let bare = bare_user_jid(jid);
+            if let Some(devs) = cache.get(&bare) {
+                participant_devices.extend(devs);
+            } else {
+                uncached.push(bare);
+            }
+        }
+
+        let uncached_user_count = uncached.len();
+        if !uncached.is_empty() {
+            let uncached_refs: Vec<&str> = uncached.iter().map(String::as_str).collect();
+            let fetched = crate::socket::usync::get_user_devices(&self.socket, &uncached_refs).await?;
+            let mut fetched_by_user: HashMap<String, Vec<String>> = HashMap::new();
+            for dev in fetched {
+                fetched_by_user.entry(bare_user_jid(&dev)).or_default().push(dev);
+            }
+            for bare in uncached {
+                let devices = fetched_by_user
+                    .remove(&bare)
+                    .unwrap_or_else(|| vec![ensure_device(&bare)]);
+                cache.put(&bare, &devices);
+                participant_devices.extend(devices);
+            }
+        }
+
+        let skdm_proto = self.signal.get_skdm_proto(group_jid);
+        tracing::info!(
+            "SKDM plan: group={} participants={} candidate_devices={} uncached_users={} proto_len={}",
+            group_jid,
+            participants.len(),
+            participant_devices.len(),
+            uncached_user_count,
+            skdm_proto.len(),
+        );
+        tracing::debug!(
+            "SKDM candidate devices for {} => {:?}",
+            group_jid,
+            participant_devices,
+        );
+        let mut our_devices = HashSet::from([strip_zero_device(&self.our_jid)]);
+        if let Some(our_lid) = &self.our_lid {
+            our_devices.insert(strip_zero_device(our_lid));
+        }
+        let mut seen = HashSet::new();
+        let mut to_nodes = Vec::new();
+        let mut distributed = Vec::new();
+        let mut any_pkmsg = false;
+
+        for device_jid in participant_devices {
+            let jid = strip_zero_device(&device_jid);
+            if !seen.insert(jid.clone()) {
                 continue;
             }
-            // Ensure 1:1 Signal session exists
-            if !self.signal.has_session(jid) {
-                match crate::socket::prekey::fetch_pre_key_bundle(&self.socket, jid).await {
-                    Ok(bundle) => {
-                        if let Err(e) = self.signal.create_sender_session(jid, &bundle) {
-                            tracing::warn!("SKDM: session for {jid} failed: {e}");
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("SKDM: pre-keys for {jid} failed: {e}");
+            if our_devices.contains(&jid) {
+                tracing::debug!("SKDM: skipping own device {jid}");
+                continue;
+            }
+            if self.signal.is_skdm_distributed(group_jid, &jid) {
+                continue;
+            }
+            tracing::debug!(
+                "SKDM: refreshing pairwise session for {} (had_session={})",
+                jid,
+                self.signal.has_session(&jid),
+            );
+            match crate::socket::prekey::fetch_pre_key_bundle(&self.socket, &jid).await {
+                Ok(bundle) => {
+                    if let Err(e) = self.signal.create_sender_session(&jid, &bundle) {
+                        tracing::warn!("SKDM: session refresh for {jid} failed: {e}");
                         continue;
                     }
                 }
+                Err(e) => {
+                    tracing::warn!("SKDM: pre-keys for {jid} failed: {e}");
+                    continue;
+                }
             }
-            // Signal-encrypt the SKDM proto and send as a 1:1 message
-            match self.signal.encrypt_message(jid, &skdm_proto).await {
+            let padded = pad_wa(&skdm_proto);
+            match self.signal.encrypt_message(&jid, &padded).await {
                 Ok(enc) => {
-                    let id = generate_message_id();
-                    let node = BinaryNode {
-                        tag: "message".to_string(),
-                        attrs: vec![
-                            ("to".to_string(), jid.to_string()),
-                            ("id".to_string(), id),
-                            ("type".to_string(), "text".to_string()),
-                            ("t".to_string(), unix_now().to_string()),
-                        ],
+                    if enc.msg_type == "pkmsg" {
+                        any_pkmsg = true;
+                    }
+                    tracing::debug!(
+                        "SKDM target: group={} jid={} enc_type={} padded_len={} cipher_len={}",
+                        group_jid,
+                        jid,
+                        enc.msg_type,
+                        padded.len(),
+                        enc.ciphertext.len(),
+                    );
+                    to_nodes.push(BinaryNode {
+                        tag: "to".to_string(),
+                        attrs: vec![("jid".to_string(), jid.clone())],
                         content: NodeContent::List(vec![BinaryNode {
                             tag: "enc".to_string(),
                             attrs: vec![
@@ -839,17 +1193,20 @@ impl MessageManager {
                             ],
                             content: NodeContent::Bytes(enc.ciphertext),
                         }]),
-                    };
-                    if let Err(e) = self.socket.send_node(&node).await {
-                        tracing::warn!("SKDM send to {jid} failed: {e}");
-                        continue;
-                    }
-                    self.signal.mark_skdm_distributed(group_jid, jid);
+                    });
+                    distributed.push(jid);
                 }
                 Err(e) => tracing::warn!("SKDM encrypt for {jid} failed: {e}"),
             }
         }
-        Ok(())
+        tracing::info!(
+            "SKDM built: group={} targets={} pkmsg={} distributed={:?}",
+            group_jid,
+            to_nodes.len(),
+            any_pkmsg,
+            distributed,
+        );
+        Ok((to_nodes, distributed, any_pkmsg))
     }
 
     /// Send a text message with a link preview card.

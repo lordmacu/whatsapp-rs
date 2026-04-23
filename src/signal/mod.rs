@@ -197,8 +197,19 @@ impl SignalRepository {
         let mut sk = self.sender_keys.lock().expect("sender_keys");
         let own = sk.get_or_create_own(group_jid);
         let axolotl = wa_proto::encode_axolotl_skdm(own.key_id, own.iteration, &own.chain_key, &own.signing_pub);
+        let key_id = own.key_id;
+        let iteration = own.iteration;
         drop(sk);
-        wa_proto::encode_wa_skdm_message(group_jid, &axolotl)
+        let proto = wa_proto::encode_wa_skdm_message(group_jid, &axolotl);
+        debug!(
+            "skdm proto: group={} key_id={} iteration={} axolotl_len={} wa_len={}",
+            group_jid,
+            key_id,
+            iteration,
+            axolotl.len(),
+            proto.len(),
+        );
+        proto
     }
 
     /// Encrypt `plaintext` as a SenderKey message for `group_jid`.
@@ -217,6 +228,14 @@ impl SignalRepository {
         let enc = cbc::Encryptor::<Aes256>::new_from_slices(&cipher_key, &iv)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let ciphertext = enc.encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+        debug!(
+            "group encrypt: group={} key_id={} iteration={} plaintext_len={} ciphertext_len={}",
+            group_jid,
+            key_id,
+            iteration,
+            plaintext.len(),
+            ciphertext.len(),
+        );
 
         // Persist updated chain
         let bytes = self.sender_keys.lock().map_err(|e| anyhow::anyhow!("{e}"))?.to_bytes();

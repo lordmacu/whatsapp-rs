@@ -2,7 +2,7 @@
 use crate::binary::{BinaryNode, NodeContent};
 use crate::socket::SocketSender;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -123,6 +123,18 @@ pub async fn get_user_devices(sender: &SocketSender, jids: &[&str]) -> Result<Ve
         return Ok(vec![]);
     }
 
+    let requested_lid_users: HashSet<String> = jids
+        .iter()
+        .filter_map(|jid| {
+            let (_, server) = split_user_server(jid)?;
+            if server.ends_with("lid") {
+                Some(bare_user_jid(jid))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let user_nodes: Vec<BinaryNode> = jids
         .iter()
         .map(|jid| BinaryNode {
@@ -144,8 +156,11 @@ pub async fn get_user_devices(sender: &SocketSender, jids: &[&str]) -> Result<Ve
             let NodeContent::List(users) = &list.content else { continue };
             for user in users {
                 let Some(user_jid) = user.attr("jid") else { continue };
-                // server key is everything after '@'
-                let (user_part, server) = match user_jid.split_once('@') {
+                let base_jid = user.attr("lid")
+                    .filter(|lid| requested_lid_users.contains(&bare_user_jid(lid)))
+                    .unwrap_or(user_jid);
+                let bare_base = bare_user_jid(base_jid);
+                let (user_part, server) = match split_user_server(&bare_base) {
                     Some((u, s)) => (u.to_string(), s.to_string()),
                     None => continue,
                 };
@@ -165,6 +180,18 @@ pub async fn get_user_devices(sender: &SocketSender, jids: &[&str]) -> Result<Ve
     }
 
     Ok(devices)
+}
+
+fn split_user_server(jid: &str) -> Option<(&str, &str)> {
+    jid.split_once('@')
+}
+
+fn bare_user_jid(jid: &str) -> String {
+    let Some((left, server)) = split_user_server(jid) else {
+        return jid.to_string();
+    };
+    let user = left.split(':').next().unwrap_or(left);
+    format!("{user}@{server}")
 }
 
 // ── internals ─────────────────────────────────────────────────────────────────

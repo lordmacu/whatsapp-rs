@@ -1,6 +1,8 @@
+pub mod recent_sends;
 pub mod recv;
 pub mod send;
 
+use crate::binary::BinaryNode;
 use crate::signal::SignalRepository;
 use crate::socket::SocketSender;
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,15 @@ pub struct MessageKey {
     pub from_me: bool,
     pub id: String,
     pub participant: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPdoRetry {
+    pub retry_key: String,
+    pub orig: BinaryNode,
+    pub to: String,
+    pub msg_id: String,
+    pub t: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +185,7 @@ pub struct MessageManager {
     pub(crate) signal: Arc<SignalRepository>,
     pub(crate) event_tx: broadcast::Sender<MessageEvent>,
     pub(crate) our_jid: String,
+    pub(crate) our_lid: Option<String>,
     pub(crate) contacts: Arc<crate::contacts::ContactStore>,
     pub(crate) msg_store: Arc<crate::message_store::MessageStore>,
     pub(crate) poll_store: Arc<crate::poll_store::PollStore>,
@@ -183,10 +195,17 @@ pub struct MessageManager {
     /// are logged and ignored.
     pub(crate) app_state_keys: Option<Arc<crate::app_state::AppStateKeyStore>>,
     pub(crate) app_state_sync: Option<Arc<crate::app_state::AppStateSync>>,
-    /// Message ids we've already sent a retry receipt for. Second occurrence
-    /// escalates from no-keys retry to a full `<keys>` retry (Baileys' count>1
-    /// path) so the sender recreates the pairwise session.
-    pub(crate) retry_ids: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Retry counts keyed by `message_id:participant_or_sender`. We follow
+    /// WA Web/Baileys semantics: first retry is count=1 without `<keys>`,
+    /// second occurrence escalates to count=2 with a full `<keys>` bundle.
+    pub(crate) retry_ids: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    /// Maps outgoing PDO request ids to the original message context so we can
+    /// escalate to a second retry-with-keys immediately when the phone returns
+    /// `NOT_FOUND`.
+    pub(crate) pending_pdo_retries: Arc<std::sync::Mutex<std::collections::HashMap<String, PendingPdoRetry>>>,
+    /// Ring cache of last ~256 outgoing messages. Answers incoming
+    /// `<receipt type="retry">` from peer devices that missed the original.
+    pub(crate) recent_sends: Arc<recent_sends::RecentSends>,
 }
 
 #[allow(dead_code)]
@@ -198,7 +217,22 @@ impl MessageManager {
         let msg_store = Arc::new(crate::message_store::MessageStore::new(p).expect("msg store"));
         let poll_store = Arc::new(crate::poll_store::PollStore::new(p).expect("poll store"));
         let outbox = Arc::new(crate::outbox::OutboxStore::new(p).expect("outbox store"));
-        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None, retry_ids: std::sync::Mutex::new(std::collections::HashSet::new()) }
+        Self {
+            socket,
+            signal,
+            event_tx,
+            our_jid,
+            our_lid: None,
+            contacts,
+            msg_store,
+            poll_store,
+            outbox,
+            app_state_keys: None,
+            app_state_sync: None,
+            retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            recent_sends: Arc::new(recent_sends::RecentSends::new()),
+        }
     }
 
     pub fn with_tx(
@@ -212,7 +246,22 @@ impl MessageManager {
         let msg_store = Arc::new(crate::message_store::MessageStore::new(p).expect("msg store"));
         let poll_store = Arc::new(crate::poll_store::PollStore::new(p).expect("poll store"));
         let outbox = Arc::new(crate::outbox::OutboxStore::new(p).expect("outbox store"));
-        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None, retry_ids: std::sync::Mutex::new(std::collections::HashSet::new()) }
+        Self {
+            socket,
+            signal,
+            event_tx,
+            our_jid,
+            our_lid: None,
+            contacts,
+            msg_store,
+            poll_store,
+            outbox,
+            app_state_keys: None,
+            app_state_sync: None,
+            retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            recent_sends: Arc::new(recent_sends::RecentSends::new()),
+        }
     }
 
     pub fn with_tx_and_contacts(
@@ -226,7 +275,22 @@ impl MessageManager {
         let msg_store = Arc::new(crate::message_store::MessageStore::new(p).expect("msg store"));
         let poll_store = Arc::new(crate::poll_store::PollStore::new(p).expect("poll store"));
         let outbox = Arc::new(crate::outbox::OutboxStore::new(p).expect("outbox store"));
-        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None, retry_ids: std::sync::Mutex::new(std::collections::HashSet::new()) }
+        Self {
+            socket,
+            signal,
+            event_tx,
+            our_jid,
+            our_lid: None,
+            contacts,
+            msg_store,
+            poll_store,
+            outbox,
+            app_state_keys: None,
+            app_state_sync: None,
+            retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            recent_sends: Arc::new(recent_sends::RecentSends::new()),
+        }
     }
 
     pub fn with_stores(
@@ -239,7 +303,27 @@ impl MessageManager {
         poll_store: Arc<crate::poll_store::PollStore>,
         outbox: Arc<crate::outbox::OutboxStore>,
     ) -> Self {
-        Self { socket, signal, event_tx, our_jid, contacts, msg_store, poll_store, outbox, app_state_keys: None, app_state_sync: None, retry_ids: std::sync::Mutex::new(std::collections::HashSet::new()) }
+        Self {
+            socket,
+            signal,
+            event_tx,
+            our_jid,
+            our_lid: None,
+            contacts,
+            msg_store,
+            poll_store,
+            outbox,
+            app_state_keys: None,
+            app_state_sync: None,
+            retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            recent_sends: Arc::new(recent_sends::RecentSends::new()),
+        }
+    }
+
+    pub fn with_our_lid(mut self, our_lid: Option<String>) -> Self {
+        self.our_lid = our_lid;
+        self
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MessageEvent> {
