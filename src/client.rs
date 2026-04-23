@@ -1326,6 +1326,25 @@ impl Session {
         Chat { session: self, jid: jid.into() }
     }
 
+    /// Register a LID↔PN equivalence manually. Bidirectional — inserts
+    /// both directions into the lookup map and informs the Signal layer so
+    /// session lookup falls back across addressings.
+    ///
+    /// Useful when the mapping isn't auto-discoverable from stanza attrs
+    /// (e.g. 1:1 DMs where the peer addresses you via LID and `sender_pn`
+    /// isn't emitted). Group stanzas do carry `participant_pn` and
+    /// populate this map automatically.
+    pub async fn set_jid_alias(&self, lid: &str, pn: &str) {
+        let mgr = self.mgr.read().await;
+        let lid_bare = bare_user_jid(lid);
+        let pn_bare = bare_user_jid(pn);
+        if let Ok(mut map) = mgr.lid_pn_map.lock() {
+            map.insert(lid_bare.clone(), pn_bare.clone());
+            map.insert(pn_bare.clone(), lid_bare.clone());
+        }
+        mgr.signal.set_jid_alias(&lid_bare, &pn_bare);
+    }
+
     /// Return the LID↔PN counterpart of `jid` if one has been learned from
     /// an incoming stanza (`sender_pn` / `participant_pn`). Both identities
     /// route to the same user — handy when you track a peer by PN but they

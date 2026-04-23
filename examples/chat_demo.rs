@@ -2,10 +2,13 @@
 ///
 /// Usage:
 ///   systemctl --user stop whatsapp-rs   # daemon shares the WA socket
-///   cargo run --example chat_demo -- <jid>
+///   cargo run --example chat_demo -- <jid> [lid]
 ///   systemctl --user start whatsapp-rs
 ///
 /// `<jid>` format: `573154645370@s.whatsapp.net` (1:1) or `12345@g.us` (group).
+/// `[lid]` optional LID counterpart (`168001974309057@lid`) — registers the
+/// alias so incoming msgs from the peer's LID identity decrypt against the
+/// same session we use for outgoing PN sends.
 ///
 /// What it does:
 ///   1. Connects (reuses existing ~/.local/share/.whatsapp-rs pairing)
@@ -38,6 +41,11 @@ async fn main() -> Result<()> {
     let client = Client::new()?;
     let session = client.connect().await?;
     println!("connected as {}", session.our_jid);
+
+    if let Some(lid) = args.get(2) {
+        session.set_jid_alias(lid, &jid).await;
+        println!("→ registered LID alias: {lid} ↔ {jid}");
+    }
 
     let chat = session.chat(&jid);
     println!("chat target: {} (name={:?})", chat.jid(), chat.name());
