@@ -92,6 +92,121 @@ impl Session {
     }
 }
 
+// ── Multi-handler router ──────────────────────────────────────────────────────
+
+/// Dispatch a message to one of several handlers by predicate. Useful when a
+/// single session hosts distinct flows — e.g. one handler for admins, one
+/// for customers, one for a specific command prefix, and a catch-all.
+///
+/// Routes are tried in insertion order; the first matching one wins. Build
+/// with [`Router::new`] and chain [`Router::route`] / [`Router::fallback`].
+///
+/// ```ignore
+/// use whatsapp_rs::agent::{Router, Response};
+///
+/// let router = Router::new()
+///     .route_text_prefix("!",            |ctx| async move { admin(ctx).await })
+///     .route_from("573XX@s.whatsapp.net", |ctx| async move { owner(ctx).await })
+///     .fallback(                          |ctx| async move { echo(ctx).await });
+///
+/// session.run_agent(move |ctx| router.dispatch(ctx)).await?;
+/// ```
+///
+/// Handlers must have the same signature `Fn(AgentCtx) -> impl Future<Output = Response>`.
+/// Each handler is boxed internally so the Router type stays simple.
+pub struct Router {
+    routes: Vec<Route>,
+}
+
+type BoxedHandler = Box<
+    dyn Fn(AgentCtx) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
+        + Send + Sync,
+>;
+
+struct Route {
+    matches: Box<dyn Fn(&AgentCtx) -> bool + Send + Sync>,
+    handler: BoxedHandler,
+}
+
+impl Default for Router {
+    fn default() -> Self { Self::new() }
+}
+
+impl Router {
+    pub fn new() -> Self { Self { routes: Vec::new() } }
+
+    /// Add a route with a custom predicate. Most callers should prefer the
+    /// narrower helpers below (`route_text_prefix`, `route_from`,
+    /// `route_text_match`) and only drop to this when the match logic is
+    /// non-trivial (regex, semantic, stateful).
+    pub fn route<P, F, Fut>(mut self, predicate: P, handler: F) -> Self
+    where
+        P: Fn(&AgentCtx) -> bool + Send + Sync + 'static,
+        F: Fn(AgentCtx) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Response> + Send + 'static,
+    {
+        self.routes.push(Route {
+            matches: Box::new(predicate),
+            handler: Box::new(move |ctx| Box::pin(handler(ctx))),
+        });
+        self
+    }
+
+    /// Catch-all — match any message. Typically the last route added.
+    pub fn fallback<F, Fut>(self, handler: F) -> Self
+    where
+        F: Fn(AgentCtx) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Response> + Send + 'static,
+    {
+        self.route(|_| true, handler)
+    }
+
+    /// Match when the extracted text starts with `prefix` (case-sensitive).
+    /// Ignores media / reaction / poll messages (they have no text).
+    pub fn route_text_prefix<F, Fut>(self, prefix: &'static str, handler: F) -> Self
+    where
+        F: Fn(AgentCtx) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Response> + Send + 'static,
+    {
+        self.route(move |ctx| ctx.text.as_deref().map(|t| t.starts_with(prefix)).unwrap_or(false), handler)
+    }
+
+    /// Match when `ctx.text.trim().eq_ignore_ascii_case(command)`. Good for
+    /// slash-command bots where each route is one verb.
+    pub fn route_text_match<F, Fut>(self, command: &'static str, handler: F) -> Self
+    where
+        F: Fn(AgentCtx) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Response> + Send + 'static,
+    {
+        self.route(move |ctx| {
+            ctx.text.as_deref()
+                .map(|t| t.trim().eq_ignore_ascii_case(command))
+                .unwrap_or(false)
+        }, handler)
+    }
+
+    /// Match when the **sender** JID (bare — `:device` stripped) equals `jid`.
+    /// Use for owner-only / admin-only flows.
+    pub fn route_from<F, Fut>(self, jid: &'static str, handler: F) -> Self
+    where
+        F: Fn(AgentCtx) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Response> + Send + 'static,
+    {
+        self.route(move |ctx| bare_jid(ctx.sender()) == bare_jid(jid), handler)
+    }
+
+    /// Pick the first matching route and run it. Returns `Response::Noop`
+    /// if no route matches (no handler installed for the fallback case).
+    pub async fn dispatch(&self, ctx: AgentCtx) -> Response {
+        for r in &self.routes {
+            if (r.matches)(&ctx) {
+                return (r.handler)(ctx).await;
+            }
+        }
+        Response::Noop
+    }
+}
+
 // ── Audio transcription hook ──────────────────────────────────────────────────
 
 /// Extension point for voice-note → text. When configured, the agent loop
@@ -249,6 +364,56 @@ mod tests {
         assert!(acl.permits("57300@s.whatsapp.net"));
         assert!(acl.permits("57300:20@s.whatsapp.net")); // device suffix stripped
         assert!(!acl.permits("57999@s.whatsapp.net"));
+    }
+
+    fn fake_ctx(text: Option<&str>, jid: &str) -> AgentCtx {
+        AgentCtx {
+            msg: crate::messages::WAMessage {
+                key: crate::messages::MessageKey {
+                    remote_jid: jid.to_string(),
+                    from_me: false,
+                    id: "test".into(),
+                    participant: None,
+                },
+                message: None,
+                message_timestamp: 0,
+                status: crate::messages::MessageStatus::Delivered,
+                push_name: None,
+            },
+            text: text.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn router_text_prefix_hits() {
+        let router = Router::new()
+            .route_text_prefix("!", |_| async { Response::text("cmd") })
+            .fallback(|_| async { Response::text("other") });
+        match router.dispatch(fake_ctx(Some("!help"), "x@s")).await {
+            Response::Text(s) => assert_eq!(s, "cmd"),
+            _ => panic!(),
+        }
+        match router.dispatch(fake_ctx(Some("hola"), "x@s")).await {
+            Response::Text(s) => assert_eq!(s, "other"),
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn router_empty_returns_noop() {
+        let router = Router::new();
+        assert!(matches!(router.dispatch(fake_ctx(Some("x"), "y@s")).await, Response::Noop));
+    }
+
+    #[tokio::test]
+    async fn router_first_match_wins() {
+        let router = Router::new()
+            .route_text_match("ping", |_| async { Response::text("a") })
+            .route_text_prefix("p",   |_| async { Response::text("b") });
+        match router.dispatch(fake_ctx(Some("ping"), "x@s")).await {
+            Response::Text(s) => assert_eq!(s, "a"),
+            _ => panic!(),
+        }
     }
 }
 
