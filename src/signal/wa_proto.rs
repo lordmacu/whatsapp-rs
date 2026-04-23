@@ -99,27 +99,114 @@ fn encode_media_fields(info: &crate::messages::MediaInfo, caption: Option<&str>,
 
 // Canonical WAProto Message oneof field numbers (verified against Baileys
 // and whatsmeow protos): imageMessage=3, documentMessage=7, audioMessage=8,
-// videoMessage=9, stickerMessage=26. Older code used 4/5/6/20 respectively,
-// which some WA clients accepted but modern ones don't.
+// videoMessage=9, stickerMessage=26.
+//
+// Each media sub-message has ITS OWN internal field layout — same logical
+// fields (fileSha256, mediaKey, directPath, …) sit at different tags in
+// ImageMessage vs VideoMessage vs AudioMessage vs DocumentMessage vs
+// StickerMessage. Using one shared helper (`encode_media_fields` below)
+// only works for image; the others need per-type encoders.
 pub fn encode_wa_image_message(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
     proto_message(3, &encode_media_fields(info, caption, &[]))
 }
 
 pub fn encode_wa_video_message(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
-    proto_message(9, &encode_media_fields(info, caption, &[]))
+    proto_message(9, &encode_video_fields(info, caption))
 }
 
 pub fn encode_wa_audio_message(info: &crate::messages::MediaInfo) -> Vec<u8> {
-    proto_message(8, &encode_media_fields(info, None, &[]))
+    proto_message(8, &encode_audio_fields(info, /*ptt*/ false))
 }
 
 pub fn encode_wa_document_message(info: &crate::messages::MediaInfo, file_name: &str) -> Vec<u8> {
-    let extra = proto_bytes(30, file_name.as_bytes());
-    proto_message(7, &encode_media_fields(info, None, &extra))
+    proto_message(7, &encode_document_fields(info, file_name))
 }
 
 pub fn encode_wa_sticker_message(info: &crate::messages::MediaInfo) -> Vec<u8> {
-    proto_message(26, &encode_media_fields(info, None, &[]))
+    proto_message(26, &encode_sticker_fields(info))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// WAProto VideoMessage:
+///   1 url  2 mimetype  3 fileSha256  4 fileLength  5 seconds  6 mediaKey
+///   7 caption  11 fileEncSha256  13 directPath  14 mediaKeyTimestamp
+fn encode_video_fields(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
+    let mut sub = Vec::new();
+    sub.extend(proto_bytes(1, info.url.as_bytes()));
+    sub.extend(proto_bytes(2, info.mimetype.as_bytes()));
+    sub.extend(proto_bytes(3, &info.file_sha256));
+    sub.extend(proto_varint(4, info.file_length));
+    sub.extend(proto_bytes(6, &info.media_key));
+    if let Some(cap) = caption {
+        if !cap.is_empty() {
+            sub.extend(proto_bytes(7, cap.as_bytes()));
+        }
+    }
+    sub.extend(proto_bytes(11, &info.file_enc_sha256));
+    sub.extend(proto_bytes(13, info.direct_path.as_bytes()));
+    sub.extend(proto_varint(14, now_unix()));
+    sub
+}
+
+/// WAProto AudioMessage:
+///   1 url  2 mimetype  3 fileSha256  4 fileLength  5 seconds  6 ptt
+///   7 mediaKey  8 fileEncSha256  9 directPath  10 mediaKeyTimestamp
+fn encode_audio_fields(info: &crate::messages::MediaInfo, ptt: bool) -> Vec<u8> {
+    let mut sub = Vec::new();
+    sub.extend(proto_bytes(1, info.url.as_bytes()));
+    sub.extend(proto_bytes(2, info.mimetype.as_bytes()));
+    sub.extend(proto_bytes(3, &info.file_sha256));
+    sub.extend(proto_varint(4, info.file_length));
+    if ptt {
+        sub.extend(proto_varint(6, 1));
+    }
+    sub.extend(proto_bytes(7, &info.media_key));
+    sub.extend(proto_bytes(8, &info.file_enc_sha256));
+    sub.extend(proto_bytes(9, info.direct_path.as_bytes()));
+    sub.extend(proto_varint(10, now_unix()));
+    sub
+}
+
+/// WAProto DocumentMessage:
+///   1 url  2 mimetype  3 title  4 fileSha256  5 fileLength
+///   7 mediaKey  8 fileName  9 fileEncSha256  10 directPath
+///   11 mediaKeyTimestamp
+fn encode_document_fields(info: &crate::messages::MediaInfo, file_name: &str) -> Vec<u8> {
+    let mut sub = Vec::new();
+    sub.extend(proto_bytes(1, info.url.as_bytes()));
+    sub.extend(proto_bytes(2, info.mimetype.as_bytes()));
+    sub.extend(proto_bytes(3, file_name.as_bytes())); // title same as file_name
+    sub.extend(proto_bytes(4, &info.file_sha256));
+    sub.extend(proto_varint(5, info.file_length));
+    sub.extend(proto_bytes(7, &info.media_key));
+    sub.extend(proto_bytes(8, file_name.as_bytes()));
+    sub.extend(proto_bytes(9, &info.file_enc_sha256));
+    sub.extend(proto_bytes(10, info.direct_path.as_bytes()));
+    sub.extend(proto_varint(11, now_unix()));
+    sub
+}
+
+/// WAProto StickerMessage:
+///   1 url  2 fileSha256  3 fileEncSha256  4 mediaKey  5 mimetype
+///   8 directPath  9 fileLength  10 mediaKeyTimestamp
+/// Note: layout is different from other media types (mimetype at 5, not 2).
+fn encode_sticker_fields(info: &crate::messages::MediaInfo) -> Vec<u8> {
+    let mut sub = Vec::new();
+    sub.extend(proto_bytes(1, info.url.as_bytes()));
+    sub.extend(proto_bytes(2, &info.file_sha256));
+    sub.extend(proto_bytes(3, &info.file_enc_sha256));
+    sub.extend(proto_bytes(4, &info.media_key));
+    sub.extend(proto_bytes(5, info.mimetype.as_bytes()));
+    sub.extend(proto_bytes(8, info.direct_path.as_bytes()));
+    sub.extend(proto_varint(9, info.file_length));
+    sub.extend(proto_varint(10, now_unix()));
+    sub
 }
 
 /// Encode WAProto.Message with link preview (field 17 = ExtendedTextMessage).
