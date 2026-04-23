@@ -44,16 +44,16 @@ async fn main() -> Result<()> {
 
     // Start listening for a reply *before* we send anything. This catches
     // fast replies that would arrive during the text_and_wait window.
-    let reply_waiter = chat.listen_for_reply(Duration::from_secs(120));
-    println!("→ reply listener armed (120s window)");
+    let reply_waiter = chat.listen_for_reply(Duration::from_secs(20));
+    println!("→ reply listener armed (20s window)");
 
-    // 1. Send + wait for delivered
-    println!("→ sending and waiting for delivery (30s)…");
+    // 1. Send + wait for delivered (short timeout so demo finishes quickly)
+    println!("→ sending and waiting for delivery (10s)…");
     let (id, status) = chat
         .text_and_wait(
             "hola desde chat_demo",
             MessageStatus::Delivered,
-            Duration::from_secs(30),
+            Duration::from_secs(10),
         )
         .await?;
     println!("  id={id} final_status={:?}", status);
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     println!("→ typing pulse sent");
 
     // 4. Await the pre-armed reply listener
-    println!("→ awaiting reply (up to 120s total from listener start)…");
+    println!("→ awaiting reply (up to 20s total from listener start)…");
     match reply_waiter.await.ok().flatten() {
         Some(msg) => {
             let preview = match &msg.message {

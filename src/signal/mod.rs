@@ -121,6 +121,15 @@ pub struct SignalRepository {
     sender_keys: Arc<Mutex<sender_key::SenderKeyStore>>,
     store: Arc<dyn SessionStore>,
     pkmsg_count: Arc<AtomicU32>,
+    /// Bidirectional LID↔PN bare-user aliases learned from incoming stanza
+    /// attrs. Lets session lookup fall back across LID/PN addressings so a
+    /// single actual session state serves both identities and we don't
+    /// diverge with the peer.
+    ///
+    /// Stored bidirectionally keyed by bare user jid (no `:device` slot).
+    /// Example entries:
+    ///   "168001974309057@lid"          ↔ "573154645370@s.whatsapp.net"
+    jid_alias: Arc<Mutex<HashMap<String, String>>>,
 }
 
 pub struct EncryptedMessage {
@@ -146,7 +155,74 @@ impl SignalRepository {
             sender_keys: Arc::new(Mutex::new(sender_keys)),
             store,
             pkmsg_count: Arc::new(AtomicU32::new(0)),
+            jid_alias: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Record a LID↔PN equivalence so session lookups can fall back across
+    /// addressings. Bidirectional — inserts both directions. Keyed by bare
+    /// user jid (no `:device` slot).
+    pub fn set_jid_alias(&self, a: &str, b: &str) {
+        if let Ok(mut map) = self.jid_alias.lock() {
+            map.insert(a.to_string(), b.to_string());
+            map.insert(b.to_string(), a.to_string());
+        }
+    }
+
+    /// Return the alias of a bare user jid if known.
+    fn aliased_bare(&self, bare_jid: &str) -> Option<String> {
+        self.jid_alias.lock().ok()?.get(bare_jid).cloned()
+    }
+
+    /// Translate a canonical session jid into the best-known session key.
+    /// Preference order:
+    ///   1. the jid as-is if a session exists;
+    ///   2. any session under the LID/PN alias (same user, different server);
+    ///   3. the jid as-is (caller will get `no session` error).
+    fn resolve_session_key(&self, canonical: &str) -> String {
+        let sessions = match self.sessions.lock() {
+            Ok(m) => m,
+            _ => return canonical.to_string(),
+        };
+        if sessions.contains_key(canonical) {
+            return canonical.to_string();
+        }
+        // Try the aliased bare jid, preserving the device slot.
+        let (user, server, device) = split_user_server_device(canonical);
+        let bare = format!("{user}{server}");
+        drop(sessions);
+        if let Some(alt_bare) = self.aliased_bare(&bare) {
+            let sessions = match self.sessions.lock() {
+                Ok(m) => m,
+                _ => return canonical.to_string(),
+            };
+            // Try exact alt device first, then fall back to any device under alt user.
+            let alt_exact = match device {
+                Some(d) => format!(
+                    "{}:{d}{}",
+                    alt_bare.split('@').next().unwrap_or(""),
+                    alt_bare.find('@').map(|i| &alt_bare[i..]).unwrap_or(""),
+                ),
+                None => alt_bare.clone(),
+            };
+            if sessions.contains_key(&alt_exact) {
+                return alt_exact;
+            }
+            let (alt_user, alt_server) = match alt_bare.find('@') {
+                Some(i) => (&alt_bare[..i], &alt_bare[i..]),
+                None => return canonical.to_string(),
+            };
+            for k in sessions.keys() {
+                if let Some(at) = k.find('@') {
+                    let (left, srv) = (&k[..at], &k[at..]);
+                    let ku = left.split(':').next().unwrap_or(left);
+                    if ku == alt_user && srv == alt_server {
+                        return k.clone();
+                    }
+                }
+            }
+        }
+        canonical.to_string()
     }
 
     pub fn account_identity_bytes(&self) -> &[u8] { &self.account_enc }
@@ -443,16 +519,39 @@ fn canonical_session_jid(jid: &str) -> String {
     }
 }
 
+/// `(user, server, device)` split. `"A:7@lid" → ("A", "@lid", Some(7))`.
+/// `"A@s.whatsapp.net" → ("A", "@s.whatsapp.net", None)`.
+fn split_user_server_device(jid: &str) -> (String, String, Option<u32>) {
+    let Some(at) = jid.find('@') else {
+        return (jid.to_string(), String::new(), None);
+    };
+    let (left, server) = (&jid[..at], &jid[at..]);
+    let (user, device) = match left.split_once(':') {
+        Some((u, d)) => (u.to_string(), d.parse().ok()),
+        None => (left.to_string(), None),
+    };
+    (user, server.to_string(), device)
+}
+
 // ── Decrypt ───────────────────────────────────────────────────────────────────
 
 impl SignalRepository {
     fn decrypt_normal_message(&self, jid: &str, data: &[u8]) -> Result<Vec<u8>> {
         let (msg, _) = decode_signal_wire(data)?;
+        // Resolve LID↔PN alias: if peer sends us under LID but our actual
+        // session for this user lives under PN (because we've been sending
+        // to the PN addressing), redirect the lookup so a single ratchet
+        // state serves both directions.
+        let resolved_jid = self.resolve_session_key(jid);
+        if resolved_jid != jid {
+            tracing::debug!("decrypt msg: resolved {jid} → {resolved_jid} via alias");
+        }
         let mut sessions = self.sessions.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let session_keys: Vec<String> = sessions.keys().cloned().collect();
         let entry = sessions
-            .get_mut(jid)
-            .ok_or_else(|| anyhow::anyhow!("no session for {jid} (have: {session_keys:?})"))?;
+            .get_mut(&resolved_jid)
+            .ok_or_else(|| anyhow::anyhow!("no session for {jid} (resolved={resolved_jid}, have: {session_keys:?})"))?;
+        let jid = resolved_jid.as_str();
         tracing::debug!(
             "decrypt msg: jid={} ratchet_key_incoming={} counter={} prev_counter={}",
             jid, hex::encode(msg.ratchet_key), msg.counter, msg.prev_counter,

@@ -305,9 +305,14 @@ impl MessageManager {
             );
             let pn_user = bare_user_jid(pn);
             if lid_user.ends_with("@lid") && pn_user.ends_with("@s.whatsapp.net") {
-                let mut map = self.lid_pn_map.lock().unwrap();
-                map.insert(lid_user.clone(), pn_user.clone());
-                map.insert(pn_user, lid_user);
+                {
+                    let mut map = self.lid_pn_map.lock().unwrap();
+                    map.insert(lid_user.clone(), pn_user.clone());
+                    map.insert(pn_user.clone(), lid_user.clone());
+                }
+                // Also inform the Signal layer so session lookup can fall
+                // back across LID/PN before decrypt (critical for MAC match).
+                self.signal.set_jid_alias(&lid_user, &pn_user);
             }
         }
 
