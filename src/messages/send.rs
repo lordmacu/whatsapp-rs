@@ -720,6 +720,13 @@ impl MessageManager {
     /// Called from the reconnect loop for every entry still in the outbox.
     pub(crate) async fn retry_outbox_entry(&self, jid: &str, msg: WAMessage) {
         let id = msg.key.id.clone();
+        // Give up after the cap so a poisoned entry can't loop forever. The
+        // counter is bumped *before* the attempt so a crash mid-retry still
+        // registers progress and the entry eventually ages out.
+        if !self.outbox.record_attempt(&id) {
+            tracing::warn!("outbox: dropping {id} after exceeding retry cap");
+            return;
+        }
         let wa_bytes = match self.encode_content(&msg) {
             Ok(b) => b,
             Err(e) => { tracing::warn!("retry encode failed for {id}: {e}"); return; }

@@ -111,7 +111,13 @@ impl Client {
 
         info!("connected as {our_jid}");
 
-        // Retry any messages that were left in the outbox from a previous run
+        // Retry any messages that were left in the outbox from a previous run.
+        // Purge expired entries first — a 24h-old send is almost never still
+        // relevant and would just retry-loop forever against a bad jid.
+        let expired = outbox.purge_expired();
+        if expired > 0 {
+            info!("outbox: purged {expired} expired entries (>24h)");
+        }
         let pending = outbox.pending();
         if !pending.is_empty() {
             info!("{} outbox entries pending from previous session, retrying", pending.len());
@@ -1377,6 +1383,18 @@ impl Session {
     }
 
     /// Last `n` stored messages for a JID (oldest first, most-recent last).
+    /// Current outbox depth — messages written to disk as Pending that
+    /// haven't yet been ACK'd by the server. Handy for `/metrics` + CLI.
+    pub async fn outbox_pending_count(&self) -> usize {
+        self.mgr.read().await.outbox.len()
+    }
+
+    /// Snapshot of all pending outbox entries as `(jid, message)` tuples,
+    /// oldest first. Use for the `outbox` CLI subcommand.
+    pub async fn outbox_pending(&self) -> Vec<(String, crate::messages::WAMessage)> {
+        self.mgr.read().await.outbox.pending()
+    }
+
     pub fn message_history(&self, jid: &str, n: usize) -> Vec<crate::message_store::StoredMessage> {
         self.msg_store.recent(jid, n)
     }

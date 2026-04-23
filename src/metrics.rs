@@ -149,6 +149,7 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<serde_json::Valu
 async fn metrics_prom(State(s): State<AppState>) -> (StatusCode, [(&'static str, &'static str); 1], String) {
     let snap = snapshot();
     let connected = if s.session.is_connected() { 1 } else { 0 };
+    let outbox = s.session.outbox_pending_count().await;
     let body = format!(
         "\
 # HELP whatsapp_connected 1 if the socket is authenticated.
@@ -175,6 +176,9 @@ whatsapp_last_rx_unix_seconds {last_rx}
 # HELP whatsapp_last_tx_unix_seconds Unix timestamp of last outbound message.
 # TYPE whatsapp_last_tx_unix_seconds gauge
 whatsapp_last_tx_unix_seconds {last_tx}
+# HELP whatsapp_outbox_pending Current outbox depth (unsent / awaiting reconnect).
+# TYPE whatsapp_outbox_pending gauge
+whatsapp_outbox_pending {outbox}
 ",
         uptime = snap.uptime_secs,
         rx = snap.messages_received,
@@ -183,6 +187,7 @@ whatsapp_last_tx_unix_seconds {last_tx}
         reconnects = snap.reconnects,
         last_rx = snap.last_rx_unix,
         last_tx = snap.last_tx_unix,
+        outbox = outbox,
     );
     (
         StatusCode::OK,
@@ -193,6 +198,7 @@ whatsapp_last_tx_unix_seconds {last_tx}
 
 async fn metrics_json(State(s): State<AppState>) -> Json<serde_json::Value> {
     let snap = snapshot();
+    let outbox_pending = s.session.outbox_pending_count().await;
     Json(serde_json::json!({
         "connected": s.session.is_connected(),
         "jid": s.session.our_jid,
@@ -203,6 +209,7 @@ async fn metrics_json(State(s): State<AppState>) -> Json<serde_json::Value> {
         "reconnects": snap.reconnects,
         "last_rx_unix": snap.last_rx_unix,
         "last_tx_unix": snap.last_tx_unix,
+        "outbox_pending": outbox_pending,
     }))
 }
 

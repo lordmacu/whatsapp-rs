@@ -60,6 +60,7 @@ Commands:
   lookup <phone>...                     Check if phone numbers are on WhatsApp
   status                                Show our JID and exit
   doctor                                Self-test: creds, daemon, handshake, success, IQ, media
+  outbox                                List pending outbox entries (unsent / awaiting reconnect)
   metrics                               Pretty-print /metrics from WA_METRICS_ADDR (default 127.0.0.1:9100)
   schedule <when> <jid> <text>          Queue a text for later delivery (when: 30s/15m/2h/1d/<unix>/ISO-8601)
   schedule-daily <HH:MM> <jid> <text>   Send <text> every day at HH:MM UTC
@@ -277,6 +278,7 @@ async fn main() -> Result<()> {
             let ok = doctor::run_doctor().await?;
             std::process::exit(if ok { 0 } else { 1 });
         }
+        "outbox" => cmd_outbox().await,
         "broadcast" => {
             if args.len() < 3 {
                 bail!("Usage: whatsapp-rs broadcast <jid1,jid2,...> <text>\n  (or <file> with one JID per line)");
@@ -921,6 +923,24 @@ async fn cmd_status() -> Result<()> {
     Ok(())
 }
 
+async fn cmd_outbox() -> Result<()> {
+    let v = daemon::try_daemon_request(daemon::Request::OutboxStatus).await?
+        .ok_or_else(|| anyhow::anyhow!("no daemon running"))?;
+    let items = v.get("pending").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    if items.is_empty() {
+        println!("outbox empty");
+        return Ok(());
+    }
+    println!("{} pending:", items.len());
+    for it in items {
+        let id  = it.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        let jid = it.get("jid").and_then(|x| x.as_str()).unwrap_or("?");
+        let ts  = it.get("timestamp").and_then(|x| x.as_u64()).unwrap_or(0);
+        println!("  {id}  ts={ts}  → {jid}");
+    }
+    Ok(())
+}
+
 async fn cmd_broadcast(jids_spec: &str, text: &str) -> Result<()> {
     // Accept either a comma-separated list or a path to a file with one JID
     // per line. Lines starting with '#' are skipped so you can comment them.
@@ -1095,6 +1115,7 @@ async fn cmd_metrics() -> Result<()> {
     println!("reconnects:       {}", get_u64("reconnects"));
     println!("last rx:          {}", fmt_age(get_u64("last_rx_unix")));
     println!("last tx:          {}", fmt_age(get_u64("last_tx_unix")));
+    println!("outbox pending:   {}", get_u64("outbox_pending"));
     Ok(())
 }
 

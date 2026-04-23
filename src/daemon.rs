@@ -67,6 +67,8 @@ pub enum Request {
     ListScheduled,
     /// Cancel a pending scheduled item by its id. No-op if unknown.
     CancelScheduled { id: String },
+    /// List outbox entries that haven't been ACK'd yet — retried on reconnect.
+    OutboxStatus,
     /// "View once" image/video — receiver's WA wipes after first open.
     SendViewOnceImage { jid: String, data_b64: String, caption: Option<String> },
     SendViewOnceVideo { jid: String, data_b64: String, caption: Option<String> },
@@ -554,6 +556,15 @@ async fn dispatch(
         Request::CancelScheduled { id } => {
             let removed = scheduler.cancel(&id);
             Response::Ok(serde_json::json!({"removed": removed}))
+        }
+        Request::OutboxStatus => {
+            let items = session.outbox_pending().await;
+            let summary: Vec<_> = items.into_iter().map(|(jid, msg)| serde_json::json!({
+                "id": msg.key.id,
+                "jid": jid,
+                "timestamp": msg.message_timestamp,
+            })).collect();
+            Response::Ok(serde_json::json!({"pending": summary}))
         }
         Request::Shutdown => {
             let _ = shutdown_tx.send(()).await;
