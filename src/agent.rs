@@ -28,6 +28,70 @@
 use crate::client::Session;
 use crate::messages::{MessageContent, MessageEvent, MessageKey, WAMessage};
 
+// ── Conversation history (LLM-friendly) ───────────────────────────────────────
+
+/// Role of one turn in a chat, using the standard LLM two-role convention.
+///
+/// Maps from `from_me`: our outbound messages are `Assistant`, everything
+/// received is `User`. In group chats all non-self senders collapse into
+/// `User` — if you need per-sender attribution, inspect [`ConvEntry::sender`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role { User, Assistant }
+
+/// One turn of a WhatsApp chat in a shape that drops straight into an LLM
+/// prompt (`[{ "role": "user", "content": "…" }, …]`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConvEntry {
+    pub role: Role,
+    /// Plain text for text variants; bracketed placeholders like
+    /// `"[image: caption]"` or `"[audio]"` for media. `None` for
+    /// reactions / polls / unknown content.
+    pub content: String,
+    pub timestamp: u64,
+    /// Stanza id — useful for mapping back to [`MessageKey`] for reactions
+    /// / replies without re-querying the store.
+    pub id: String,
+    /// Raw WhatsApp JID of the sender (bare `:device` stripped would be on
+    /// caller). Helps disambiguate group participants.
+    pub sender: String,
+}
+
+impl Session {
+    /// Return the last `n` messages in a chat formatted for LLM prompting.
+    ///
+    /// Media messages are rendered as `[image]`, `[video]`, `[audio]`,
+    /// `[document]`, `[sticker]` with captions inline when present. Reactions,
+    /// polls and unknown variants are skipped — they'd just pollute the prompt.
+    ///
+    /// Ordered oldest → newest so you can feed it directly into the LLM's
+    /// messages array. De-dups already handled by the underlying store.
+    pub fn conversation_history(&self, jid: &str, n: usize) -> Vec<ConvEntry> {
+        self.message_history(jid, n)
+            .into_iter()
+            .filter_map(|m| {
+                let content = if let Some(t) = &m.text {
+                    if t.starts_with('<') && t.ends_with('>') && t.contains("failed") {
+                        return None; // skip decrypt placeholders
+                    }
+                    t.clone()
+                } else if let Some(mt) = &m.media_type {
+                    format!("[{mt}]")
+                } else {
+                    return None;
+                };
+                Some(ConvEntry {
+                    role: if m.from_me { Role::Assistant } else { Role::User },
+                    content,
+                    timestamp: m.timestamp,
+                    id: m.id,
+                    sender: m.participant.unwrap_or(m.remote_jid),
+                })
+            })
+            .collect()
+    }
+}
+
 /// Context passed to the handler on each incoming message.
 #[derive(Debug, Clone)]
 pub struct AgentCtx {
@@ -78,6 +142,87 @@ impl Response {
     pub fn react(emoji: impl std::fmt::Display) -> Self { Self::React(emoji.to_string()) }
 }
 
+// ── Access control ────────────────────────────────────────────────────────────
+
+/// Gate an agent on a set of allowed JIDs so it only responds to known
+/// contacts. Empty allow-list = accept everyone (the default).
+///
+/// Reads `WA_AGENT_ALLOW` if set: comma-separated JIDs (with or without
+/// the device suffix — matched against the bare user JID).
+#[derive(Debug, Clone, Default)]
+pub struct Acl {
+    allow: std::collections::HashSet<String>,
+}
+
+impl Acl {
+    /// Empty — everyone allowed.
+    pub fn open() -> Self { Self::default() }
+
+    /// Seed from a comma-separated env var. Empty or missing = open.
+    pub fn from_env(var: &str) -> Self {
+        let mut allow = std::collections::HashSet::new();
+        if let Ok(s) = std::env::var(var) {
+            for j in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                allow.insert(bare_jid(j));
+            }
+        }
+        Self { allow }
+    }
+
+    /// Add a single JID to the allow-list (bare form — `:device` stripped).
+    pub fn allow(mut self, jid: impl AsRef<str>) -> Self {
+        self.allow.insert(bare_jid(jid.as_ref()));
+        self
+    }
+
+    /// `true` if `sender` is allowed to invoke the agent. Open ACL permits
+    /// everyone; otherwise we match on the bare form.
+    pub fn permits(&self, sender: &str) -> bool {
+        self.allow.is_empty() || self.allow.contains(&bare_jid(sender))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_strips_device() {
+        assert_eq!(bare_jid("5731:20@s.whatsapp.net"), "5731@s.whatsapp.net");
+        assert_eq!(bare_jid("5731@s.whatsapp.net"),    "5731@s.whatsapp.net");
+        assert_eq!(bare_jid("group@g.us"),             "group@g.us");
+        assert_eq!(bare_jid(""),                       "");
+    }
+
+    #[test]
+    fn acl_open_permits_everyone() {
+        let acl = Acl::open();
+        assert!(acl.permits("anyone@s.whatsapp.net"));
+    }
+
+    #[test]
+    fn acl_whitelist_enforces() {
+        let acl = Acl::open().allow("57300@s.whatsapp.net");
+        assert!(acl.permits("57300@s.whatsapp.net"));
+        assert!(acl.permits("57300:20@s.whatsapp.net")); // device suffix stripped
+        assert!(!acl.permits("57999@s.whatsapp.net"));
+    }
+}
+
+/// Strip a `:device` suffix (`1234:20@s.whatsapp.net` → `1234@s.whatsapp.net`).
+fn bare_jid(jid: &str) -> String {
+    let at = match jid.find('@') {
+        Some(i) => i,
+        None => return jid.to_string(),
+    };
+    let user = &jid[..at];
+    let host = &jid[at..];
+    match user.find(':') {
+        Some(colon) => format!("{}{}", &user[..colon], host),
+        None => jid.to_string(),
+    }
+}
+
 /// Pull a human-readable text out of the message variants that carry one.
 /// Returns `None` for media/reaction/poll/etc. Filters decrypt-failure
 /// placeholders (`<decrypt failed>`, `<skmsg decrypt failed>`, …) so
@@ -111,6 +256,22 @@ impl Session {
         F: Fn(AgentCtx) -> Fut,
         Fut: std::future::Future<Output = Response>,
     {
+        self.run_agent_with(Acl::from_env("WA_AGENT_ALLOW"), handler).await
+    }
+
+    /// Like [`Self::run_agent`] but with an explicit [`Acl`] — only the
+    /// JIDs it permits reach the handler. Everything else is silently
+    /// dropped (the sender never sees typing / reply, so the bot stays
+    /// invisible to unauthorised contacts).
+    pub async fn run_agent_with<F, Fut>(
+        &self,
+        acl: Acl,
+        handler: F,
+    ) -> crate::error::Result<()>
+    where
+        F: Fn(AgentCtx) -> Fut,
+        Fut: std::future::Future<Output = Response>,
+    {
         let mut rx = self.events();
         loop {
             let ev = match rx.recv().await {
@@ -127,6 +288,14 @@ impl Session {
                 MessageEvent::NewMessage { msg } if !msg.key.from_me => msg,
                 _ => continue,
             };
+
+            let sender = msg.key.participant.as_deref()
+                .unwrap_or(&msg.key.remote_jid);
+            if !acl.permits(sender) {
+                tracing::debug!("agent: skipping {sender} (not in ACL)");
+                continue;
+            }
+
             let text = extract_text(msg.message.as_ref());
             let ctx = AgentCtx { msg: msg.clone(), text };
 
