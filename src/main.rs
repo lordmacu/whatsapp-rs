@@ -497,9 +497,52 @@ async fn cmd_send_file(jid: &str, path: &str, caption: Option<&str>) -> Result<(
         .unwrap_or("")
         .to_lowercase();
 
+    // Fast path: route through the running daemon's IPC so the CLI doesn't
+    // have to spin up its own WA socket (which collides with the daemon and
+    // blocks on offline-drain IQ races). Falls through to a one-shot
+    // standalone session if no daemon is listening.
+    use base64::Engine as _;
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let caption_owned = caption.map(|c| c.to_string());
+    let req = match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "webp" | "gif" => daemon::Request::SendImage {
+            jid: jid.to_string(), data_b64: data_b64.clone(), caption: caption_owned.clone(),
+        },
+        "mp4" | "mov" | "avi" | "mkv" => daemon::Request::SendVideo {
+            jid: jid.to_string(), data_b64: data_b64.clone(), caption: caption_owned.clone(),
+        },
+        "mp3" | "ogg" | "opus" | "m4a" | "aac" | "wav" => {
+            let mime = match ext.as_str() {
+                "mp3"  => "audio/mpeg",
+                "ogg" | "opus" => "audio/ogg; codecs=opus",
+                "m4a"  => "audio/mp4",
+                "aac"  => "audio/aac",
+                _      => "audio/wav",
+            };
+            daemon::Request::SendAudio {
+                jid: jid.to_string(), data_b64: data_b64.clone(), mimetype: mime.to_string(),
+            }
+        }
+        _ => daemon::Request::SendDocument {
+            jid: jid.to_string(), data_b64: data_b64.clone(),
+            mimetype: mime_for_ext(&ext).to_string(),
+            file_name: file_name.clone(),
+        },
+    };
+    if let Some(v) = daemon::try_daemon_request(req).await? {
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        println!("sent: {id}");
+        return Ok(());
+    }
+
+    // Fallback: no daemon — spin up a one-shot session.
     let client = client::Client::new()?;
     let session = client.connect().await?;
-
     let id = match ext.as_str() {
         "jpg" | "jpeg" | "png" | "webp" | "gif" => {
             session.send_image(jid, &data, caption).await?
@@ -518,12 +561,8 @@ async fn cmd_send_file(jid: &str, path: &str, caption: Option<&str>) -> Result<(
             session.send_audio(jid, &data, mime).await?
         }
         _ => {
-            let file_name = Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file");
             let mime = mime_for_ext(&ext);
-            session.send_document(jid, &data, mime, file_name).await?
+            session.send_document(jid, &data, mime, &file_name).await?
         }
     };
     println!("sent: {id}");
