@@ -1325,6 +1325,20 @@ impl Session {
     pub fn chat(&self, jid: impl Into<String>) -> Chat<'_> {
         Chat { session: self, jid: jid.into() }
     }
+
+    /// Return the LID↔PN counterpart of `jid` if one has been learned from
+    /// an incoming stanza (`sender_pn` / `participant_pn`). Both identities
+    /// route to the same user — handy when you track a peer by PN but they
+    /// start addressing you via LID or vice versa.
+    pub async fn equivalent_jid(&self, jid: &str) -> Option<String> {
+        let at = jid.find('@')?;
+        let (user, server) = (&jid[..at], &jid[at..]);
+        let bare_user = user.split(':').next().unwrap_or(user);
+        let bare = format!("{bare_user}{server}");
+        let mgr = self.mgr.read().await;
+        let map = mgr.lid_pn_map.lock().ok()?;
+        map.get(&bare).cloned()
+    }
 }
 
 /// Ergonomic wrapper over [`Session`] scoped to one chat JID. Mirrors the
@@ -1467,11 +1481,17 @@ impl<'a> Chat<'a> {
 
     /// Block until the next incoming (non-self) message in this chat, or
     /// until `timeout`. For Q&A-style bots.
+    ///
+    /// Matches incoming messages whose `remote_jid` equals `self.jid` OR
+    /// whose LID↔PN counterpart (learned from earlier stanzas) equals it —
+    /// so a Chat tracked by PN still catches replies addressed via LID and
+    /// vice versa.
     pub async fn wait_for_reply(
         &self,
         timeout: std::time::Duration,
     ) -> Option<crate::messages::WAMessage> {
         let mut rx = self.session.events();
+        let target_bare = bare_user_jid(&self.jid);
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1479,15 +1499,43 @@ impl<'a> Chat<'a> {
             match tokio::time::timeout(rem, rx.recv()).await {
                 Err(_) => return None,
                 Ok(Err(_)) => return None,
-                Ok(Ok(MessageEvent::NewMessage { msg }))
-                    if !msg.key.from_me && msg.key.remote_jid == self.jid =>
-                {
-                    return Some(msg);
+                Ok(Ok(MessageEvent::NewMessage { msg })) if !msg.key.from_me => {
+                    // Skip decrypt-failed placeholders — not a real reply.
+                    if matches!(
+                        &msg.message,
+                        Some(crate::messages::MessageContent::Text { text, .. })
+                            if text == "<decrypt failed>" || text == "<skmsg decrypt failed>"
+                    ) {
+                        continue;
+                    }
+                    let remote_bare = bare_user_jid(&msg.key.remote_jid);
+                    if remote_bare == target_bare {
+                        return Some(msg);
+                    }
+                    // Re-query on each event so newly-learned LID↔PN mappings
+                    // (populated by recv.rs when the stanza carries sender_pn)
+                    // take effect without restarting the waiter.
+                    if let Some(alt) = self.session.equivalent_jid(&self.jid).await {
+                        if bare_user_jid(&alt) == remote_bare {
+                            return Some(msg);
+                        }
+                    }
                 }
                 _ => {}
             }
         }
     }
+}
+
+/// Strip any `:device` suffix from a JID to get the bare user form.
+fn bare_user_jid(jid: &str) -> String {
+    let at = match jid.find('@') {
+        Some(i) => i,
+        None => return jid.to_string(),
+    };
+    let (before, server) = (&jid[..at], &jid[at..]);
+    let user = before.split(':').next().unwrap_or(before);
+    format!("{user}{server}")
 }
 
 fn status_rank(s: MessageStatus) -> u8 {

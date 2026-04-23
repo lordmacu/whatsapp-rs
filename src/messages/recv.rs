@@ -296,6 +296,21 @@ impl MessageManager {
         let push_name = node.attr("notify").map(|s| s.to_string());
         let t: u64 = node.attr("t").and_then(|s| s.parse().ok()).unwrap_or_else(unix_now);
 
+        // Learn LID↔PN equivalence from stanza attrs so Session::equivalent_jids
+        // can resolve peers addressed under either identity.
+        let pn_counterpart = node.attr("sender_pn").or_else(|| node.attr("participant_pn"));
+        if let Some(pn) = pn_counterpart {
+            let lid_user = bare_user_jid(
+                participant.as_deref().unwrap_or(from.as_str()),
+            );
+            let pn_user = bare_user_jid(pn);
+            if lid_user.ends_with("@lid") && pn_user.ends_with("@s.whatsapp.net") {
+                let mut map = self.lid_pn_map.lock().unwrap();
+                map.insert(lid_user.clone(), pn_user.clone());
+                map.insert(pn_user, lid_user);
+            }
+        }
+
         // Ack is deferred until after decrypt: success → plain ack, failure →
         // retry-receipt then ack with error code. Sending a success-ack first
         // tells the server the message was delivered and retry is ignored.
