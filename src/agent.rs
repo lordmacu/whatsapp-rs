@@ -92,6 +92,49 @@ impl Session {
     }
 }
 
+// ── Audio transcription hook ──────────────────────────────────────────────────
+
+/// Extension point for voice-note → text. When configured, the agent loop
+/// downloads each incoming audio / voice-note, calls `transcribe`, and
+/// injects the returned string into `ctx.text` so the handler sees it as
+/// if it were a regular text message.
+///
+/// Intended for plugging in Whisper (local or API), Google STT, Deepgram,
+/// etc. — the library stays codec-agnostic.
+///
+/// Impl'd for any `Fn(Vec<u8>, String) -> Future<Output = Option<String>>`
+/// so callers usually pass a closure:
+///
+/// ```ignore
+/// session.run_agent_with_transcribe(acl,
+///     |audio, mimetype| async move {
+///         whisper_api::transcribe(audio, &mimetype).await.ok()
+///     },
+///     |ctx| async move { Response::reply(format!("heard: {}", ctx.text.unwrap_or_default())) },
+/// ).await?;
+/// ```
+pub trait Transcriber: Send + Sync + 'static {
+    fn transcribe(
+        &self,
+        audio: Vec<u8>,
+        mimetype: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+}
+
+impl<F, Fut> Transcriber for F
+where
+    F: Fn(Vec<u8>, String) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<String>> + Send + 'static,
+{
+    fn transcribe(
+        &self,
+        audio: Vec<u8>,
+        mimetype: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+        Box::pin((self)(audio, mimetype))
+    }
+}
+
 /// Context passed to the handler on each incoming message.
 #[derive(Debug, Clone)]
 pub struct AgentCtx {
@@ -272,6 +315,38 @@ impl Session {
         F: Fn(AgentCtx) -> Fut,
         Fut: std::future::Future<Output = Response>,
     {
+        self.run_agent_full(acl, None, handler).await
+    }
+
+    /// Run an agent loop that transcribes incoming voice notes / audio
+    /// into text before calling the handler. See [`Transcriber`].
+    ///
+    /// Identical to [`run_agent_with`] otherwise — ACL, typing heartbeat,
+    /// dedup, rate limiter all still apply.
+    pub async fn run_agent_with_transcribe<T, F, Fut>(
+        &self,
+        acl: Acl,
+        transcribe: T,
+        handler: F,
+    ) -> crate::error::Result<()>
+    where
+        T: Transcriber,
+        F: Fn(AgentCtx) -> Fut,
+        Fut: std::future::Future<Output = Response>,
+    {
+        self.run_agent_full(acl, Some(Box::new(transcribe) as Box<dyn Transcriber>), handler).await
+    }
+
+    async fn run_agent_full<F, Fut>(
+        &self,
+        acl: Acl,
+        transcribe: Option<Box<dyn Transcriber>>,
+        handler: F,
+    ) -> crate::error::Result<()>
+    where
+        F: Fn(AgentCtx) -> Fut,
+        Fut: std::future::Future<Output = Response>,
+    {
         let mut rx = self.events();
         loop {
             let ev = match rx.recv().await {
@@ -296,7 +371,33 @@ impl Session {
                 continue;
             }
 
-            let text = extract_text(msg.message.as_ref());
+            let mut text = extract_text(msg.message.as_ref());
+
+            // Voice-note transcription: only runs when configured AND the
+            // message is audio with no accompanying text. Failure is silent
+            // (handler just sees text=None and can route to Noop).
+            if text.is_none() {
+                if let Some(t) = transcribe.as_ref() {
+                    if let Some(MessageContent::Audio { info, .. }) = msg.message.as_ref() {
+                        match self.download_media(info, crate::media::MediaType::Audio).await {
+                            Ok(bytes) => {
+                                let mime = info.mimetype.clone();
+                                match t.transcribe(bytes, mime).await {
+                                    Some(s) if !s.trim().is_empty() => {
+                                        tracing::info!("transcribed {} bytes → {:?}…",
+                                            info.file_length,
+                                            s.chars().take(40).collect::<String>());
+                                        text = Some(s);
+                                    }
+                                    _ => tracing::debug!("transcriber returned empty"),
+                                }
+                            }
+                            Err(e) => tracing::warn!("download audio for transcribe: {e}"),
+                        }
+                    }
+                }
+            }
+
             let ctx = AgentCtx { msg: msg.clone(), text };
 
             let _typing = self.typing_heartbeat(&msg.key.remote_jid);
