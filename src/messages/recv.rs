@@ -712,9 +712,16 @@ impl MessageManager {
                                 status: MessageStatus::Delivered,
                                 push_name: resent.push_name.clone(),
                             };
-                            self.msg_store.push(&resent_msg);
-                            log_incoming_message(&resent_msg);
-                            let _ = self.event_tx.send(MessageEvent::NewMessage { msg: resent_msg });
+                            // `push` returns false on duplicate id — swallow
+                            // the event so agents subscribed to NewMessage
+                            // don't process the same delivery twice when the
+                            // server re-fans a PDO / offline-queue retry.
+                            if self.msg_store.push(&resent_msg) {
+                                log_incoming_message(&resent_msg);
+                                let _ = self.event_tx.send(MessageEvent::NewMessage { msg: resent_msg });
+                            } else {
+                                debug!("dedup: skipping repeat NewMessage for {}", resent_msg.key.id);
+                            }
                         }
                     }
                     ProtocolMessagePayload::AppStateSyncKeyShare(shares) => {
@@ -751,9 +758,12 @@ impl MessageManager {
                     status: MessageStatus::Delivered,
                     push_name,
                 };
-                self.msg_store.push(&msg);
-                log_incoming_message(&msg);
-                let _ = self.event_tx.send(MessageEvent::NewMessage { msg });
+                if self.msg_store.push(&msg) {
+                    log_incoming_message(&msg);
+                    let _ = self.event_tx.send(MessageEvent::NewMessage { msg });
+                } else {
+                    debug!("dedup: skipping repeat poll NewMessage for {}", msg.key.id);
+                }
             }
             Some(DecodedPayload::PollVoteRaw(info)) => {
                 if let Some(enc_key) = self.poll_store.enc_key(&info.poll_msg_id) {
@@ -782,9 +792,12 @@ impl MessageManager {
                     status: MessageStatus::Delivered,
                     push_name,
                 };
-                self.msg_store.push(&msg);
-                log_incoming_message(&msg);
-                let _ = self.event_tx.send(MessageEvent::NewMessage { msg });
+                if self.msg_store.push(&msg) {
+                    log_incoming_message(&msg);
+                    let _ = self.event_tx.send(MessageEvent::NewMessage { msg });
+                } else {
+                    debug!("dedup: skipping repeat NewMessage for {}", msg.key.id);
+                }
             }
         }
 
