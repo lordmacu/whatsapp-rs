@@ -577,20 +577,55 @@ fn split_user_server_device(jid: &str) -> (String, String, Option<u32>) {
 impl SignalRepository {
     fn decrypt_normal_message(&self, jid: &str, data: &[u8]) -> Result<Vec<u8>> {
         let (msg, _) = decode_signal_wire(data)?;
-        // Resolve LID↔PN alias: if peer sends us under LID but our actual
-        // session for this user lives under PN (because we've been sending
-        // to the PN addressing), redirect the lookup so a single ratchet
-        // state serves both directions.
-        let resolved_jid = self.resolve_session_key(jid);
-        if resolved_jid != jid {
-            tracing::debug!("decrypt msg: resolved {jid} → {resolved_jid} via alias");
+        // Resolve LID↔PN alias. A LID-addressed stanza doesn't tell us which
+        // PN device actually encrypted, so first try the jid we'd normally
+        // pick — if MAC fails, walk every session under the alias user and
+        // try each. Matches whatsmeow's per-device fallback for migrated
+        // sessions.
+        let primary = self.resolve_session_key(jid);
+        let mut candidates: Vec<String> = vec![primary.clone()];
+        // Add sibling sessions under the aliased user (other device slots).
+        let (user, server, _) = split_user_server_device(&primary);
+        let bare = format!("{user}{server}");
+        if let Ok(sessions) = self.sessions.lock() {
+            for k in sessions.keys() {
+                if k == &primary { continue; }
+                let (ku, ks, _) = split_user_server_device(k);
+                if format!("{ku}{ks}") == bare {
+                    candidates.push(k.clone());
+                }
+            }
         }
+        let mut last_err: Option<anyhow::Error> = None;
+        for candidate in &candidates {
+            match self.decrypt_normal_for_jid(candidate, &msg, data) {
+                Ok(pt) => {
+                    if candidate != &primary {
+                        tracing::info!(
+                            "decrypt msg: primary {primary} MAC-failed, sibling {candidate} decrypted OK"
+                        );
+                    } else if primary != jid {
+                        tracing::debug!("decrypt msg: resolved {jid} → {primary} via alias");
+                    }
+                    return Ok(pt);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no sessions for {jid}")))
+    }
+
+    fn decrypt_normal_for_jid(
+        &self,
+        jid: &str,
+        msg: &RatchetMessage,
+        _data: &[u8],
+    ) -> Result<Vec<u8>> {
         let mut sessions = self.sessions.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let session_keys: Vec<String> = sessions.keys().cloned().collect();
         let entry = sessions
-            .get_mut(&resolved_jid)
-            .ok_or_else(|| anyhow::anyhow!("no session for {jid} (resolved={resolved_jid}, have: {session_keys:?})"))?;
-        let jid = resolved_jid.as_str();
+            .get_mut(jid)
+            .ok_or_else(|| anyhow::anyhow!("no session for {jid} (have: {session_keys:?})"))?;
         tracing::debug!(
             "decrypt msg: jid={} ratchet_key_incoming={} counter={} prev_counter={}",
             jid, hex::encode(msg.ratchet_key), msg.counter, msg.prev_counter,
