@@ -1006,6 +1006,30 @@ impl Drop for Session {
     }
 }
 
+/// RAII handle for a typing heartbeat. See [`Session::typing_heartbeat`].
+///
+/// Dropping the handle aborts the refresher task and fires one last
+/// `typing=off` in a background task (Drop can't be async). The off send
+/// is best-effort — it may race with the task-executor being torn down
+/// but normally lands well under 100 ms.
+pub struct TypingHandle {
+    abort: tokio::task::AbortHandle,
+    mgr: Arc<RwLock<Arc<MessageManager>>>,
+    jid: String,
+}
+
+impl Drop for TypingHandle {
+    fn drop(&mut self) {
+        self.abort.abort();
+        let mgr = self.mgr.clone();
+        let jid = std::mem::take(&mut self.jid);
+        tokio::spawn(async move {
+            let m = mgr.read().await;
+            let _ = m.send_typing(&jid, false).await;
+        });
+    }
+}
+
 #[allow(dead_code)]
 impl Session {
     // ── Events ────────────────────────────────────────────────────────────────
@@ -1266,6 +1290,36 @@ impl Session {
 
     pub async fn send_typing(&self, jid: &str, composing: bool) -> Result<()> {
         self.mgr.read().await.send_typing(jid, composing).await.map_err(Into::into)
+    }
+
+    /// Start a "typing…" heartbeat on `jid`. WA expires the indicator after
+    /// ~15 s of silence, so a long-running agent must refresh it. Returns a
+    /// [`TypingHandle`] that loops `typing=on` every 10 s until dropped; at
+    /// drop the handle sends `typing=off` once and aborts the refresher.
+    ///
+    /// Use when an agent spends >15 s preparing a reply (LLM round-trip,
+    /// media rendering, external API call).
+    ///
+    /// ```ignore
+    /// let _typing = session.typing_heartbeat(&jid);
+    /// let reply = my_agent.think(msg).await;  // slow
+    /// session.send_text(&jid, &reply).await?;  // drop here → typing=off
+    /// ```
+    pub fn typing_heartbeat(&self, jid: &str) -> TypingHandle {
+        let mgr = self.mgr.clone();
+        let jid_owned = jid.to_string();
+        let refresh_mgr = mgr.clone();
+        let refresh_jid = jid_owned.clone();
+        let task = tokio::spawn(async move {
+            // Send the initial on immediately (interval's first tick fires instantly).
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let m = refresh_mgr.read().await;
+                let _ = m.send_typing(&refresh_jid, true).await;
+            }
+        });
+        TypingHandle { abort: task.abort_handle(), mgr, jid: jid_owned }
     }
 
     pub async fn send_presence(&self, available: bool) -> Result<()> {
@@ -1649,6 +1703,12 @@ impl<'a> Chat<'a> {
 
     pub async fn typing(&self, composing: bool) -> Result<()> {
         self.session.send_typing(&self.jid, composing).await.map_err(Into::into)
+    }
+
+    /// RAII "typing…" indicator that refreshes every 10 s so WA doesn't
+    /// expire it. See [`Session::typing_heartbeat`].
+    pub fn typing_heartbeat(&self) -> TypingHandle {
+        self.session.typing_heartbeat(&self.jid)
     }
 
     pub async fn mark_read(&self, keys: &[MessageKey]) -> Result<()> {
