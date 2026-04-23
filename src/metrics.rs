@@ -120,6 +120,7 @@ pub async fn serve(addr: SocketAddr, session: Arc<Session>) -> std::io::Result<(
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics_json))
+        .route("/metrics/prometheus", get(metrics_prom))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -143,6 +144,51 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<serde_json::Valu
             "jid": s.session.our_jid,
         })))
     }
+}
+
+async fn metrics_prom(State(s): State<AppState>) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    let snap = snapshot();
+    let connected = if s.session.is_connected() { 1 } else { 0 };
+    let body = format!(
+        "\
+# HELP whatsapp_connected 1 if the socket is authenticated.
+# TYPE whatsapp_connected gauge
+whatsapp_connected {connected}
+# HELP whatsapp_uptime_seconds Seconds since process start.
+# TYPE whatsapp_uptime_seconds counter
+whatsapp_uptime_seconds {uptime}
+# HELP whatsapp_messages_received_total Successfully-decoded inbound messages.
+# TYPE whatsapp_messages_received_total counter
+whatsapp_messages_received_total {rx}
+# HELP whatsapp_messages_sent_total Successfully-dispatched outbound messages.
+# TYPE whatsapp_messages_sent_total counter
+whatsapp_messages_sent_total {tx}
+# HELP whatsapp_decrypt_failures_total Signal decrypt / MAC failures.
+# TYPE whatsapp_decrypt_failures_total counter
+whatsapp_decrypt_failures_total {decrypt_fail}
+# HELP whatsapp_reconnects_total Reconnect-loop attempts.
+# TYPE whatsapp_reconnects_total counter
+whatsapp_reconnects_total {reconnects}
+# HELP whatsapp_last_rx_unix_seconds Unix timestamp of last inbound message.
+# TYPE whatsapp_last_rx_unix_seconds gauge
+whatsapp_last_rx_unix_seconds {last_rx}
+# HELP whatsapp_last_tx_unix_seconds Unix timestamp of last outbound message.
+# TYPE whatsapp_last_tx_unix_seconds gauge
+whatsapp_last_tx_unix_seconds {last_tx}
+",
+        uptime = snap.uptime_secs,
+        rx = snap.messages_received,
+        tx = snap.messages_sent,
+        decrypt_fail = snap.decrypt_failures,
+        reconnects = snap.reconnects,
+        last_rx = snap.last_rx_unix,
+        last_tx = snap.last_tx_unix,
+    );
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }
 
 async fn metrics_json(State(s): State<AppState>) -> Json<serde_json::Value> {

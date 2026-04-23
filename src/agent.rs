@@ -401,13 +401,40 @@ impl Session {
             let ctx = AgentCtx { msg: msg.clone(), text };
 
             let _typing = self.typing_heartbeat(&msg.key.remote_jid);
+            let _slow = self.slow_notice(&msg.key.remote_jid);
             let response = handler(ctx).await;
+            drop(_slow);
             drop(_typing);
 
             if let Err(e) = self.apply_response(&msg.key, response).await {
                 tracing::warn!("agent response send failed: {e}");
             }
         }
+    }
+
+    /// Spawn a task that, if the handler is still running after
+    /// `WA_AGENT_SLOW_SECS` seconds, sends `WA_AGENT_SLOW_MSG` once to
+    /// keep the user informed. Aborted on drop — normal-speed replies
+    /// never trigger it.
+    ///
+    /// Disabled when `WA_AGENT_SLOW_SECS` is unset. Default message is
+    /// "⏳ procesando…". Useful for LLM-backed agents where a single
+    /// turn can take 30–60 s.
+    fn slow_notice(&self, jid: &str) -> Option<tokio::task::AbortHandle> {
+        let secs: u64 = std::env::var("WA_AGENT_SLOW_SECS").ok()?.parse().ok()?;
+        if secs == 0 { return None; }
+        let msg = std::env::var("WA_AGENT_SLOW_MSG")
+            .unwrap_or_else(|_| "⏳ procesando…".to_string());
+        let jid = jid.to_string();
+        let mgr = self.mgr_handle();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            let m = mgr.read().await;
+            if let Err(e) = m.send_text(&jid, &msg).await {
+                tracing::debug!("slow notice send failed: {e}");
+            }
+        });
+        Some(task.abort_handle())
     }
 
     /// Dispatch one [`Response`] against the chat identified by `trigger`.

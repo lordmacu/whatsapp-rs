@@ -1306,6 +1306,13 @@ impl Session {
     /// let reply = my_agent.think(msg).await;  // slow
     /// session.send_text(&jid, &reply).await?;  // drop here → typing=off
     /// ```
+    /// Internal accessor: hands out a clone of the current-manager Arc so
+    /// crate-local helpers (agent runtime, metrics, etc.) can spawn tasks
+    /// that use the live manager across reconnects.
+    pub(crate) fn mgr_handle(&self) -> Arc<RwLock<Arc<MessageManager>>> {
+        self.mgr.clone()
+    }
+
     pub fn typing_heartbeat(&self, jid: &str) -> TypingHandle {
         let mgr = self.mgr.clone();
         let jid_owned = jid.to_string();
