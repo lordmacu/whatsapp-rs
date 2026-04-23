@@ -59,6 +59,9 @@ Commands:
   status                                Show our JID and exit
   metrics                               Pretty-print /metrics from WA_METRICS_ADDR (default 127.0.0.1:9100)
   schedule <when> <jid> <text>          Queue a text for later delivery (when: 30s/15m/2h/1d/<unix>/ISO-8601)
+  schedule-daily <HH:MM> <jid> <text>   Send <text> every day at HH:MM UTC
+  schedule-weekly <day> <HH:MM> <jid> <text>   Send every week on <day> (mon/lun/…) at HH:MM UTC
+  schedule-every <interval> <jid> <text>   Send every <interval> (30s/15m/2h/1d) forever
   scheduled                             List pending scheduled messages
   cancel-schedule <id>                  Cancel a pending scheduled message
   group <jid>                           Fetch and print group info and exit
@@ -272,6 +275,24 @@ async fn main() -> Result<()> {
                 bail!("Usage: whatsapp-rs schedule <when> <jid> <text>\n  <when>: 30s | 15m | 2h | 1d | <unix-seconds> | 2026-04-24T09:00:00");
             }
             cmd_schedule(&args[1], &args[2], &args[3]).await
+        }
+        "schedule-daily" => {
+            if args.len() < 4 {
+                bail!("Usage: whatsapp-rs schedule-daily <HH:MM> <jid> <text>");
+            }
+            cmd_schedule_daily(&args[1], &args[2], &args[3]).await
+        }
+        "schedule-weekly" => {
+            if args.len() < 5 {
+                bail!("Usage: whatsapp-rs schedule-weekly <weekday> <HH:MM> <jid> <text>\n  weekday: mon/tue/… or lun/mar/…");
+            }
+            cmd_schedule_weekly(&args[1], &args[2], &args[3], &args[4]).await
+        }
+        "schedule-every" => {
+            if args.len() < 4 {
+                bail!("Usage: whatsapp-rs schedule-every <interval> <jid> <text>\n  interval: 30s | 15m | 2h | 1d");
+            }
+            cmd_schedule_every(&args[1], &args[2], &args[3]).await
         }
         "scheduled" => cmd_scheduled_list().await,
         "cancel-schedule" => {
@@ -893,6 +914,7 @@ async fn cmd_schedule(when: &str, jid: &str, text: &str) -> Result<()> {
         jid: jid.to_string(),
         text: text.to_string(),
         send_at_unix: send_at,
+        recur: None,
     };
     match daemon::try_daemon_request(req).await? {
         Some(v) => {
@@ -902,6 +924,49 @@ async fn cmd_schedule(when: &str, jid: &str, text: &str) -> Result<()> {
             Ok(())
         }
         None => bail!("no daemon running — start with `systemctl --user start whatsapp-rs`"),
+    }
+}
+
+async fn cmd_schedule_daily(hhmm: &str, jid: &str, text: &str) -> Result<()> {
+    let (hour, minute) = scheduler::parse_hhmm(hhmm)?;
+    let recur = scheduler::Recurrence::Daily { hour, minute };
+    let first = recur.next_after(scheduler::now_unix());
+    schedule_recurring(jid, text, first, Some(recur)).await
+}
+
+async fn cmd_schedule_weekly(weekday: &str, hhmm: &str, jid: &str, text: &str) -> Result<()> {
+    let dow = scheduler::parse_weekday(weekday)?;
+    let (hour, minute) = scheduler::parse_hhmm(hhmm)?;
+    let recur = scheduler::Recurrence::Weekly { weekday: dow, hour, minute };
+    let first = recur.next_after(scheduler::now_unix());
+    schedule_recurring(jid, text, first, Some(recur)).await
+}
+
+async fn cmd_schedule_every(interval: &str, jid: &str, text: &str) -> Result<()> {
+    let first = scheduler::parse_when(interval)?;
+    let interval_secs = first.saturating_sub(scheduler::now_unix()).max(1);
+    let recur = scheduler::Recurrence::Every { interval_secs };
+    schedule_recurring(jid, text, first, Some(recur)).await
+}
+
+async fn schedule_recurring(
+    jid: &str, text: &str, first: u64,
+    recur: Option<scheduler::Recurrence>,
+) -> Result<()> {
+    let req = daemon::Request::Schedule {
+        jid: jid.to_string(),
+        text: text.to_string(),
+        send_at_unix: first,
+        recur,
+    };
+    match daemon::try_daemon_request(req).await? {
+        Some(v) => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+            let delta = first.saturating_sub(scheduler::now_unix());
+            println!("scheduled {id} — first fires in {delta}s, then repeats");
+            Ok(())
+        }
+        None => bail!("no daemon running"),
     }
 }
 
@@ -918,7 +983,12 @@ async fn cmd_scheduled_list() -> Result<()> {
         let at = it.get("send_at_unix").and_then(|x| x.as_u64()).unwrap_or(0);
         let delta = at.saturating_sub(now);
         let when = if delta == 0 { "due".to_string() } else { format!("in {delta}s") };
-        println!("{id}  {when:>10}  {jid}  {text:.60}");
+        let recur = it.get("recur")
+            .and_then(|r| r.get("kind"))
+            .and_then(|k| k.as_str())
+            .map(|k| format!(" [{k}]"))
+            .unwrap_or_default();
+        println!("{id}  {when:>10}{recur}  {jid}  {text:.60}");
     }
     Ok(())
 }

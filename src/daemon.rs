@@ -54,7 +54,15 @@ pub enum Request {
     SendTextPreview { jid: String, text: String },
     /// Queue a text message for delivery at a future unix timestamp.
     /// Persists across daemon restarts; see `src/scheduler.rs`.
-    Schedule { jid: String, text: String, send_at_unix: u64 },
+    /// `recur` is optional — omit for one-shot, otherwise the scheduler
+    /// re-queues with the computed next fire time after each dispatch.
+    Schedule {
+        jid: String,
+        text: String,
+        send_at_unix: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recur: Option<crate::scheduler::Recurrence>,
+    },
     /// List all pending scheduled items.
     ListScheduled,
     /// Cancel a pending scheduled item by its id. No-op if unknown.
@@ -535,8 +543,8 @@ async fn dispatch(
             // Handled earlier in handle_client; unreachable here.
             Response::Err { error: "subscribe handled out-of-band".into() }
         }
-        Request::Schedule { jid, text, send_at_unix } => {
-            let id = scheduler.schedule(jid, text, send_at_unix);
+        Request::Schedule { jid, text, send_at_unix, recur } => {
+            let id = scheduler.schedule_full(jid, text, send_at_unix, recur);
             Response::Ok(serde_json::json!({"id": id}))
         }
         Request::ListScheduled => {

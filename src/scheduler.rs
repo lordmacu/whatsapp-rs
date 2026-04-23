@@ -12,6 +12,32 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// How a [`ScheduledItem`] repeats after firing. `None` means one-shot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Recurrence {
+    /// Fire every day at `hour:minute` UTC.
+    Daily { hour: u8, minute: u8 },
+    /// Fire every week on `weekday` (0=Sunday, 1=Monday … 6=Saturday) at `hour:minute` UTC.
+    Weekly { weekday: u8, hour: u8, minute: u8 },
+    /// Fire every `interval_secs` starting from the previous fire time.
+    Every { interval_secs: u64 },
+}
+
+impl Recurrence {
+    /// Compute the next unix timestamp > `after` when this recurrence fires.
+    pub fn next_after(&self, after: u64) -> u64 {
+        match self {
+            Recurrence::Every { interval_secs } =>
+                after + interval_secs.max(&1),
+            Recurrence::Daily { hour, minute } =>
+                next_daily(after, *hour, *minute),
+            Recurrence::Weekly { weekday, hour, minute } =>
+                next_weekly(after, *weekday, *hour, *minute),
+        }
+    }
+}
+
 /// One pending scheduled send.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledItem {
@@ -19,6 +45,8 @@ pub struct ScheduledItem {
     pub jid: String,
     pub text: String,
     pub send_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recur: Option<Recurrence>,
 }
 
 pub struct Scheduler {
@@ -39,10 +67,25 @@ impl Scheduler {
         Ok(Arc::new(Self { path, items: Mutex::new(items) }))
     }
 
-    /// Add an item. Returns the assigned id.
+    /// Add a one-shot item. Returns the assigned id.
     pub fn schedule(&self, jid: impl Into<String>, text: impl Into<String>, send_at_unix: u64) -> String {
+        self.schedule_full(jid, text, send_at_unix, None)
+    }
+
+    /// Add an item with optional recurrence. After each fire the scheduler
+    /// reinserts the item with `send_at_unix = recur.next_after(fired_at)`
+    /// so the id is stable across repetitions.
+    pub fn schedule_full(
+        &self,
+        jid: impl Into<String>,
+        text: impl Into<String>,
+        send_at_unix: u64,
+        recur: Option<Recurrence>,
+    ) -> String {
         let id = new_id();
-        let item = ScheduledItem { id: id.clone(), jid: jid.into(), text: text.into(), send_at_unix };
+        let item = ScheduledItem {
+            id: id.clone(), jid: jid.into(), text: text.into(), send_at_unix, recur,
+        };
         {
             let mut items = self.items.lock().unwrap();
             items.push(item);
@@ -70,11 +113,23 @@ impl Scheduler {
     }
 
     /// Pop and return all items whose `send_at_unix` has already elapsed.
-    /// Persists the new (smaller) list before returning.
+    /// Recurring items are re-inserted at their next fire time before the
+    /// returned one-shot copy is dispatched by the caller. Persists the
+    /// new list before returning.
     pub fn take_due(&self, now: u64) -> Vec<ScheduledItem> {
         let mut items = self.items.lock().unwrap();
-        let (due, remaining): (Vec<_>, Vec<_>) =
+        let (due, mut remaining): (Vec<_>, Vec<_>) =
             items.drain(..).partition(|i| i.send_at_unix <= now);
+        // Requeue recurring items with their next fire time so the id stays
+        // stable and persistence reflects the "next due" moment even if the
+        // daemon crashes mid-dispatch.
+        for d in &due {
+            if let Some(r) = &d.recur {
+                let next = r.next_after(now);
+                remaining.push(ScheduledItem { send_at_unix: next, ..d.clone() });
+            }
+        }
+        remaining.sort_by_key(|i| i.send_at_unix);
         *items = remaining;
         drop(items);
         if !due.is_empty() { self.flush(); }
@@ -97,6 +152,31 @@ fn new_id() -> String {
     let mut b = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut b);
     hex::encode(b)
+}
+
+/// Parse `"HH:MM"` into `(hour, minute)` with range checks.
+pub fn parse_hhmm(s: &str) -> anyhow::Result<(u8, u8)> {
+    let (h, m) = s.split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected HH:MM, got {s:?}"))?;
+    let h: u8 = h.parse().map_err(|e| anyhow::anyhow!("bad hour: {e}"))?;
+    let m: u8 = m.parse().map_err(|e| anyhow::anyhow!("bad minute: {e}"))?;
+    if h > 23 || m > 59 { anyhow::bail!("time out of range: {s}"); }
+    Ok((h, m))
+}
+
+/// Parse a weekday name (case-insensitive, English or Spanish). Accepts full
+/// or 3-letter abbreviations: mon / monday / lun / lunes → 1.
+pub fn parse_weekday(s: &str) -> anyhow::Result<u8> {
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "sun" | "sunday"    | "dom" | "domingo"    => 0,
+        "mon" | "monday"    | "lun" | "lunes"      => 1,
+        "tue" | "tuesday"   | "mar" | "martes"     => 2,
+        "wed" | "wednesday" | "mie" | "miercoles" | "miércoles" => 3,
+        "thu" | "thursday"  | "jue" | "jueves"     => 4,
+        "fri" | "friday"    | "vie" | "viernes"    => 5,
+        "sat" | "saturday"  | "sab" | "sabado"    | "sábado"   => 6,
+        _ => anyhow::bail!("unknown weekday {s:?}"),
+    })
 }
 
 /// Current unix seconds, defaulting to 0 on clock failure (unreachable in
@@ -135,6 +215,32 @@ pub fn parse_when(s: &str) -> anyhow::Result<u64> {
     iso8601_utc_to_unix(s).ok_or_else(|| {
         anyhow::anyhow!("unrecognized time spec {s:?} — use 15m / 2h / 1d / <unix-seconds> / 2026-04-24T09:00:00")
     })
+}
+
+/// Next unix timestamp (UTC) strictly after `after` that matches
+/// `hour:minute` of the day.
+fn next_daily(after: u64, hour: u8, minute: u8) -> u64 {
+    let day_start = after - (after % 86_400);
+    let target = day_start + (hour as u64) * 3600 + (minute as u64) * 60;
+    if target > after { target } else { target + 86_400 }
+}
+
+/// Next unix timestamp (UTC) strictly after `after` on the given weekday
+/// (0=Sunday … 6=Saturday) at `hour:minute`.
+fn next_weekly(after: u64, weekday: u8, hour: u8, minute: u8) -> u64 {
+    // Unix epoch (1970-01-01) was a Thursday — day-of-week = 4.
+    let today_dow = ((after / 86_400) + 4) % 7;
+    let mut days = ((weekday as u64 + 7) - today_dow) % 7;
+    let today_at = next_daily(after, hour, minute);
+    if days == 0 {
+        // Same weekday — use the already-correct daily computation.
+        return today_at;
+    }
+    // Roll forward from today_at's day by `days - (today_at rolled?1:0)`.
+    // Simpler: recompute from day_start.
+    let day_start = after - (after % 86_400);
+    let target = day_start + days * 86_400 + (hour as u64) * 3600 + (minute as u64) * 60;
+    if target > after { target } else { target + 7 * 86_400 }
 }
 
 /// Tiny hand-rolled ISO-8601 parser for `YYYY-MM-DDTHH:MM:SS` (assumed UTC).
@@ -225,6 +331,51 @@ mod tests {
         assert!(parse_when("").is_err());
         assert!(parse_when("tomorrow").is_err());
         assert!(parse_when("25h99m").is_err());
+    }
+
+    #[test]
+    fn next_daily_wraps_to_tomorrow() {
+        // 2021-01-01T00:00:00 UTC = 1609459200 (a Friday).
+        let midnight = 1609459200;
+        // 09:00 same day is 1609459200 + 9*3600 = 1609491600.
+        assert_eq!(next_daily(midnight, 9, 0), midnight + 9 * 3600);
+        // If we're already past 09:00, next daily fires tomorrow at 09:00.
+        assert_eq!(next_daily(midnight + 10 * 3600, 9, 0), midnight + 86400 + 9 * 3600);
+    }
+
+    #[test]
+    fn next_weekly_finds_target_day() {
+        let midnight_fri = 1609459200; // 2021-01-01 = Friday (dow 5).
+        // Next Monday (dow 1) at 09:00 from this Friday midnight.
+        let next_mon = next_weekly(midnight_fri, 1, 9, 0);
+        // Expected: +3 days +9h.
+        assert_eq!(next_mon, midnight_fri + 3 * 86400 + 9 * 3600);
+    }
+
+    #[test]
+    fn recur_daily_reschedules_after_fire() {
+        let s = Scheduler::open(tmp_path()).unwrap();
+        s.schedule_full("x", "hi", 100, Some(Recurrence::Daily { hour: 0, minute: 0 }));
+        let fired = s.take_due(200);
+        assert_eq!(fired.len(), 1);
+        let pending = s.list();
+        assert_eq!(pending.len(), 1, "recurring item should re-queue");
+        assert!(pending[0].send_at_unix > 200);
+    }
+
+    #[test]
+    fn parse_hhmm_ok_and_err() {
+        assert_eq!(parse_hhmm("09:30").unwrap(), (9, 30));
+        assert!(parse_hhmm("25:00").is_err());
+        assert!(parse_hhmm("9").is_err());
+    }
+
+    #[test]
+    fn parse_weekday_accepts_es_en() {
+        assert_eq!(parse_weekday("mon").unwrap(), 1);
+        assert_eq!(parse_weekday("Lunes").unwrap(), 1);
+        assert_eq!(parse_weekday("viernes").unwrap(), 5);
+        assert!(parse_weekday("xx").is_err());
     }
 
     #[test]
