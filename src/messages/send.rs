@@ -783,24 +783,12 @@ impl MessageManager {
                 encode_wa_reply_message(text, reply_to_id, participant, &quoted_body)
             }
             Some(MessageContent::Image { info, caption, view_once }) => {
-                if *view_once {
-                    let inner = crate::signal::wa_proto::encode_wa_image_message_opts(
-                        info, caption.as_deref(), true,
-                    );
-                    wrap_view_once(&inner)
-                } else {
-                    encode_wa_image_message(info, caption.as_deref())
-                }
+                let bytes = encode_wa_image_message(info, caption.as_deref());
+                if *view_once { wrap_view_once(&bytes) } else { bytes }
             }
             Some(MessageContent::Video { info, caption, view_once }) => {
-                if *view_once {
-                    let inner = crate::signal::wa_proto::encode_wa_video_message_opts(
-                        info, caption.as_deref(), true,
-                    );
-                    wrap_view_once(&inner)
-                } else {
-                    encode_wa_video_message(info, caption.as_deref())
-                }
+                let bytes = encode_wa_video_message(info, caption.as_deref());
+                if *view_once { wrap_view_once(&bytes) } else { bytes }
             }
             Some(MessageContent::Audio { info, ptt }) => encode_wa_audio_message(info, *ptt),
             Some(MessageContent::Document { info, file_name }) =>

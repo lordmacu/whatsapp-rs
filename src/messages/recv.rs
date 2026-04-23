@@ -1061,11 +1061,12 @@ fn decode_plaintext(data: &[u8]) -> DecodedPayload {
             }
         }
 
-        // ViewOnce wrapper: one of field 25 (v1), 68 (v2), 91 (v2 extension).
-        // Each wraps a FutureProofMessage { message=1 = inner Message }.
-        // Unwrap, recurse, and promote the resulting Image/Video's view_once
-        // flag so callers can distinguish "normal" media from a one-shot.
-        for &wrapper in &[68u64, 25, 91] {
+        // ViewOnce wrapper: one of field 37 (v1), 55 (v2), 59 (v2 extension).
+        // Canonical Baileys numbers — each wraps a FutureProofMessage
+        // { message=1 = inner Message }. Unwrap, recurse, and promote the
+        // resulting Image/Video's view_once flag so callers can distinguish
+        // normal media from a one-shot.
+        for &wrapper in &[37u64, 55, 59] {
             if let Some(wrap_bytes) = fields.get(&wrapper) {
                 if let Some(fp) = wa_proto::parse_proto_fields(wrap_bytes) {
                     if let Some(inner) = fp.get(&1) {

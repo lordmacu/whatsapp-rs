@@ -330,33 +330,36 @@ pub fn encode_wa_poll_message(
     (proto_message(49, &poll), enc_key)
 }
 
-/// Wrap a normal WAProto.Message blob (image/video) in a `ViewOnceMessageV2`
+/// Wrap a normal WAProto.Message blob (image/video) in a `viewOnceMessage`
 /// envelope so the receiver's WA client deletes the media after first open.
 ///
-/// Structure (modern WA, required by ≥ 2.24):
+/// Field numbers verified against local Baileys WAProto.proto:
+///   `viewOnceMessage = 37` (V1 — what Baileys actually sends),
+///   `viewOnceMessageV2 = 55`, `viewOnceMessageV2Extension = 59`.
+///   `messageContextInfo = 35`, `MessageContextInfo.messageSecret = 3`.
+///
+/// Structure:
 /// ```text
 /// outer Message {
 ///   messageContextInfo = MessageContextInfo { messageSecret = <32 random bytes> }   // field 35
-///   viewOnceMessageV2  = FutureProofMessage   { message = inner Message }           // field 68
+///   viewOnceMessage    = FutureProofMessage   { message = inner Message }           // field 37
 /// }
 /// ```
 ///
-/// The `messageSecret` is mandatory — without it modern WA shows
-/// "this message is not supported by your version of WhatsApp". The
-/// bytes don't need to match anything; they're an ephemeral per-message
-/// key the client stores next to the view-once record.
+/// Baileys uses V1 (field 37) here (`Utils/messages.ts`), not V2. The inner
+/// Image/VideoMessage does NOT carry an additional `viewOnce` bool — the
+/// envelope alone drives the UI. `messageSecret` is unconditionally added
+/// for non-reaction/poll/event messages (the reporting-token path).
 pub fn wrap_view_once(inner_message: &[u8]) -> Vec<u8> {
     use rand::RngCore;
     let mut secret = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut secret);
 
-    // MessageContextInfo { field 3 = messageSecret (bytes) }
     let mci_body = proto_bytes(3, &secret);
     let mci_outer = proto_message(35, &mci_body);
 
-    // FutureProofMessage { field 1 = inner Message }
     let fp = proto_bytes(1, inner_message);
-    let view_once = proto_message(68, &fp);
+    let view_once = proto_message(37, &fp);
 
     let mut out = Vec::with_capacity(view_once.len() + mci_outer.len());
     out.extend_from_slice(&view_once);
