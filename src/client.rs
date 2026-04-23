@@ -163,11 +163,14 @@ impl Client {
         }).await.unwrap_or(false);
 
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(saw_connected));
+        let chat_meta = Arc::new(crate::chat_meta::ChatMetaStore::new(base)?);
 
-        // Mirror connection state from the event bus into `connected` so
-        // Session::is_connected / wait_connected are free of event-bus polling.
+        // Mirror connection state + app-state updates from the event bus.
+        // Single subscriber drives both so ordering is preserved (you'll
+        // never get an AppStateUpdate before the matching Connected).
         {
             let connected = connected.clone();
+            let chat_meta = chat_meta.clone();
             let mut rx = event_tx.subscribe();
             tokio::spawn(async move {
                 use std::sync::atomic::Ordering;
@@ -177,6 +180,9 @@ impl Client {
                         MessageEvent::Disconnected { .. }
                         | MessageEvent::Reconnecting { .. } => {
                             connected.store(false, Ordering::SeqCst);
+                        }
+                        MessageEvent::AppStateUpdate { ref action, .. } => {
+                            chat_meta.apply(action);
                         }
                         _ => {}
                     }
@@ -190,6 +196,7 @@ impl Client {
             store: self.store.clone(),
             bg_handle: bg_handle.abort_handle(),
             connected,
+            chat_meta,
         })
     }
 
@@ -1005,6 +1012,9 @@ pub struct Session {
     /// Mirrored from `MessageEvent::Connected` / `Disconnected` so callers
     /// can cheaply check liveness without subscribing to the event bus.
     connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-JID metadata index projected from app-state sync. Kept in
+    /// sync by the background event subscriber.
+    chat_meta: Arc<crate::chat_meta::ChatMetaStore>,
 }
 
 impl Drop for Session {
@@ -1404,6 +1414,16 @@ impl Session {
     }
 
     /// Last `n` stored messages for a JID (oldest first, most-recent last).
+    /// Per-chat metadata projection from app-state sync (pin, mute,
+    /// archive, lock, labels). Returns a default-populated [`ChatMeta`]
+    /// for JIDs we haven't seen events for.
+    ///
+    /// Agents can gate on `meta.agent_should_skip()` to stay silent on
+    /// muted / archived / locked chats.
+    pub fn chat_meta(&self, jid: &str) -> crate::chat_meta::ChatMeta {
+        self.chat_meta.get(jid)
+    }
+
     /// Current outbox depth — messages written to disk as Pending that
     /// haven't yet been ACK'd by the server. Handy for `/metrics` + CLI.
     pub async fn outbox_pending_count(&self) -> usize {

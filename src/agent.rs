@@ -536,6 +536,20 @@ impl Session {
                 continue;
             }
 
+            // Respect the user's chat settings: stay silent on chats they
+            // muted, archived, or locked from their phone. Opt out by
+            // setting WA_AGENT_IGNORE_CHAT_META=1.
+            if std::env::var("WA_AGENT_IGNORE_CHAT_META").is_err() {
+                let meta = self.chat_meta(&msg.key.remote_jid);
+                if meta.agent_should_skip() {
+                    tracing::debug!(
+                        "agent: skipping {} (archived={} locked={} muted={})",
+                        msg.key.remote_jid, meta.archived, meta.locked, meta.is_muted_now()
+                    );
+                    continue;
+                }
+            }
+
             let mut text = extract_text(msg.message.as_ref());
 
             // Voice-note transcription: only runs when configured AND the

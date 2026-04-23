@@ -2,6 +2,7 @@ pub mod agent;
 pub mod app_state;
 pub mod auth;
 pub mod binary;
+pub mod chat_meta;
 pub mod chat_state;
 pub mod outbox;
 pub mod client;
