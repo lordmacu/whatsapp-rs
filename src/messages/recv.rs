@@ -1100,13 +1100,20 @@ fn decode_plaintext(data: &[u8]) -> DecodedPayload {
             file_length: m.file_length,
             mimetype: m.mimetype,
         };
+        // Canonical WAProto field numbers (legacy in second line kept so
+        // our own stored msgs from before the fix still decode).
         let content = match field {
-            3 => MessageContent::Image { info, caption: m.caption },
-            4 => MessageContent::Document { info, file_name: m.file_name.unwrap_or_default() },
-            5 => MessageContent::Audio { info },
-            6 => MessageContent::Video { info, caption: m.caption },
+            3  => MessageContent::Image { info, caption: m.caption },
+            7  => MessageContent::Document { info, file_name: m.file_name.unwrap_or_default() },
+            8  => MessageContent::Audio { info },
+            9  => MessageContent::Video { info, caption: m.caption },
+            26 => MessageContent::Sticker { info },
+            // legacy fallbacks
+            4  => MessageContent::Document { info, file_name: m.file_name.unwrap_or_default() },
+            5  => MessageContent::Audio { info },
+            6  => MessageContent::Video { info, caption: m.caption },
             20 => MessageContent::Sticker { info },
-            _ => MessageContent::Image { info, caption: m.caption },
+            _  => MessageContent::Image { info, caption: m.caption },
         };
         return DecodedPayload::Message(content);
     }

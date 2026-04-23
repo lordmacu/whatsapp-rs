@@ -83,25 +83,29 @@ fn encode_media_fields(info: &crate::messages::MediaInfo, caption: Option<&str>,
     sub
 }
 
+// Canonical WAProto Message oneof field numbers (verified against Baileys
+// and whatsmeow protos): imageMessage=3, documentMessage=7, audioMessage=8,
+// videoMessage=9, stickerMessage=26. Older code used 4/5/6/20 respectively,
+// which some WA clients accepted but modern ones don't.
 pub fn encode_wa_image_message(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
     proto_message(3, &encode_media_fields(info, caption, &[]))
 }
 
 pub fn encode_wa_video_message(info: &crate::messages::MediaInfo, caption: Option<&str>) -> Vec<u8> {
-    proto_message(6, &encode_media_fields(info, caption, &[]))
+    proto_message(9, &encode_media_fields(info, caption, &[]))
 }
 
 pub fn encode_wa_audio_message(info: &crate::messages::MediaInfo) -> Vec<u8> {
-    proto_message(5, &encode_media_fields(info, None, &[]))
+    proto_message(8, &encode_media_fields(info, None, &[]))
 }
 
 pub fn encode_wa_document_message(info: &crate::messages::MediaInfo, file_name: &str) -> Vec<u8> {
     let extra = proto_bytes(30, file_name.as_bytes());
-    proto_message(4, &encode_media_fields(info, None, &extra))
+    proto_message(7, &encode_media_fields(info, None, &extra))
 }
 
 pub fn encode_wa_sticker_message(info: &crate::messages::MediaInfo) -> Vec<u8> {
-    proto_message(20, &encode_media_fields(info, None, &[]))
+    proto_message(26, &encode_media_fields(info, None, &[]))
 }
 
 /// Encode WAProto.Message with link preview (field 17 = ExtendedTextMessage).
@@ -240,7 +244,10 @@ pub struct WaMediaFields {
 ///   3=image, 4=document, 5=audio, 6=video, 20=sticker
 pub fn decode_wa_media(data: &[u8]) -> Option<(WaMediaFields, u64)> {
     let outer = parse_proto_fields(data)?;
-    for &field in &[3u64, 4, 5, 6, 20] {
+    // Canonical fields first (image=3, document=7, audio=8, video=9,
+    // sticker=26). Legacy 4/5/6/20 kept as fallback so messages we sent
+    // ourselves before the field-number fix still decode.
+    for &field in &[3u64, 7, 8, 9, 26, 4, 5, 6, 20] {
         if let Some(sub) = outer.get(&field) {
             if let Some(m) = parse_media_sub(sub) {
                 return Some((m, field));
@@ -1193,8 +1200,10 @@ fn parse_web_message_info_inner(data: &[u8], allow_missing_remote_jid: bool) -> 
             return Some(crate::messages::MessageContent::Text { text: t, mentioned_jids: Vec::new() });
         }
 
-        // field 17 = ExtendedTextMessage (text + optional link preview)
-        if let Some(ext_bytes) = mf.get(&17) {
+        // ExtendedTextMessage = field 6 (canonical). Legacy: we used to
+        // encode under 17, accept both for backward compat with our own
+        // stored msgs.
+        if let Some(ext_bytes) = mf.get(&6).or_else(|| mf.get(&17)) {
             if let Some(ef) = parse_proto_fields(ext_bytes) {
                 let text = ef.get(&1).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
                 let url  = ef.get(&2).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
@@ -1219,35 +1228,37 @@ fn parse_web_message_info_inner(data: &[u8], allow_missing_remote_jid: bool) -> 
             }
         }
 
-        // field 3 = ImageMessage
+        // ImageMessage = field 3.
         if let Some(info) = mf.get(&3).and_then(|b| parse_media_info(b)) {
             let caption = parse_proto_fields(mf.get(&3)?).ok_or(()).ok()
                 .and_then(|f| f.get(&8).and_then(|b| String::from_utf8(b.clone()).ok()));
             return Some(crate::messages::MessageContent::Image { info, caption });
         }
 
-        // field 6 = VideoMessage
-        if let Some(info) = mf.get(&6).and_then(|b| parse_media_info(b)) {
-            let caption = parse_proto_fields(mf.get(&6)?).ok_or(()).ok()
+        // VideoMessage = field 9 (canonical) / legacy 6.
+        if let Some(info) = mf.get(&9).or_else(|| mf.get(&6)).and_then(|b| parse_media_info(b)) {
+            let src = mf.get(&9).or_else(|| mf.get(&6))?;
+            let caption = parse_proto_fields(src).ok_or(()).ok()
                 .and_then(|f| f.get(&8).and_then(|b| String::from_utf8(b.clone()).ok()));
             return Some(crate::messages::MessageContent::Video { info, caption });
         }
 
-        // field 5 = AudioMessage
-        if let Some(info) = mf.get(&5).and_then(|b| parse_media_info(b)) {
+        // AudioMessage = field 8 (canonical) / legacy 5.
+        if let Some(info) = mf.get(&8).or_else(|| mf.get(&5)).and_then(|b| parse_media_info(b)) {
             return Some(crate::messages::MessageContent::Audio { info });
         }
 
-        // field 4 = DocumentMessage
-        if let Some(info) = mf.get(&4).and_then(|b| parse_media_info(b)) {
-            let file_name = parse_proto_fields(mf.get(&4)?).ok_or(()).ok()
+        // DocumentMessage = field 7 (canonical) / legacy 4.
+        if let Some(info) = mf.get(&7).or_else(|| mf.get(&4)).and_then(|b| parse_media_info(b)) {
+            let src = mf.get(&7).or_else(|| mf.get(&4))?;
+            let file_name = parse_proto_fields(src).ok_or(()).ok()
                 .and_then(|f| f.get(&30).and_then(|b| String::from_utf8(b.clone()).ok()))
                 .unwrap_or_default();
             return Some(crate::messages::MessageContent::Document { info, file_name });
         }
 
-        // field 20 = StickerMessage
-        if let Some(info) = mf.get(&20).and_then(|b| parse_media_info(b)) {
+        // StickerMessage = field 26 (canonical) / legacy 20.
+        if let Some(info) = mf.get(&26).or_else(|| mf.get(&20)).and_then(|b| parse_media_info(b)) {
             return Some(crate::messages::MessageContent::Sticker { info });
         }
 
