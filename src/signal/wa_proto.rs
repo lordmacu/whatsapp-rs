@@ -358,8 +358,11 @@ pub fn wrap_view_once(inner_message: &[u8]) -> Vec<u8> {
     let mci_body = proto_bytes(3, &secret);
     let mci_outer = proto_message(35, &mci_body);
 
+    // V2 (field 55) per whatsmeow/modern-WA; V1 (37) silently renders as a
+    // normal image on current iOS/Android clients so the "open-once" UI
+    // never triggers even though the envelope is accepted.
     let fp = proto_bytes(1, inner_message);
-    let view_once = proto_message(37, &fp);
+    let view_once = proto_message(55, &fp);
 
     let mut out = Vec::with_capacity(view_once.len() + mci_outer.len());
     out.extend_from_slice(&view_once);
