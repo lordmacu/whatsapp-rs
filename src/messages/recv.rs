@@ -28,6 +28,14 @@ fn bare_user_jid(jid: &str) -> String {
     format!("{user}{server}")
 }
 
+/// Sender-only retry counter key. Unlike [`retry_cache_key`] this is not
+/// scoped by msg id, so repeated decrypt failures from the same sender
+/// accumulate and trigger the count=2-with-keys escalation on the second
+/// failure in a row. Reset on any successful decrypt.
+fn sender_retry_key(sender: &str) -> String {
+    format!("sender:{sender}")
+}
+
 fn retry_cache_key(id: &str, sender: &str) -> String {
     format!("{id}:{sender}")
 }
@@ -463,23 +471,28 @@ impl MessageManager {
                     // candidates corrupts every session we touch.
                     match self.signal.decrypt_message(&decrypt_jid, &enc_bytes, &enc_type).await {
                         Ok(plaintext) => {
+                            // Reset the per-sender failure counter on success
+                            // so a later transient failure still gets a count=1
+                            // reminder before we escalate to count=2+keys.
+                            self.retry_ids.lock().unwrap()
+                                .remove(&sender_retry_key(sender_jid));
                             let plaintext = unpad_wa(&plaintext);
                             self.maybe_process_skdm(&decrypt_jid, plaintext);
                             Some(decode_plaintext(plaintext))
                         }
                         Err(e) => {
                             debug!("signal decrypt failed for {from}: {e}");
-                            // Keep the session: dropping it nukes the
-                            // established ratchet state, and the sender's
-                            // retry response may arrive as a plain msg (not
-                            // pkmsg) so there's nothing to rebuild from.
-                            // A retry-receipt asks the sender to redeliver;
-                            // that path is what actually unsticks things.
+                            // Count consecutive decrypt failures from this
+                            // sender (keyed by the sender jid, not the msg
+                            // id — each msg has a unique id so a per-msg
+                            // counter always starts at 1 and we never
+                            // escalate to count=2 with keys). Two straight
+                            // failures means the session is truly broken
+                            // and we need peer to re-X3DH.
                             if !is_offline_replay {
-                                let retry_key = retry_cache_key(&id, sender_jid);
                                 let retry_count = {
                                     let mut retries = self.retry_ids.lock().unwrap();
-                                    let count = retries.entry(retry_key).or_insert(0);
+                                    let count = retries.entry(sender_retry_key(sender_jid)).or_insert(0);
                                     *count += 1;
                                     *count
                                 };
