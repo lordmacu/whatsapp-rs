@@ -12,17 +12,17 @@ pub fn encode_wa_text_message(text: &str) -> Vec<u8> {
 /// Encode a reply WAProto.Message.
 /// `participant` = original sender JID (required for group replies so the app shows the quote correctly).
 pub fn encode_wa_reply_message(text: &str, reply_to_id: &str, participant: Option<&str>) -> Vec<u8> {
+    // ContextInfo (WAProto): field 1 = stanzaId, field 2 = participant.
     let mut ctx_info = Vec::new();
-    ctx_info.extend(proto_bytes(3, reply_to_id.as_bytes())); // stanzaId
+    ctx_info.extend(proto_bytes(1, reply_to_id.as_bytes())); // stanzaId
     if let Some(p) = participant {
-        ctx_info.extend(proto_bytes(1, p.as_bytes())); // participant (ContextInfo field 1)
+        ctx_info.extend(proto_bytes(2, p.as_bytes())); // participant
     }
+    // ExtendedTextMessage: field 1 = text, field 17 = contextInfo.
     let mut extended = Vec::new();
-    extended.extend(proto_bytes(1, text.as_bytes())); // text
-    extended.extend(proto_message(2, &ctx_info));     // contextInfo
-    // Message.extendedTextMessage = field 6 (WAProto). Older code used 17,
-    // which current WA clients render as "this message is incompatible
-    // with your version of WhatsApp".
+    extended.extend(proto_bytes(1, text.as_bytes()));
+    extended.extend(proto_message(17, &ctx_info));
+    // Message.extendedTextMessage = field 6.
     proto_message(6, &extended)
 }
 
@@ -38,10 +38,9 @@ pub fn encode_wa_text_with_mentions(text: &str, mention_jids: &[&str]) -> Vec<u8
     }
     let mut extended = Vec::new();
     extended.extend(proto_bytes(1, text.as_bytes()));
-    extended.extend(proto_message(2, &ctx_info));
-    // Message.extendedTextMessage = field 6 (WAProto). Older code used 17,
-    // which current WA clients render as "this message is incompatible
-    // with your version of WhatsApp".
+    // ExtendedTextMessage.contextInfo = field 17.
+    extended.extend(proto_message(17, &ctx_info));
+    // Message.extendedTextMessage = field 6.
     proto_message(6, &extended)
 }
 
