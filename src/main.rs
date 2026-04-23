@@ -1,3 +1,4 @@
+mod agent;
 mod app_state;
 mod auth;
 mod binary;
