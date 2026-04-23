@@ -323,6 +323,9 @@ fn event_to_json(session: &Session, ev: &MessageEvent) -> Option<serde_json::Val
         MessageEvent::Disconnected { reason, reconnect } => Some(serde_json::json!({
             "event": "disconnected", "reason": reason, "reconnect": reconnect,
         })),
+        MessageEvent::Reconnecting { attempt, delay } => Some(serde_json::json!({
+            "event": "reconnecting", "attempt": attempt, "delay_ms": delay.as_millis() as u64,
+        })),
         // Ignore connection lifecycle, history sync, app-state, etc — not
         // useful to agents. Add more if needed.
         _ => None,

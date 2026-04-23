@@ -1139,6 +1139,7 @@ fn event_label(event: &MessageEvent) -> &'static str {
         MessageEvent::EphemeralSetting { .. } => "EphemeralSetting",
         MessageEvent::GroupUpdate { .. }    => "GroupUpdate",
         MessageEvent::Disconnected { .. }   => "Disconnected",
+        MessageEvent::Reconnecting { .. }   => "Reconnecting",
         MessageEvent::Connected             => "Connected",
         MessageEvent::AppStateUpdate { .. } => "AppStateUpdate",
     }

@@ -631,21 +631,32 @@ async fn run_session_loop(
     poll_store: Arc<PollStore>,
     outbox: Arc<OutboxStore>,
 ) {
-    if !run_one_connection(receiver, initial_mgr, creds.clone(), store.clone()).await {
+    if !run_one_connection(receiver, initial_mgr, creds.clone(), store.clone(), event_tx.clone()).await {
         return; // permanent failure — don't reconnect
     }
 
-    // Reconnect loop with exponential backoff
+    // Reconnect loop: exponential backoff with jitter, capped at 60s. Each
+    // retry emits a `Reconnecting` event so UIs / metrics can surface the
+    // delay. `attempt` resets once a fresh connection holds long enough to
+    // yield a successful <success>.
     let mut backoff = Duration::from_secs(2);
+    let mut attempt: u32 = 0;
     loop {
-        info!("reconnecting in {backoff:?}…");
-        tokio::time::sleep(backoff).await;
+        attempt = attempt.saturating_add(1);
+        let delay = with_jitter(backoff);
+        info!("reconnecting in {delay:?} (attempt {attempt})");
+        let _ = event_tx.send(MessageEvent::Reconnecting { attempt, delay });
+        tokio::time::sleep(delay).await;
         backoff = (backoff * 2).min(Duration::from_secs(60));
 
         let (sender, receiver) = {
             let c = creds.lock().await;
             match socket::connect(&*c).await {
-                Ok(pair) => { backoff = Duration::from_secs(2); pair }
+                Ok(pair) => {
+                    backoff = Duration::from_secs(2);
+                    attempt = 0;
+                    pair
+                }
                 Err(e) => { warn!("reconnect failed: {e}"); continue; }
             }
         };
@@ -689,11 +700,23 @@ async fn run_session_loop(
             });
         }
 
-        if !run_one_connection(receiver, mgr, creds.clone(), store.clone()).await {
+        if !run_one_connection(receiver, mgr, creds.clone(), store.clone(), event_tx.clone()).await {
             warn!("permanent disconnect — stopping reconnect loop");
             return;
         }
     }
+}
+
+/// Add ±20% random jitter to `base` to avoid thundering-herd reconnects.
+///
+/// Clamped to a floor of 500 ms so we never burst-dial after a flap.
+fn with_jitter(base: Duration) -> Duration {
+    use rand::Rng;
+    let ms = base.as_millis() as u64;
+    let jitter_ms = (ms / 5).max(100);
+    let offset: i64 = rand::thread_rng().gen_range(-(jitter_ms as i64)..=(jitter_ms as i64));
+    let adjusted = (ms as i64).saturating_add(offset).max(500) as u64;
+    Duration::from_millis(adjusted)
 }
 
 /// Drive a single connection to completion (recv loop + keepalive + pre-key rotation).
@@ -703,7 +726,14 @@ async fn run_one_connection(
     mgr: Arc<MessageManager>,
     creds: SharedCreds,
     store: Arc<FileStore>,
+    event_tx: broadcast::Sender<MessageEvent>,
 ) -> bool {
+    // Shared liveness marker — updated every time we accept a node from the
+    // wire. The liveness watchdog tears the connection down if it goes
+    // stale, which is our only signal for "silent" WebSocket stalls where
+    // the kernel never surfaces a RST.
+    let last_rx = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
     let ping_socket = mgr.socket.clone();
     let keepalive = tokio::spawn(async move {
         use crate::binary::{BinaryNode, NodeContent};
@@ -728,6 +758,37 @@ async fn run_one_connection(
             };
             if ping_socket.send_node(&ping).await.is_err() {
                 break;
+            }
+        }
+    });
+
+    // Liveness watchdog: if no node has arrived in 75 s the socket is
+    // effectively dead. Disconnect it so the recv loop breaks and the
+    // outer reconnect loop dials again. 75 s > 3× the 25 s keepalive
+    // interval so transient jitter won't trip it.
+    const STALE_AFTER: Duration = Duration::from_secs(75);
+    let watchdog_rx = last_rx.clone();
+    let watchdog_sock = mgr.socket.clone();
+    let watchdog_ev  = event_tx.clone();
+    let watchdog = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let since = {
+                let t = watchdog_rx.lock().await;
+                tokio::time::Instant::now().saturating_duration_since(*t)
+            };
+            if since > STALE_AFTER {
+                warn!("liveness watchdog: no nodes in {since:?}, forcing reconnect");
+                let _ = watchdog_ev.send(MessageEvent::Disconnected {
+                    reason: format!("watchdog stale ({since:?})"),
+                    reconnect: true,
+                });
+                // Closing the underlying socket causes recv_node to
+                // return Err and the select!-loop to break.
+                watchdog_sock.close().await;
+                return;
             }
         }
     });
@@ -798,6 +859,7 @@ async fn run_one_connection(
             node_result = receiver.recv_node() => {
                 match node_result {
                     Ok(Some(node)) => {
+                        *last_rx.lock().await = tokio::time::Instant::now();
                         tracing::debug!(tag = %node.tag, attrs = ?node.attrs, "← node");
                         if node.tag == "message" {
                             info!(
@@ -888,6 +950,7 @@ async fn run_one_connection(
     }
     keepalive.abort();
     rotation.abort();
+    watchdog.abort();
     should_reconnect
 }
 

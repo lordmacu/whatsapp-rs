@@ -166,6 +166,9 @@ pub async fn print_event(session: &Session, event: MessageEvent) {
         MessageEvent::Disconnected { reason, reconnect } => {
             println!("[DISCONNECTED] reason={reason} reconnect={reconnect}");
         }
+        MessageEvent::Reconnecting { attempt, delay } => {
+            println!("[RECONNECTING] attempt={attempt} in {delay:?}");
+        }
         MessageEvent::AppStateUpdate { collection, action } => {
             println!("[app-state {collection}] {action:?}");
         }

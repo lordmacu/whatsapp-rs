@@ -212,6 +212,10 @@ pub enum MessageEvent {
     /// The server terminated this session (conflict, device removed, logged out, etc.).
     /// When `reconnect` is false the reconnect loop will stop; credentials may be invalid.
     Disconnected { reason: String, reconnect: bool },
+    /// The background loop is about to retry a connection. `attempt` is 1-based
+    /// (first retry = 1); `delay` is how long we'll sleep before dialing.
+    /// Surfaced so UIs / metrics can show "reconnecting in 4s (attempt 3)".
+    Reconnecting { attempt: u32, delay: std::time::Duration },
     /// An app-state collection patch was applied. `collection` is the WhatsApp
     /// name ("critical_block", "regular", ...). `action` carries the decoded
     /// mutation (contact rename, pin, mute, archive, …).

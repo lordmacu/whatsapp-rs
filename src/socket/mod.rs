@@ -97,6 +97,14 @@ impl SocketSender {
         format!("{:08x}", self.id_seq.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Close the underlying WebSocket. The receive loop sees EOF on its next
+    /// `recv_node` and breaks, which is what the caller wants when a
+    /// liveness watchdog decides the socket has gone silent.
+    pub async fn close(&self) {
+        use futures_util::SinkExt;
+        let _ = self.tx.lock().await.close().await;
+    }
+
     /// Send `<iq xmlns="passive"><active/></iq>`. Baileys does this after <success>.
     pub async fn send_passive_active(&self) -> Result<()> {
         let id = self.next_id();
