@@ -26,5 +26,11 @@ bible_*.json
 
 # Reference only — not shipped
 /Baileys/
+/whatsmeow/
 /proto/
 /PENDIENTES.md
+/.codex
+/agent-state/
+/agent-state-offhours/
+/.env
+.env.local

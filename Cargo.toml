@@ -1,7 +1,36 @@
 [package]
-name = "whatsapp-rs"
-version = "0.1.0"
-edition = "2021"
+name          = "whatsapp-rs"
+version       = "0.1.0"
+edition       = "2021"
+rust-version  = "1.75"
+description   = "WhatsApp multi-device client library — Signal-protocol 1:1 + groups, media, polls, view-once, scheduler, and an agent runtime for LLM / webhook / voice-note bots."
+license       = "MIT OR Apache-2.0"
+repository    = "https://github.com/cristian-garcia/whatsapp-rs"
+homepage      = "https://github.com/cristian-garcia/whatsapp-rs"
+readme        = "README.md"
+keywords      = ["whatsapp", "messaging", "bot", "signal", "agent"]
+categories    = ["api-bindings", "network-programming", "asynchronous"]
+authors       = ["Cristian García <informacion@cristiangarcia.co>"]
+
+# Files excluded from the `cargo package` tarball (what crates.io serves).
+# Keeps the bundle small and free of local-dev detritus.
+exclude = [
+    "/Baileys",
+    "/whatsmeow",
+    "/proto",
+    "/.codex",
+    "/.env",
+    "/agent-state",
+    "/agent-state-offhours",
+    "/.worktrees",
+    "/.whatsapp-rs",
+    "/target",
+    "/PENDIENTES.md",
+    "/bible_*.json",
+    "/captura_*",
+    "/*.log",
+    "/docs/superpowers",
+]
 
 [[bin]]
 name = "whatsapp-rs"
