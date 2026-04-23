@@ -838,6 +838,8 @@ impl MessageManager {
     /// Groups (`@g.us`): fetches participants, distributes SenderKey, encrypts as skmsg.
     /// 1:1: establishes Signal session if needed, encrypts as msg/pkmsg.
     async fn send_encrypted_bytes(&self, jid: &str, id: &str, wa_bytes: Vec<u8>) -> Result<()> {
+        let (stanza_type, media_type) =
+            crate::signal::wa_proto::classify_stanza(&wa_bytes);
         // Normalize the target jid: for 1:1 sends, if the caller passed an
         // `@lid` address and we've learned the `@s.whatsapp.net` alias,
         // route through PN instead. Sending via LID while an established
@@ -870,12 +872,16 @@ impl MessageManager {
             let (sender_key_nodes, distributed, sender_key_pkmsg) =
                 self.build_group_sender_key_distribution(jid, &participants).await?;
             let skmsg = self.signal.encrypt_group_message(jid, &pad_wa(&wa_bytes)).await?;
+            let mut enc_attrs = vec![
+                ("v".to_string(), "2".to_string()),
+                ("type".to_string(), "skmsg".to_string()),
+            ];
+            if !media_type.is_empty() {
+                enc_attrs.push(("mediatype".to_string(), media_type.to_string()));
+            }
             let mut children = vec![BinaryNode {
                 tag: "enc".to_string(),
-                attrs: vec![
-                    ("v".to_string(), "2".to_string()),
-                    ("type".to_string(), "skmsg".to_string()),
-                ],
+                attrs: enc_attrs,
                 content: NodeContent::Bytes(skmsg),
             }];
             if !sender_key_nodes.is_empty() {
@@ -971,15 +977,19 @@ impl MessageManager {
                     Err(e) => { tracing::warn!("encrypt {dev_jid}: {e}"); continue; }
                 };
                 if enc.msg_type == "pkmsg" { any_pkmsg = true; }
+                let mut enc_attrs = vec![
+                    ("v".to_string(), "2".to_string()),
+                    ("type".to_string(), enc.msg_type.to_string()),
+                ];
+                if !media_type.is_empty() {
+                    enc_attrs.push(("mediatype".to_string(), media_type.to_string()));
+                }
                 to_nodes.push(BinaryNode {
                     tag: "to".to_string(),
                     attrs: vec![("jid".to_string(), dev_jid)],
                     content: NodeContent::List(vec![BinaryNode {
                         tag: "enc".to_string(),
-                        attrs: vec![
-                            ("v".to_string(), "2".to_string()),
-                            ("type".to_string(), enc.msg_type.to_string()),
-                        ],
+                        attrs: enc_attrs,
                         content: NodeContent::Bytes(enc.ciphertext),
                     }]),
                 });
@@ -1014,7 +1024,7 @@ impl MessageManager {
             attrs: vec![
                 ("to".to_string(), jid.to_string()),
                 ("id".to_string(), id.to_string()),
-                ("type".to_string(), "text".to_string()),
+                ("type".to_string(), stanza_type.to_string()),
                 ("t".to_string(), unix_now().to_string()),
             ],
             content: message_content,

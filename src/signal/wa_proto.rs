@@ -367,6 +367,59 @@ pub fn wrap_view_once(inner_message: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Classify a WAProto.Message blob into the `type` attribute for the outer
+/// `<message>` stanza and the `mediatype` attribute for its `<enc>` children.
+///
+/// Whatsmeow does this via `getTypeFromMessage` / `getMediaTypeFromMessage`
+/// (send.go). Modern WA ignores view-once / ephemeral envelope semantics when
+/// the stanza is announced as `type="text"` with no `mediatype` — the image
+/// renders but the "open-once" UI never kicks in. Recurse into the known
+/// envelopes (viewOnceMessage=37, viewOnceMessageV2=55, ext=59, ephemeral=40,
+/// documentWithCaption=53) and pull the media type from the leaf.
+///
+/// Returns `(stanza_type, media_type_or_empty)`.
+pub fn classify_stanza(wa_bytes: &[u8]) -> (&'static str, &'static str) {
+    fn leaf_media(bytes: &[u8]) -> &'static str {
+        let f = match parse_proto_fields(bytes) { Some(f) => f, None => return "" };
+        // Unwrap envelopes (FutureProofMessage.field 1 = inner Message).
+        for &env in &[37u64, 55, 59, 40, 53] {
+            if let Some(fp) = f.get(&env) {
+                if let Some(fp_fields) = parse_proto_fields(fp) {
+                    if let Some(inner) = fp_fields.get(&1) {
+                        return leaf_media(inner);
+                    }
+                }
+            }
+        }
+        // DSM (deviceSentMessage) = 31 { destinationJid=1, message=2 }
+        if let Some(dsm) = f.get(&31) {
+            if let Some(df) = parse_proto_fields(dsm) {
+                if let Some(inner) = df.get(&2) { return leaf_media(inner); }
+            }
+        }
+        // Canonical media field numbers.
+        if f.contains_key(&3)  { return "image"; }
+        if f.contains_key(&9)  { return "video"; }
+        if f.contains_key(&8)  {
+            // AudioMessage.ptt = field 6 (bool) → "ptt", else "audio".
+            if let Some(audio) = f.get(&8) {
+                if let Some(af) = parse_proto_fields(audio) {
+                    if af.get(&6).map(|b| !b.is_empty() && b[0] != 0).unwrap_or(false) {
+                        return "ptt";
+                    }
+                }
+            }
+            return "audio";
+        }
+        if f.contains_key(&7)  { return "document"; }
+        if f.contains_key(&26) { return "sticker"; }
+        ""
+    }
+    let media = leaf_media(wa_bytes);
+    let stanza = if !media.is_empty() { "media" } else { "text" };
+    (stanza, media)
+}
+
 // ── WAProto.Message decode ────────────────────────────────────────────────────
 
 /// Extract the best text representation from a decrypted WAProto.Message blob.
