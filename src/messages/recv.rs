@@ -242,6 +242,11 @@ impl MessageManager {
         // (actual text). Decrypt the pkmsg first so the SKDM registers the
         // sender key, then fall through to the skmsg for the content.
         let all_enc = extract_all_enc(node);
+        debug!(
+            "recv msg {id} from={from} participant={:?} enc_types={:?}",
+            participant,
+            all_enc.iter().map(|(b, t)| format!("{t}({}B)", b.len())).collect::<Vec<_>>(),
+        );
         let has_skmsg = all_enc.iter().any(|(_, t)| t == "skmsg");
         if from.ends_with("@g.us") && has_skmsg {
             for (bytes, t) in &all_enc {
@@ -268,18 +273,17 @@ impl MessageManager {
                     let failed = matches!(&r, Some(DecodedPayload::Message(
                         MessageContent::Text { text, .. })) if text == "<skmsg decrypt failed>");
                     if failed && !is_offline_replay {
-                        // Retry-receipt only, one attempt per msg id. PDO
-                        // placeholder-resend (Baileys' second recovery lane)
-                        // works — phone acks peer_msg — but the response
-                        // triggers a Double-Ratchet bidirectional path whose
-                        // MAC we still can't verify, and spamming PDOs got our
-                        // device dropped from routing once. Groups will
-                        // recover naturally when the sender rotates the sender
-                        // key (member add/remove, admin change).
+                        // Two-lane recovery (matches Baileys `sendRetryRequest`):
+                        //  1. retry-receipt to the group → sender redistributes
+                        //     SKDM on their next send.
+                        //  2. PlaceholderMessageResend peer-msg to our own
+                        //     primary phone → phone re-delivers the missed
+                        //     message with a fresh SKDM bundled, fixing this
+                        //     msg immediately without waiting for the sender.
                         let already = self.retry_ids.lock().unwrap().contains(&id);
                         if !already {
                             self.retry_ids.lock().unwrap().insert(id.clone());
-                            debug!("skmsg recovery: id={id} from={from} — retry-receipt");
+                            debug!("skmsg recovery: id={id} from={from} — retry + PDO");
                             send_retry_receipt_inner(
                                 &self.socket, node, &from, &id, t,
                                 self.signal.registration_id(),
@@ -289,6 +293,17 @@ impl MessageManager {
                                 self.signal.account_identity_bytes(),
                                 true,
                             ).await;
+                            let socket = self.socket.clone();
+                            let signal = self.signal.clone();
+                            let our_jid = self.our_jid.clone();
+                            let pdo_key = key.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::messages::send::placeholder_resend_send(
+                                    socket, signal, our_jid, pdo_key,
+                                ).await {
+                                    tracing::debug!("PDO send failed: {e}");
+                                }
+                            });
                         }
                     }
                     r
@@ -924,7 +939,12 @@ async fn send_retry_receipt_inner(
         BinaryNode {
             tag: "retry".to_string(),
             attrs: vec![
-                ("count".to_string(), "1".to_string()),
+                // Baileys uses `count > 1` as the trigger to recreate the
+                // session / clear sender-key-memory and re-ship SKDM. The
+                // official WA client follows the same heuristic; count=1 is
+                // treated as "session probably still good" and doesn't
+                // redistribute, which leaves group skmsg undecryptable.
+                ("count".to_string(), "2".to_string()),
                 ("id".to_string(), msg_id.to_string()),
                 ("t".to_string(), t.to_string()),
                 ("v".to_string(), "1".to_string()),
@@ -946,6 +966,14 @@ async fn send_retry_receipt_inner(
         attrs,
         content: NodeContent::List(children),
     };
+    tracing::info!(
+        "→ retry-receipt to={to} id={msg_id} include_keys={include_keys} children={:?} attrs={:?}",
+        match &node.content {
+            NodeContent::List(c) => c.iter().map(|n| n.tag.as_str()).collect::<Vec<_>>(),
+            _ => vec![],
+        },
+        node.attrs,
+    );
     if let Err(e) = socket.send_node(&node).await {
         tracing::debug!("retry receipt failed: {e}");
     }
