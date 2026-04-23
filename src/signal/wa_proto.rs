@@ -346,42 +346,23 @@ pub fn encode_wa_buttons_message(
     footer: Option<&str>,
     buttons: &[(&str, &str)],
 ) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend(proto_bytes(1, text.as_bytes()));
-    body.extend(proto_bytes(6, text.as_bytes()));
-    if let Some(f) = footer {
-        if !f.is_empty() { body.extend(proto_bytes(7, f.as_bytes())); }
-    }
-    for (id, label) in buttons {
-        let mut btn = Vec::new();
-        btn.extend(proto_bytes(1, id.as_bytes()));
-        let bt = proto_bytes(1, label.as_bytes());
-        btn.extend(proto_message(2, &bt));
-        btn.extend(proto_varint(3, 1));
-        body.extend(proto_message(9, &btn));
-    }
-    body.extend(proto_varint(10, 2));
-
-    // Consumer WA drops the whole Message when the only recognized payload
-    // is ButtonsMessage (field 42) — it renders nothing, not even the
-    // fallback text. Pair a Message.conversation (field 1 = string) sibling
-    // with the button options inlined as bullets so consumer accounts at
-    // least see a readable message; Business accounts still see the pills.
-    let mut fallback = String::from(text);
+    // Consumer WA silently drops any Message whose payload is a raw
+    // ButtonsMessage (field 42) — the server filters it before fan-out,
+    // so neither the pills nor a fallback ever reach the recipient.
+    // Real inline buttons require a Business API account + approved
+    // template. For everyone else, render as plain text with bullets so
+    // bots still work (they match on the typed reply text, not a buttonId).
+    let mut body = String::from(text);
     if !buttons.is_empty() {
-        fallback.push_str("\n");
+        body.push('\n');
         for (_, label) in buttons {
-            fallback.push_str(&format!("\n• {label}"));
+            body.push_str(&format!("\n• {label}"));
         }
     }
     if let Some(f) = footer {
-        if !f.is_empty() { fallback.push_str(&format!("\n\n{f}")); }
+        if !f.is_empty() { body.push_str(&format!("\n\n{f}")); }
     }
-
-    let mut outer = Vec::new();
-    outer.extend(proto_bytes(1, fallback.as_bytes()));
-    outer.extend(proto_message(42, &body));
-    outer
+    encode_wa_text_message(&body)
 }
 
 /// Encode WAProto.Message.listMessage = field 36.
@@ -422,9 +403,10 @@ pub fn encode_wa_list_message(
     if let Some(f) = footer {
         if !f.is_empty() { body.extend(proto_bytes(7, f.as_bytes())); }
     }
-    // Same consumer-WA fallback as ButtonsMessage: pair the list entries
-    // as plain-text bullets under a Message.conversation sibling so accounts
-    // without list rendering still see the options.
+    // Same consumer-WA behavior as ButtonsMessage — the server drops raw
+    // ListMessage for non-Business accounts. Render as a formatted text
+    // with section headings + bullet rows so every client sees it.
+    let _ = body; // (consumer path ignores the ListMessage bytes)
     let mut fallback = format!("*{title}*\n{description}");
     for (sec_title, rows) in sections {
         if !sec_title.is_empty() { fallback.push_str(&format!("\n\n_{sec_title}_")); }
@@ -434,14 +416,11 @@ pub fn encode_wa_list_message(
             fallback.push_str(&format!("\n• {}{desc_part}", row.title));
         }
     }
+    let _ = button_text; // not used for consumer rendering
     if let Some(f) = footer {
         if !f.is_empty() { fallback.push_str(&format!("\n\n{f}")); }
     }
-
-    let mut outer = Vec::new();
-    outer.extend(proto_bytes(1, fallback.as_bytes()));
-    outer.extend(proto_message(36, &body));
-    outer
+    encode_wa_text_message(&fallback)
 }
 
 /// One entry inside a ListMessage section.
