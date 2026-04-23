@@ -982,6 +982,12 @@ impl Session {
         self.mgr.read().await.send_audio(jid, data, mimetype).await
     }
 
+    /// Voice note (push-to-talk): audio with the `ptt` flag set so peer
+    /// clients show the waveform/play-bar UI.
+    pub async fn send_voice_note(&self, jid: &str, data: &[u8], mimetype: &str) -> Result<String> {
+        self.mgr.read().await.send_voice_note(jid, data, mimetype).await
+    }
+
     pub async fn send_document(
         &self, jid: &str, data: &[u8], mimetype: &str, file_name: &str,
     ) -> Result<String> {
@@ -1408,6 +1414,10 @@ impl<'a> Chat<'a> {
         self.session.send_audio(&self.jid, data, mimetype).await
     }
 
+    pub async fn voice_note(&self, data: &[u8], mimetype: &str) -> Result<String> {
+        self.session.send_voice_note(&self.jid, data, mimetype).await
+    }
+
     pub async fn document(&self, data: &[u8], mimetype: &str, file_name: &str) -> Result<String> {
         self.session.send_document(&self.jid, data, mimetype, file_name).await
     }
@@ -1550,6 +1560,33 @@ impl<'a> Chat<'a> {
                 }
             }
         })
+    }
+
+    /// Send a question and wait for the peer's text reply. Sugar for
+    /// bots: pre-arms the reply listener *before* sending to avoid the
+    /// race where a fast answer lands before we subscribe, then drops
+    /// anything that's not plain text (reactions, delivery receipts,
+    /// decrypt-failed placeholders).
+    ///
+    /// Returns the reply text on success, `None` on timeout.
+    pub async fn ask(
+        &self,
+        question: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<String>> {
+        let waiter = self.listen_for_reply(timeout);
+        self.text(question).await?;
+        let msg = match waiter.await.ok().flatten() {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let text = match &msg.message {
+            Some(crate::messages::MessageContent::Text { text, .. }) => Some(text.clone()),
+            Some(crate::messages::MessageContent::Reply { text, .. }) => Some(text.clone()),
+            Some(crate::messages::MessageContent::LinkPreview { text, .. }) => Some(text.clone()),
+            _ => None,
+        };
+        Ok(text)
     }
 
     /// Block until the next incoming (non-self) message in this chat, or

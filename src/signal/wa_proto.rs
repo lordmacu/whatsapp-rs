@@ -117,8 +117,8 @@ pub fn encode_wa_video_message(info: &crate::messages::MediaInfo, caption: Optio
     proto_message(9, &encode_video_fields(info, caption))
 }
 
-pub fn encode_wa_audio_message(info: &crate::messages::MediaInfo) -> Vec<u8> {
-    proto_message(8, &encode_audio_fields(info, /*ptt*/ false))
+pub fn encode_wa_audio_message(info: &crate::messages::MediaInfo, ptt: bool) -> Vec<u8> {
+    proto_message(8, &encode_audio_fields(info, ptt))
 }
 
 pub fn encode_wa_document_message(info: &crate::messages::MediaInfo, file_name: &str) -> Vec<u8> {
@@ -1356,7 +1356,10 @@ fn parse_web_message_info_inner(data: &[u8], allow_missing_remote_jid: bool) -> 
 
         // AudioMessage = field 8 (canonical) / legacy 5.
         if let Some(info) = mf.get(&8).or_else(|| mf.get(&5)).and_then(|b| parse_media_info(b)) {
-            return Some(crate::messages::MessageContent::Audio { info });
+            // ptt flag lives inside the AudioMessage sub-proto at field 6 —
+            // we don't decode it yet; default false so render picks the
+            // normal audio-file UI.
+            return Some(crate::messages::MessageContent::Audio { info, ptt: false });
         }
 
         // DocumentMessage = field 7 (canonical) / legacy 4.

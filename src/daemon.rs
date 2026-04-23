@@ -271,7 +271,7 @@ fn event_to_json(session: &Session, ev: &MessageEvent) -> Option<serde_json::Val
                     serde_json::json!({"type": "image", "caption": caption, "media": info}),
                 MessageContent::Video { info, caption } =>
                     serde_json::json!({"type": "video", "caption": caption, "media": info}),
-                MessageContent::Audio { info } =>
+                MessageContent::Audio { info, .. } =>
                     serde_json::json!({"type": "audio", "media": info}),
                 MessageContent::Document { info, file_name } =>
                     serde_json::json!({"type": "document", "file_name": file_name, "media": info}),

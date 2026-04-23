@@ -1105,12 +1105,12 @@ fn decode_plaintext(data: &[u8]) -> DecodedPayload {
         let content = match field {
             3  => MessageContent::Image { info, caption: m.caption },
             7  => MessageContent::Document { info, file_name: m.file_name.unwrap_or_default() },
-            8  => MessageContent::Audio { info },
+            8  => MessageContent::Audio { info, ptt: false },
             9  => MessageContent::Video { info, caption: m.caption },
             26 => MessageContent::Sticker { info },
             // legacy fallbacks
             4  => MessageContent::Document { info, file_name: m.file_name.unwrap_or_default() },
-            5  => MessageContent::Audio { info },
+            5  => MessageContent::Audio { info, ptt: false },
             6  => MessageContent::Video { info, caption: m.caption },
             20 => MessageContent::Sticker { info },
             _  => MessageContent::Image { info, caption: m.caption },

@@ -46,7 +46,7 @@ impl StoredMessage {
         let media_info = match &msg.message {
             Some(MessageContent::Image { info, .. })    => Some(info.clone()),
             Some(MessageContent::Video { info, .. })    => Some(info.clone()),
-            Some(MessageContent::Audio { info })        => Some(info.clone()),
+            Some(MessageContent::Audio { info, .. })    => Some(info.clone()),
             Some(MessageContent::Document { info, .. }) => Some(info.clone()),
             Some(MessageContent::Sticker { info })      => Some(info.clone()),
             _ => None,

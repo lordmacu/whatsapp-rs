@@ -61,7 +61,7 @@ fn build_quoted_body(stored: Option<&crate::message_store::StoredMessage>) -> Ve
     match (m.media_type.as_deref(), m.media_info.as_ref()) {
         (Some("image"), Some(info))    => encode_wa_image_message(info, m.text.as_deref()),
         (Some("video"), Some(info))    => encode_wa_video_message(info, m.text.as_deref()),
-        (Some("audio"), Some(info))    => encode_wa_audio_message(info),
+        (Some("audio"), Some(info))    => encode_wa_audio_message(info, /*ptt*/ false),
         (Some("document"), Some(info)) => {
             // file_name lives in StoredMessage.text for documents in our schema;
             // fall back to a generic placeholder if missing.
@@ -760,7 +760,7 @@ impl MessageManager {
                 encode_wa_image_message(info, caption.as_deref()),
             Some(MessageContent::Video { info, caption }) =>
                 encode_wa_video_message(info, caption.as_deref()),
-            Some(MessageContent::Audio { info }) => encode_wa_audio_message(info),
+            Some(MessageContent::Audio { info, ptt }) => encode_wa_audio_message(info, *ptt),
             Some(MessageContent::Document { info, file_name }) =>
                 encode_wa_document_message(info, file_name),
             Some(MessageContent::Sticker { info }) => encode_wa_sticker_message(info),
@@ -1030,7 +1030,17 @@ impl MessageManager {
     pub async fn send_audio(&self, jid: &str, data: &[u8], mimetype: &str) -> Result<String> {
         let info = self.upload_media(data, crate::media::MediaType::Audio, mimetype).await?;
         let id = generate_message_id();
-        self.send_message(jid, id.clone(), MessageContent::Audio { info }).await?;
+        self.send_message(jid, id.clone(), MessageContent::Audio { info, ptt: false }).await?;
+        Ok(id)
+    }
+
+    /// Send a WhatsApp voice note (push-to-talk). Same wire format as a
+    /// regular audio message but with `ptt=1` so peer clients render the
+    /// play bar UI instead of a music-file row.
+    pub async fn send_voice_note(&self, jid: &str, data: &[u8], mimetype: &str) -> Result<String> {
+        let info = self.upload_media(data, crate::media::MediaType::Audio, mimetype).await?;
+        let id = generate_message_id();
+        self.send_message(jid, id.clone(), MessageContent::Audio { info, ptt: true }).await?;
         Ok(id)
     }
 

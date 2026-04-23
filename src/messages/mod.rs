@@ -61,7 +61,7 @@ pub enum MessageContent {
     },
     Image { info: MediaInfo, caption: Option<String> },
     Video { info: MediaInfo, caption: Option<String> },
-    Audio { info: MediaInfo },
+    Audio { info: MediaInfo, #[serde(default)] ptt: bool },
     Document { info: MediaInfo, file_name: String },
     Sticker { info: MediaInfo },
     Reaction { target_id: String, emoji: String },
