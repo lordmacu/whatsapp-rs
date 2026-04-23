@@ -802,6 +802,27 @@ impl MessageManager {
     /// Groups (`@g.us`): fetches participants, distributes SenderKey, encrypts as skmsg.
     /// 1:1: establishes Signal session if needed, encrypts as msg/pkmsg.
     async fn send_encrypted_bytes(&self, jid: &str, id: &str, wa_bytes: Vec<u8>) -> Result<()> {
+        // Normalize the target jid: for 1:1 sends, if the caller passed an
+        // `@lid` address and we've learned the `@s.whatsapp.net` alias,
+        // route through PN instead. Sending via LID while an established
+        // PN session exists creates a parallel LID-keyed session whose
+        // ratchet state diverges from the peer's expectations — every
+        // subsequent incoming from that peer then MAC-fails.
+        let jid_owned: String;
+        let jid: &str = if jid.ends_with("@lid") && !jid.ends_with("@g.us") {
+            let bare = bare_user_jid(jid);
+            match self.signal.alias_of(&bare) {
+                Some(pn) => {
+                    tracing::info!("send: routing {jid} → {pn} via learned LID↔PN alias");
+                    jid_owned = pn;
+                    &jid_owned
+                }
+                None => jid,
+            }
+        } else {
+            jid
+        };
+
         // Do NOT pad `wa_bytes` here — padding must be applied to the
         // *outermost* Message bytes handed to encrypt. For DSM (own-device
         // copy) the outer Message is `deviceSentMessage{destinationJid,message}`
