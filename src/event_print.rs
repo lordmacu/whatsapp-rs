@@ -31,6 +31,11 @@ fn summarize_message(message: Option<&MessageContent>) -> Option<String> {
             Some(format!("poll: {question} — {}", options.join(" / ")))
         }
         MessageContent::LinkPreview { text, url, .. } => Some(format!("{text}  [{url}]")),
+        MessageContent::Location { latitude, longitude, name, .. } => Some(format!(
+            "<location: {latitude:.5},{longitude:.5}{}>",
+            name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
+        )),
+        MessageContent::Contact { display_name, .. } => Some(format!("<contact: {display_name}>")),
     }
 }
 
@@ -109,6 +114,15 @@ pub async fn print_event(session: &Session, event: MessageEvent) {
                 }
                 Some(MessageContent::LinkPreview { text, url, .. }) => {
                     println!("{prefix} {text}  [{url}]");
+                    let _ = session.mark_read(&[msg.key]).await;
+                }
+                Some(MessageContent::Location { latitude, longitude, name, .. }) => {
+                    println!("{prefix} <location {latitude:.5},{longitude:.5}{}>",
+                        name.as_deref().map(|n| format!(" {n}")).unwrap_or_default());
+                    let _ = session.mark_read(&[msg.key]).await;
+                }
+                Some(MessageContent::Contact { display_name, .. }) => {
+                    println!("{prefix} <contact: {display_name}>");
                     let _ = session.mark_read(&[msg.key]).await;
                 }
                 None => {}

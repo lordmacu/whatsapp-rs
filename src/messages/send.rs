@@ -295,6 +295,31 @@ impl MessageManager {
         Ok(id)
     }
 
+    pub async fn send_location(
+        &self, jid: &str,
+        latitude: f64, longitude: f64,
+        name: Option<&str>, address: Option<&str>,
+    ) -> Result<String> {
+        let id = generate_message_id();
+        self.send_message(jid, id.clone(), MessageContent::Location {
+            latitude, longitude,
+            name: name.map(String::from),
+            address: address.map(String::from),
+        }).await?;
+        Ok(id)
+    }
+
+    pub async fn send_contact(
+        &self, jid: &str, display_name: &str, vcard: &str,
+    ) -> Result<String> {
+        let id = generate_message_id();
+        self.send_message(jid, id.clone(), MessageContent::Contact {
+            display_name: display_name.to_string(),
+            vcard: vcard.to_string(),
+        }).await?;
+        Ok(id)
+    }
+
     pub async fn send_reaction(&self, jid: &str, target_id: &str, emoji: &str) -> Result<()> {
         let id = generate_message_id();
         self.send_message(jid, id, MessageContent::Reaction {
@@ -792,6 +817,12 @@ impl MessageManager {
             }
             Some(MessageContent::LinkPreview { text, url, title, description, thumbnail_jpeg }) =>
                 encode_wa_link_preview_message(text, url, title, description, thumbnail_jpeg.as_deref()),
+            Some(MessageContent::Location { latitude, longitude, name, address }) =>
+                crate::signal::wa_proto::encode_wa_location_message(
+                    *latitude, *longitude, name.as_deref(), address.as_deref(),
+                ),
+            Some(MessageContent::Contact { display_name, vcard }) =>
+                crate::signal::wa_proto::encode_wa_contact_message(display_name, vcard),
             None => anyhow::bail!("send_message called with no content"),
         };
         Ok(bytes)

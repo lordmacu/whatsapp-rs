@@ -31,6 +31,8 @@ Commands:
   send-file <jid> <path> [caption]      Send an image/video/audio/document from disk and exit
   sticker <jid> <path>                  Send a sticker from disk and exit
   send-voice <jid> <path.ogg>           Send a push-to-talk voice note (Opus/OGG recommended)
+  send-location <jid> <lat> <lon> [name] [address]   Share a location pin
+  send-contact <jid> <display-name> <phone-E164>     Share a contact card
   download <jid> <msg-id> [path]        Download received media to a file (default: ./<msg-id>)
   reply <jid> <msg-id> <text>           Reply to a specific message and exit
   react <jid> <msg-id> <emoji>          Send a reaction and exit
@@ -129,6 +131,22 @@ async fn main() -> Result<()> {
                 bail!("Usage: whatsapp-rs send-voice <jid> <path.ogg>  (Opus-in-OGG recommended)");
             }
             cmd_send_voice(&args[1], &args[2]).await
+        }
+        "send-location" => {
+            if args.len() < 4 {
+                bail!("Usage: whatsapp-rs send-location <jid> <lat> <lon> [name] [address]");
+            }
+            let lat: f64 = args[2].parse()?;
+            let lon: f64 = args[3].parse()?;
+            let name = args.get(4).map(|s| s.as_str());
+            let address = args.get(5).map(|s| s.as_str());
+            cmd_send_location(&args[1], lat, lon, name, address).await
+        }
+        "send-contact" => {
+            if args.len() < 4 {
+                bail!("Usage: whatsapp-rs send-contact <jid> <display-name> <phone-E164>");
+            }
+            cmd_send_contact(&args[1], &args[2], &args[3]).await
         }
         "download" => {
             if args.len() < 3 {
@@ -589,6 +607,44 @@ fn mime_for_ext(ext: &str) -> &'static str {
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         _      => "application/octet-stream",
     }
+}
+
+async fn cmd_send_location(
+    jid: &str, lat: f64, lon: f64,
+    name: Option<&str>, address: Option<&str>,
+) -> Result<()> {
+    let req = daemon::Request::SendLocation {
+        jid: jid.to_string(), latitude: lat, longitude: lon,
+        name: name.map(String::from), address: address.map(String::from),
+    };
+    if let Some(v) = daemon::try_daemon_request(req).await? {
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        println!("sent: {id}");
+        return Ok(());
+    }
+    let client = client::Client::new()?;
+    let session = client.connect().await?;
+    let id = session.send_location(jid, lat, lon, name, address).await?;
+    println!("sent: {id}");
+    Ok(())
+}
+
+async fn cmd_send_contact(jid: &str, display_name: &str, phone_e164: &str) -> Result<()> {
+    let req = daemon::Request::SendContact {
+        jid: jid.to_string(),
+        display_name: display_name.to_string(),
+        phone_e164: phone_e164.to_string(),
+    };
+    if let Some(v) = daemon::try_daemon_request(req).await? {
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        println!("sent: {id}");
+        return Ok(());
+    }
+    let client = client::Client::new()?;
+    let session = client.connect().await?;
+    let id = session.send_contact(jid, display_name, phone_e164).await?;
+    println!("sent: {id}");
+    Ok(())
 }
 
 async fn cmd_send_voice(jid: &str, path: &str) -> Result<()> {

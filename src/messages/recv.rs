@@ -89,6 +89,11 @@ fn summarize_message(message: Option<&MessageContent>) -> Option<String> {
             Some(format!("poll: {question} — {}", options.join(" / ")))
         }
         MessageContent::LinkPreview { text, url, .. } => Some(format!("{text}  [{url}]")),
+        MessageContent::Location { latitude, longitude, name, .. } => Some(format!(
+            "<location: {latitude:.5},{longitude:.5}{}>",
+            name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
+        )),
+        MessageContent::Contact { display_name, .. } => Some(format!("<contact: {display_name}>")),
     }
 }
 
@@ -1118,6 +1123,32 @@ fn decode_plaintext(data: &[u8]) -> DecodedPayload {
         return DecodedPayload::Message(content);
     }
 
+    // Location / Contact — inspect the outer Message fields directly.
+    if let Some(outer) = wa_proto::parse_proto_fields(data) {
+        if let Some(loc) = outer.get(&5).and_then(|b| wa_proto::parse_proto_fields(b)) {
+            let read_f64 = |k: u64| -> Option<f64> {
+                let b = loc.get(&k)?;
+                if b.len() == 8 {
+                    Some(f64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]))
+                } else { None }
+            };
+            if let (Some(lat), Some(lon)) = (read_f64(1), read_f64(2)) {
+                let name = loc.get(&3).and_then(|b| String::from_utf8(b.clone()).ok());
+                let address = loc.get(&4).and_then(|b| String::from_utf8(b.clone()).ok());
+                return DecodedPayload::Message(MessageContent::Location {
+                    latitude: lat, longitude: lon, name, address,
+                });
+            }
+        }
+        if let Some(c) = outer.get(&4).and_then(|b| wa_proto::parse_proto_fields(b)) {
+            let display_name = c.get(&1).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+            let vcard = c.get(&16).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+            if !display_name.is_empty() || !vcard.is_empty() {
+                return DecodedPayload::Message(MessageContent::Contact { display_name, vcard });
+            }
+        }
+    }
+
     // Text (+ mentionedJid from contextInfo)
     if let Some((text, mentioned_jids)) = wa_proto::decode_wa_text_full(data) {
         return DecodedPayload::Message(MessageContent::Text { text, mentioned_jids });
@@ -1468,7 +1499,7 @@ fn build_candidate_jids(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     seen.insert(primary.to_string());
 
-    let mut add = |jid: String, acc: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+    let add = |jid: String, acc: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
         if seen.insert(jid.clone()) {
             acc.push(jid);
         }

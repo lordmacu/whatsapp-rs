@@ -129,6 +129,38 @@ pub fn encode_wa_sticker_message(info: &crate::messages::MediaInfo) -> Vec<u8> {
     proto_message(26, &encode_sticker_fields(info))
 }
 
+/// WAProto Message.locationMessage = field 5.
+/// LocationMessage: 1=lat, 2=lon, 3=name, 4=address, 5=url, 17=contextInfo.
+pub fn encode_wa_location_message(
+    lat: f64,
+    lon: f64,
+    name: Option<&str>,
+    address: Option<&str>,
+) -> Vec<u8> {
+    let mut loc = Vec::new();
+    loc.extend(proto_double(1, lat));
+    loc.extend(proto_double(2, lon));
+    if let Some(n) = name {
+        if !n.is_empty() { loc.extend(proto_bytes(3, n.as_bytes())); }
+    }
+    if let Some(a) = address {
+        if !a.is_empty() { loc.extend(proto_bytes(4, a.as_bytes())); }
+    }
+    proto_message(5, &loc)
+}
+
+/// WAProto Message.contactMessage = field 4.
+/// ContactMessage: 1=displayName, 16=vcard.
+///
+/// `vcard` must be a complete vCard 3.0 string (BEGIN:VCARD … END:VCARD).
+/// Peer clients render the "Add contact" button off this payload.
+pub fn encode_wa_contact_message(display_name: &str, vcard: &str) -> Vec<u8> {
+    let mut c = Vec::new();
+    c.extend(proto_bytes(1, display_name.as_bytes()));
+    c.extend(proto_bytes(16, vcard.as_bytes()));
+    proto_message(4, &c)
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -829,6 +861,14 @@ pub fn proto_varint(field: u64, value: u64) -> Vec<u8> {
     out
 }
 
+/// Encode a protobuf `double` (wire type 1, fixed64, IEEE 754 little-endian).
+pub fn proto_double(field: u64, value: f64) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_varint(&mut out, (field << 3) | 1);
+    out.extend_from_slice(&value.to_le_bytes());
+    out
+}
+
 /// Write `data` as a length-prefixed blob into `buf` (no field tag).
 pub fn write_proto_bytes_into(buf: &mut Vec<u8>, data: &[u8]) {
     write_varint(buf, data.len() as u64);
@@ -1374,6 +1414,31 @@ fn parse_web_message_info_inner(data: &[u8], allow_missing_remote_jid: bool) -> 
         // StickerMessage = field 26 (canonical) / legacy 20.
         if let Some(info) = mf.get(&26).or_else(|| mf.get(&20)).and_then(|b| parse_media_info(b)) {
             return Some(crate::messages::MessageContent::Sticker { info });
+        }
+
+        // LocationMessage = field 5. Canonical layout:
+        //   1 = latitude (double)  2 = longitude (double)  3 = name  4 = address.
+        if let Some(loc) = mf.get(&5).and_then(|b| parse_proto_fields(b)) {
+            let read_f64 = |k: u64| -> Option<f64> {
+                let b = loc.get(&k)?;
+                if b.len() == 8 { Some(f64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]])) } else { None }
+            };
+            if let (Some(lat), Some(lon)) = (read_f64(1), read_f64(2)) {
+                let name = loc.get(&3).and_then(|b| String::from_utf8(b.clone()).ok());
+                let address = loc.get(&4).and_then(|b| String::from_utf8(b.clone()).ok());
+                return Some(crate::messages::MessageContent::Location {
+                    latitude: lat, longitude: lon, name, address,
+                });
+            }
+        }
+
+        // ContactMessage = field 4: 1 = displayName, 16 = vcard.
+        if let Some(c) = mf.get(&4).and_then(|b| parse_proto_fields(b)) {
+            let display_name = c.get(&1).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+            let vcard = c.get(&16).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+            if !display_name.is_empty() || !vcard.is_empty() {
+                return Some(crate::messages::MessageContent::Contact { display_name, vcard });
+            }
         }
 
         None

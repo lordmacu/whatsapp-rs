@@ -48,6 +48,8 @@ pub enum Request {
     SendAudio { jid: String, data_b64: String, mimetype: String },
     SendVoiceNote { jid: String, data_b64: String, mimetype: String },
     SendDocument { jid: String, data_b64: String, mimetype: String, file_name: String },
+    SendLocation { jid: String, latitude: f64, longitude: f64, name: Option<String>, address: Option<String> },
+    SendContact { jid: String, display_name: String, phone_e164: String },
     Shutdown,
 }
 
@@ -286,6 +288,10 @@ fn event_to_json(session: &Session, ev: &MessageEvent) -> Option<serde_json::Val
                     serde_json::json!({"type": "poll", "question": question, "options": options, "selectable_count": selectable_count}),
                 MessageContent::LinkPreview { text, url, title, description, .. } =>
                     serde_json::json!({"type": "link_preview", "text": text, "url": url, "title": title, "description": description}),
+                MessageContent::Location { latitude, longitude, name, address } =>
+                    serde_json::json!({"type": "location", "lat": latitude, "lon": longitude, "name": name, "address": address}),
+                MessageContent::Contact { display_name, vcard } =>
+                    serde_json::json!({"type": "contact", "display_name": display_name, "vcard": vcard}),
             });
             Some(serde_json::json!({
                 "event": "message",
@@ -407,6 +413,18 @@ async fn dispatch(
                 Err(e) => return Response::Err { error: format!("bad base64: {e}") },
             };
             match session.send_voice_note(&jid, &data, &mimetype).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendLocation { jid, latitude, longitude, name, address } => {
+            match session.send_location(&jid, latitude, longitude, name.as_deref(), address.as_deref()).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendContact { jid, display_name, phone_e164 } => {
+            match session.send_contact(&jid, &display_name, &phone_e164).await {
                 Ok(id) => Response::Ok(serde_json::json!({"id": id})),
                 Err(e) => Response::Err { error: e.to_string() },
             }

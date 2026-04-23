@@ -1008,6 +1008,32 @@ impl Session {
         self.mgr.read().await.send_poll(jid, question, options, selectable_count).await
     }
 
+    pub async fn send_location(
+        &self, jid: &str,
+        latitude: f64, longitude: f64,
+        name: Option<&str>, address: Option<&str>,
+    ) -> Result<String> {
+        self.mgr.read().await.send_location(jid, latitude, longitude, name, address).await
+    }
+
+    /// Send a contact card built from a name + E.164 phone (e.g.
+    /// `+573001234567`). Generates a minimal vCard automatically.
+    pub async fn send_contact(
+        &self, jid: &str, display_name: &str, phone_e164: &str,
+    ) -> Result<String> {
+        let vcard = crate::messages::MessageContent::contact_vcard(display_name, phone_e164);
+        self.mgr.read().await.send_contact(jid, display_name, &vcard).await
+    }
+
+    /// Send a contact card with a pre-built vCard string. Use when you
+    /// need something richer than the single-phone helper
+    /// ([`Self::send_contact`]) — multiple TEL lines, email, address, etc.
+    pub async fn send_contact_vcard(
+        &self, jid: &str, display_name: &str, vcard: &str,
+    ) -> Result<String> {
+        self.mgr.read().await.send_contact(jid, display_name, vcard).await
+    }
+
     pub async fn send_link_preview(
         &self,
         jid: &str,
@@ -1434,6 +1460,18 @@ impl<'a> Chat<'a> {
 
     pub async fn poll_vote(&self, poll_msg_id: &str, selected: &[&str]) -> Result<()> {
         self.session.send_poll_vote(&self.jid, poll_msg_id, selected).await
+    }
+
+    pub async fn location(
+        &self,
+        latitude: f64, longitude: f64,
+        name: Option<&str>, address: Option<&str>,
+    ) -> Result<String> {
+        self.session.send_location(&self.jid, latitude, longitude, name, address).await
+    }
+
+    pub async fn contact(&self, display_name: &str, phone_e164: &str) -> Result<String> {
+        self.session.send_contact(&self.jid, display_name, phone_e164).await
     }
 
     pub async fn link_preview(

@@ -74,6 +74,33 @@ pub enum MessageContent {
         description: String,
         thumbnail_jpeg: Option<Vec<u8>>,
     },
+    Location {
+        latitude: f64,
+        longitude: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+    },
+    Contact {
+        display_name: String,
+        /// Full vCard 3.0 payload. Use [`MessageContent::contact_vcard`]
+        /// to build a minimal one from name + phone.
+        vcard: String,
+    },
+}
+
+impl MessageContent {
+    /// Build a minimal vCard 3.0 from a display name + E.164 phone number.
+    /// Convenience for `MessageContent::Contact`.
+    pub fn contact_vcard(name: &str, phone_e164: &str) -> String {
+        // WA expects the TEL line tagged `waid=<digits>` so it hyperlinks
+        // the entry in the receiver's Contacts UI.
+        let digits: String = phone_e164.chars().filter(|c| c.is_ascii_digit()).collect();
+        format!(
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:{name}\r\nTEL;type=CELL;type=VOICE;waid={digits}:{phone_e164}\r\nEND:VCARD"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
