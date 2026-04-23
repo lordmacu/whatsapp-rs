@@ -961,12 +961,14 @@ impl MessageManager {
         mimetype: &str,
     ) -> Result<crate::messages::MediaInfo> {
         use crate::media::{encrypt_media_blob};
-        use crate::socket::media_upload::{request_upload_url, upload_to_cdn};
+        use crate::socket::media_upload::request_upload_url;
 
         let (blob, media_key, enc_sha256, sha256) = encrypt_media_blob(plaintext, media_type)?;
         let size = blob.len() as u64;
-        let up = request_upload_url(&self.socket, &enc_sha256, media_type, size).await?;
-        upload_to_cdn(&up.url, &blob).await?;
+        // New flow: `request_upload_url` fetches media_conn hosts + auth,
+        // POSTs the encrypted blob, and returns url + direct_path from the
+        // JSON response. The legacy `mms-url-fetch` IQ is gone.
+        let up = request_upload_url(&self.socket, &enc_sha256, media_type, size, &blob).await?;
 
         Ok(crate::messages::MediaInfo {
             url: up.url,
