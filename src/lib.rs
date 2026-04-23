@@ -18,6 +18,7 @@ pub mod poll_store;
 pub mod qr;
 pub mod signal;
 pub mod socket;
+pub mod webhook;
 
 pub use client::{Chat, Client, Session};
 pub use error::{Result as WaResult, WaError};

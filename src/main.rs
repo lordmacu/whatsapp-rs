@@ -18,6 +18,7 @@ mod poll_store;
 mod qr;
 mod signal;
 mod socket;
+mod webhook;
 
 use anyhow::{bail, Result};
 use messages::{MessageContent, MessageEvent};
