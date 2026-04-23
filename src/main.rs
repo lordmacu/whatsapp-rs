@@ -2,6 +2,7 @@ mod agent;
 mod app_state;
 mod auth;
 mod binary;
+mod chat_state;
 mod client;
 mod contacts;
 mod daemon;
