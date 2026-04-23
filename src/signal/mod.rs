@@ -162,10 +162,49 @@ impl SignalRepository {
     /// Record a LID↔PN equivalence so session lookups can fall back across
     /// addressings. Bidirectional — inserts both directions. Keyed by bare
     /// user jid (no `:device` slot).
+    ///
+    /// Also drops any sessions keyed under the LID side (`@lid`). The PN
+    /// session is the one our outgoing sends advance, so the peer's
+    /// expected `our_dh_send_pub` aligns with PN session state. Any parallel
+    /// LID session is by definition divergent — keeping it causes every
+    /// incoming LID-addressed message to MAC-fail. Dropping it lets
+    /// `resolve_session_key` fall through the alias and decrypt with the
+    /// correct PN session. If the peer needs to re-establish, they'll
+    /// re-send via pkmsg which lands under PN via `resolve_session_key`.
     pub fn set_jid_alias(&self, a: &str, b: &str) {
         if let Ok(mut map) = self.jid_alias.lock() {
             map.insert(a.to_string(), b.to_string());
             map.insert(b.to_string(), a.to_string());
+        }
+        // Determine which side is LID (if any) and drop all its sessions.
+        let lid_bare = if a.ends_with("@lid") { Some(a) }
+            else if b.ends_with("@lid") { Some(b) }
+            else { None };
+        if let Some(lid) = lid_bare {
+            if let Ok(mut sessions) = self.sessions.lock() {
+                let (user, server) = match lid.find('@') {
+                    Some(i) => (&lid[..i], &lid[i..]),
+                    None => return,
+                };
+                let victims: Vec<String> = sessions
+                    .keys()
+                    .filter(|k| {
+                        match k.find('@') {
+                            Some(i) => {
+                                let (left, srv) = (&k[..i], &k[i..]);
+                                let ku = left.split(':').next().unwrap_or(left);
+                                ku == user && srv == server
+                            }
+                            None => false,
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                for v in victims {
+                    tracing::info!("set_jid_alias: dropping divergent LID session {v}");
+                    sessions.remove(&v);
+                }
+            }
         }
     }
 
