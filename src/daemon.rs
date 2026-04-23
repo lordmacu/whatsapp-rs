@@ -124,10 +124,9 @@ pub async fn run_daemon() -> Result<()> {
         let store = std::sync::Arc::new(FileStore::new()?);
         let mgr = AuthManager::new(store)?;
         if *mgr.state() != AuthState::Authenticated {
-            bail!(
-                "daemon: not paired yet. Run `whatsapp-rs listen` once in a \
-                 terminal and scan the QR, then restart the daemon."
-            );
+            // Typed WaError so external drivers can match on the cause
+            // without string-matching on anyhow's message.
+            return Err(crate::error::WaError::NotPaired.into());
         }
     }
 

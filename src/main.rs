@@ -5,6 +5,7 @@ mod client;
 mod contacts;
 mod daemon;
 mod device_cache;
+mod error;
 mod event_print;
 mod install;
 mod media;

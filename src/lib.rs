@@ -6,6 +6,7 @@ pub mod client;
 pub mod contacts;
 pub mod daemon;
 pub mod device_cache;
+pub mod error;
 pub mod event_print;
 pub mod install;
 pub mod media;
@@ -18,6 +19,7 @@ pub mod signal;
 pub mod socket;
 
 pub use client::{Chat, Client, Session};
+pub use error::{Result as WaResult, WaError};
 pub use message_store::StoredMessage;
 pub use messages::{ChatInfo, MediaInfo, MessageContent, MessageEvent, MessageKey, MessageStatus, WAMessage};
 pub use socket::group::{GroupInfo, ParticipantInfo, ParticipantResult};

@@ -10,9 +10,9 @@ use crate::message_store::MessageStore;
 use crate::messages::{MessageEvent, MessageKey, MessageManager, MessageStatus};
 use crate::outbox::OutboxStore;
 use crate::poll_store::PollStore;
+use crate::error::{Result, WaError};
 use crate::signal::SignalRepository;
 use crate::socket;
-use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
@@ -50,7 +50,7 @@ impl Client {
         }
 
         // same post-auth setup as `connect`
-        self.start_session(auth_mgr).await
+        self.start_session(auth_mgr).await.map_err(Into::into)
     }
 
     /// Connect and return a live `Session`.
@@ -65,7 +65,7 @@ impl Client {
             self.run_pairing(&mut auth_mgr).await?;
         }
 
-        self.start_session(auth_mgr).await
+        self.start_session(auth_mgr).await.map_err(Into::into)
     }
 
     async fn start_session(&self, auth_mgr: AuthManager) -> Result<Session> {
@@ -503,7 +503,7 @@ async fn pairing_code_send_finish(
         _ => None,
     }.ok_or_else(|| anyhow::anyhow!("no link_code_companion_reg in notification"))?;
 
-    let get_bytes = |tag: &str| -> Result<Vec<u8>> {
+    let get_bytes = |tag: &str| -> anyhow::Result<Vec<u8>> {
         match &inner.content {
             NodeContent::List(ch) => ch.iter()
                 .find(|n| n.tag == tag)
@@ -929,15 +929,15 @@ impl Session {
     // ── Sending ───────────────────────────────────────────────────────────────
 
     pub async fn send_text(&self, jid: &str, text: &str) -> Result<String> {
-        self.mgr.read().await.send_text(jid, text).await
+        self.mgr.read().await.send_text(jid, text).await.map_err(Into::into)
     }
 
     pub async fn send_reply(&self, jid: &str, reply_to_id: &str, text: &str) -> Result<String> {
-        self.mgr.read().await.send_reply(jid, reply_to_id, text).await
+        self.mgr.read().await.send_reply(jid, reply_to_id, text).await.map_err(Into::into)
     }
 
     pub async fn send_reaction(&self, jid: &str, target_id: &str, emoji: &str) -> Result<()> {
-        self.mgr.read().await.send_reaction(jid, target_id, emoji).await
+        self.mgr.read().await.send_reaction(jid, target_id, emoji).await.map_err(Into::into)
     }
 
     pub async fn send_mention(
@@ -946,15 +946,15 @@ impl Session {
         text: &str,
         mention_jids: &[&str],
     ) -> Result<String> {
-        self.mgr.read().await.send_mention(jid, text, mention_jids).await
+        self.mgr.read().await.send_mention(jid, text, mention_jids).await.map_err(Into::into)
     }
 
     pub async fn send_revoke(&self, jid: &str, msg_id: &str) -> Result<()> {
-        self.mgr.read().await.send_revoke(jid, msg_id).await
+        self.mgr.read().await.send_revoke(jid, msg_id).await.map_err(Into::into)
     }
 
     pub async fn send_edit(&self, jid: &str, msg_id: &str, new_text: &str) -> Result<()> {
-        self.mgr.read().await.send_edit(jid, msg_id, new_text).await
+        self.mgr.read().await.send_edit(jid, msg_id, new_text).await.map_err(Into::into)
     }
 
     pub async fn send_poll_vote(
@@ -963,39 +963,39 @@ impl Session {
         poll_msg_id: &str,
         selected_options: &[&str],
     ) -> Result<()> {
-        self.mgr.read().await.send_poll_vote(jid, poll_msg_id, selected_options).await
+        self.mgr.read().await.send_poll_vote(jid, poll_msg_id, selected_options).await.map_err(Into::into)
     }
 
     pub async fn send_image(
         &self, jid: &str, data: &[u8], caption: Option<&str>,
     ) -> Result<String> {
-        self.mgr.read().await.send_image(jid, data, caption).await
+        self.mgr.read().await.send_image(jid, data, caption).await.map_err(Into::into)
     }
 
     pub async fn send_video(
         &self, jid: &str, data: &[u8], caption: Option<&str>,
     ) -> Result<String> {
-        self.mgr.read().await.send_video(jid, data, caption).await
+        self.mgr.read().await.send_video(jid, data, caption).await.map_err(Into::into)
     }
 
     pub async fn send_audio(&self, jid: &str, data: &[u8], mimetype: &str) -> Result<String> {
-        self.mgr.read().await.send_audio(jid, data, mimetype).await
+        self.mgr.read().await.send_audio(jid, data, mimetype).await.map_err(Into::into)
     }
 
     /// Voice note (push-to-talk): audio with the `ptt` flag set so peer
     /// clients show the waveform/play-bar UI.
     pub async fn send_voice_note(&self, jid: &str, data: &[u8], mimetype: &str) -> Result<String> {
-        self.mgr.read().await.send_voice_note(jid, data, mimetype).await
+        self.mgr.read().await.send_voice_note(jid, data, mimetype).await.map_err(Into::into)
     }
 
     pub async fn send_document(
         &self, jid: &str, data: &[u8], mimetype: &str, file_name: &str,
     ) -> Result<String> {
-        self.mgr.read().await.send_document(jid, data, mimetype, file_name).await
+        self.mgr.read().await.send_document(jid, data, mimetype, file_name).await.map_err(Into::into)
     }
 
     pub async fn send_sticker(&self, jid: &str, data: &[u8]) -> Result<String> {
-        self.mgr.read().await.send_sticker(jid, data).await
+        self.mgr.read().await.send_sticker(jid, data).await.map_err(Into::into)
     }
 
     pub async fn send_poll(
@@ -1005,7 +1005,7 @@ impl Session {
         options: &[&str],
         selectable_count: u32,
     ) -> Result<String> {
-        self.mgr.read().await.send_poll(jid, question, options, selectable_count).await
+        self.mgr.read().await.send_poll(jid, question, options, selectable_count).await.map_err(Into::into)
     }
 
     pub async fn send_location(
@@ -1013,7 +1013,7 @@ impl Session {
         latitude: f64, longitude: f64,
         name: Option<&str>, address: Option<&str>,
     ) -> Result<String> {
-        self.mgr.read().await.send_location(jid, latitude, longitude, name, address).await
+        self.mgr.read().await.send_location(jid, latitude, longitude, name, address).await.map_err(Into::into)
     }
 
     /// Send a contact card built from a name + E.164 phone (e.g.
@@ -1022,7 +1022,7 @@ impl Session {
         &self, jid: &str, display_name: &str, phone_e164: &str,
     ) -> Result<String> {
         let vcard = crate::messages::MessageContent::contact_vcard(display_name, phone_e164);
-        self.mgr.read().await.send_contact(jid, display_name, &vcard).await
+        self.mgr.read().await.send_contact(jid, display_name, &vcard).await.map_err(Into::into)
     }
 
     /// Send a contact card with a pre-built vCard string. Use when you
@@ -1031,7 +1031,7 @@ impl Session {
     pub async fn send_contact_vcard(
         &self, jid: &str, display_name: &str, vcard: &str,
     ) -> Result<String> {
-        self.mgr.read().await.send_contact(jid, display_name, vcard).await
+        self.mgr.read().await.send_contact(jid, display_name, vcard).await.map_err(Into::into)
     }
 
     pub async fn send_link_preview(
@@ -1045,31 +1045,31 @@ impl Session {
     ) -> Result<String> {
         self.mgr.read().await
             .send_link_preview(jid, text, url, title, description, thumbnail_jpeg)
-            .await
+            .await.map_err(Into::into)
     }
 
     /// Send text and auto-attach a link preview if the body contains a URL.
     /// Fetches OG metadata + thumbnail with a short timeout; degrades to
     /// plain text on fetch failure.
     pub async fn send_text_with_preview(&self, jid: &str, text: &str) -> Result<String> {
-        self.mgr.read().await.send_text_with_auto_preview(jid, text).await
+        self.mgr.read().await.send_text_with_auto_preview(jid, text).await.map_err(Into::into)
     }
 
     pub async fn send_group_text(&self, group_jid: &str, text: &str) -> Result<String> {
-        self.mgr.read().await.send_group_text(group_jid, text).await
+        self.mgr.read().await.send_group_text(group_jid, text).await.map_err(Into::into)
     }
 
     /// Post a text status update visible to all contacts.
     pub async fn send_status_text(&self, text: &str) -> Result<String> {
-        self.mgr.read().await.send_status_text(text).await
+        self.mgr.read().await.send_status_text(text).await.map_err(Into::into)
     }
 
     pub async fn send_status_image(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
-        self.mgr.read().await.send_status_image(data, caption).await
+        self.mgr.read().await.send_status_image(data, caption).await.map_err(Into::into)
     }
 
     pub async fn send_status_video(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
-        self.mgr.read().await.send_status_video(data, caption).await
+        self.mgr.read().await.send_status_video(data, caption).await.map_err(Into::into)
     }
 
     pub async fn forward_message(
@@ -1078,18 +1078,18 @@ impl Session {
         from_jid: &str,
         msg_id: &str,
     ) -> Result<String> {
-        self.mgr.read().await.forward_message(to_jid, from_jid, msg_id).await
+        self.mgr.read().await.forward_message(to_jid, from_jid, msg_id).await.map_err(Into::into)
     }
 
     pub async fn set_ephemeral_duration(&self, jid: &str, expiration_secs: u32) -> Result<()> {
-        self.mgr.read().await.set_ephemeral_duration(jid, expiration_secs).await
+        self.mgr.read().await.set_ephemeral_duration(jid, expiration_secs).await.map_err(Into::into)
     }
 
     pub async fn group_info(
         &self,
         group_jid: &str,
     ) -> Result<crate::socket::group::GroupInfo> {
-        self.mgr.read().await.group_info(group_jid).await
+        self.mgr.read().await.group_info(group_jid).await.map_err(Into::into)
     }
 
     // ── Privacy settings ─────────────────────────────────────────────────────
@@ -1099,7 +1099,7 @@ impl Session {
         &self,
     ) -> Result<crate::socket::privacy::PrivacySettings> {
         let socket = self.mgr.read().await.socket.clone();
-        crate::socket::privacy::fetch_privacy(&socket).await
+        crate::socket::privacy::fetch_privacy(&socket).await.map_err(Into::into)
     }
 
     /// Update privacy settings.  Only fields set to `Some(...)` are changed.
@@ -1109,7 +1109,7 @@ impl Session {
         patch: crate::socket::privacy::PrivacyPatch,
     ) -> Result<()> {
         let socket = self.mgr.read().await.socket.clone();
-        crate::socket::privacy::set_privacy(&socket, &patch).await
+        crate::socket::privacy::set_privacy(&socket, &patch).await.map_err(Into::into)
     }
 
     // ── Key management ───────────────────────────────────────────────────────
@@ -1118,46 +1118,46 @@ impl Session {
     pub async fn rotate_signed_pre_key(&self) -> Result<()> {
         let socket = self.mgr.read().await.socket.clone();
         let mut c = self.creds.lock().await;
-        socket::prekey::rotate_signed_pre_key(&socket, &mut *c, self.store.as_ref()).await
+        socket::prekey::rotate_signed_pre_key(&socket, &mut *c, self.store.as_ref()).await.map_err(Into::into)
     }
 
     // ── Receipts & presence ───────────────────────────────────────────────────
 
     pub async fn mark_read(&self, keys: &[MessageKey]) -> Result<()> {
-        self.mgr.read().await.read_messages(keys).await
+        self.mgr.read().await.read_messages(keys).await.map_err(Into::into)
     }
 
     pub async fn send_typing(&self, jid: &str, composing: bool) -> Result<()> {
-        self.mgr.read().await.send_typing(jid, composing).await
+        self.mgr.read().await.send_typing(jid, composing).await.map_err(Into::into)
     }
 
     pub async fn send_presence(&self, available: bool) -> Result<()> {
-        self.mgr.read().await.send_presence(available).await
+        self.mgr.read().await.send_presence(available).await.map_err(Into::into)
     }
 
     /// Subscribe to presence updates for a contact (online/offline notifications).
     pub async fn subscribe_contact_presence(&self, jid: &str) -> Result<()> {
-        self.mgr.read().await.subscribe_contact_presence(jid).await
+        self.mgr.read().await.subscribe_contact_presence(jid).await.map_err(Into::into)
     }
 
     /// Mark a WhatsApp Status (story) as viewed.
     pub async fn mark_status_viewed(&self, sender_jid: &str, msg_id: &str) -> Result<()> {
-        self.mgr.read().await.mark_status_viewed(sender_jid, msg_id).await
+        self.mgr.read().await.mark_status_viewed(sender_jid, msg_id).await.map_err(Into::into)
     }
 
     /// Fetch the list of JIDs you have blocked.
     pub async fn fetch_blocklist(&self) -> Result<Vec<String>> {
-        self.mgr.read().await.fetch_blocklist().await
+        self.mgr.read().await.fetch_blocklist().await.map_err(Into::into)
     }
 
     /// Block a contact.
     pub async fn block_contact(&self, jid: &str) -> Result<()> {
-        self.mgr.read().await.block_contact(jid).await
+        self.mgr.read().await.block_contact(jid).await.map_err(Into::into)
     }
 
     /// Unblock a contact.
     pub async fn unblock_contact(&self, jid: &str) -> Result<()> {
-        self.mgr.read().await.unblock_contact(jid).await
+        self.mgr.read().await.unblock_contact(jid).await.map_err(Into::into)
     }
 
     // ── Contacts ──────────────────────────────────────────────────────────────
@@ -1194,7 +1194,7 @@ impl Session {
         info: &crate::messages::MediaInfo,
         media_type: crate::media::MediaType,
     ) -> Result<Vec<u8>> {
-        self.mgr.read().await.download_media(info, media_type).await
+        self.mgr.read().await.download_media(info, media_type).await.map_err(Into::into)
     }
 
     /// Download media for a stored message by JID + message ID.
@@ -1202,9 +1202,9 @@ impl Session {
     /// is not a media message, or the download fails.
     pub async fn download_media_by_id(&self, jid: &str, msg_id: &str) -> Result<Vec<u8>> {
         let stored = self.msg_store.lookup(jid, msg_id)
-            .ok_or_else(|| anyhow::anyhow!("message {msg_id} not found in {jid}"))?;
+            .ok_or_else(|| WaError::message_not_found(format!("{msg_id} in {jid}")))?;
         let info = stored.media_info
-            .ok_or_else(|| anyhow::anyhow!("message {msg_id} is not a media message"))?;
+            .ok_or_else(|| WaError::invalid_input(format!("{msg_id} is not a media message")))?;
         let media_type = match stored.media_type.as_deref() {
             Some("image")    => crate::media::MediaType::Image,
             Some("video")    => crate::media::MediaType::Video,
@@ -1212,7 +1212,7 @@ impl Session {
             Some("sticker")  => crate::media::MediaType::Sticker,
             _                => crate::media::MediaType::Document,
         };
-        self.download_media(&info, media_type).await
+        self.download_media(&info, media_type).await.map_err(Into::into)
     }
 
     // ── Contact / usync ───────────────────────────────────────────────────────
@@ -1222,7 +1222,7 @@ impl Session {
     pub async fn on_whatsapp(
         &self, phones: &[&str],
     ) -> Result<Vec<crate::socket::usync::ContactInfo>> {
-        self.mgr.read().await.on_whatsapp(phones).await
+        self.mgr.read().await.on_whatsapp(phones).await.map_err(Into::into)
     }
 
     /// Resolve JIDs to `ContactInfo` (on_whatsapp + status text).
@@ -1279,7 +1279,7 @@ impl Session {
     pub async fn fetch_status(
         &self, jids: &[&str],
     ) -> Result<std::collections::HashMap<String, String>> {
-        self.mgr.read().await.fetch_status(jids).await
+        self.mgr.read().await.fetch_status(jids).await.map_err(Into::into)
     }
 
     // ── Group management ──────────────────────────────────────────────────────
@@ -1289,7 +1289,7 @@ impl Session {
         subject: &str,
         participant_jids: &[&str],
     ) -> Result<crate::socket::group::GroupInfo> {
-        self.mgr.read().await.create_group(subject, participant_jids).await
+        self.mgr.read().await.create_group(subject, participant_jids).await.map_err(Into::into)
     }
 
     pub async fn add_participants(
@@ -1297,7 +1297,7 @@ impl Session {
         group_jid: &str,
         jids: &[&str],
     ) -> Result<Vec<crate::socket::group::ParticipantResult>> {
-        self.mgr.read().await.add_participants(group_jid, jids).await
+        self.mgr.read().await.add_participants(group_jid, jids).await.map_err(Into::into)
     }
 
     pub async fn remove_participants(
@@ -1305,7 +1305,7 @@ impl Session {
         group_jid: &str,
         jids: &[&str],
     ) -> Result<Vec<crate::socket::group::ParticipantResult>> {
-        self.mgr.read().await.remove_participants(group_jid, jids).await
+        self.mgr.read().await.remove_participants(group_jid, jids).await.map_err(Into::into)
     }
 
     pub async fn promote_to_admin(
@@ -1313,7 +1313,7 @@ impl Session {
         group_jid: &str,
         jids: &[&str],
     ) -> Result<Vec<crate::socket::group::ParticipantResult>> {
-        self.mgr.read().await.promote_to_admin(group_jid, jids).await
+        self.mgr.read().await.promote_to_admin(group_jid, jids).await.map_err(Into::into)
     }
 
     pub async fn demote_from_admin(
@@ -1321,23 +1321,23 @@ impl Session {
         group_jid: &str,
         jids: &[&str],
     ) -> Result<Vec<crate::socket::group::ParticipantResult>> {
-        self.mgr.read().await.demote_from_admin(group_jid, jids).await
+        self.mgr.read().await.demote_from_admin(group_jid, jids).await.map_err(Into::into)
     }
 
     pub async fn leave_group(&self, group_jid: &str) -> Result<()> {
-        self.mgr.read().await.leave_group(group_jid).await
+        self.mgr.read().await.leave_group(group_jid).await.map_err(Into::into)
     }
 
     pub async fn set_group_subject(&self, group_jid: &str, subject: &str) -> Result<()> {
-        self.mgr.read().await.set_group_subject(group_jid, subject).await
+        self.mgr.read().await.set_group_subject(group_jid, subject).await.map_err(Into::into)
     }
 
     pub async fn set_group_description(&self, group_jid: &str, description: &str) -> Result<()> {
-        self.mgr.read().await.set_group_description(group_jid, description).await
+        self.mgr.read().await.set_group_description(group_jid, description).await.map_err(Into::into)
     }
 
     pub async fn subscribe_group_presence(&self, group_jid: &str) -> Result<()> {
-        self.mgr.read().await.subscribe_group_presence(group_jid).await
+        self.mgr.read().await.subscribe_group_presence(group_jid).await.map_err(Into::into)
     }
 
     // ── Profile pictures ──────────────────────────────────────────────────────
@@ -1347,11 +1347,11 @@ impl Session {
         jid: &str,
         high_res: bool,
     ) -> Result<Option<String>> {
-        self.mgr.read().await.get_profile_picture(jid, high_res).await
+        self.mgr.read().await.get_profile_picture(jid, high_res).await.map_err(Into::into)
     }
 
     pub async fn set_profile_picture(&self, jpeg_data: &[u8]) -> Result<()> {
-        self.mgr.read().await.set_profile_picture(jpeg_data).await
+        self.mgr.read().await.set_profile_picture(jpeg_data).await.map_err(Into::into)
     }
 
     // ── Chat handle ───────────────────────────────────────────────────────────
@@ -1412,61 +1412,61 @@ impl<'a> Chat<'a> {
     }
 
     pub async fn text(&self, text: &str) -> Result<String> {
-        self.session.send_text(&self.jid, text).await
+        self.session.send_text(&self.jid, text).await.map_err(Into::into)
     }
 
     pub async fn reply(&self, reply_to_id: &str, text: &str) -> Result<String> {
-        self.session.send_reply(&self.jid, reply_to_id, text).await
+        self.session.send_reply(&self.jid, reply_to_id, text).await.map_err(Into::into)
     }
 
     pub async fn react(&self, target_id: &str, emoji: &str) -> Result<()> {
-        self.session.send_reaction(&self.jid, target_id, emoji).await
+        self.session.send_reaction(&self.jid, target_id, emoji).await.map_err(Into::into)
     }
 
     pub async fn mention(&self, text: &str, mention_jids: &[&str]) -> Result<String> {
-        self.session.send_mention(&self.jid, text, mention_jids).await
+        self.session.send_mention(&self.jid, text, mention_jids).await.map_err(Into::into)
     }
 
     pub async fn revoke(&self, msg_id: &str) -> Result<()> {
-        self.session.send_revoke(&self.jid, msg_id).await
+        self.session.send_revoke(&self.jid, msg_id).await.map_err(Into::into)
     }
 
     pub async fn edit(&self, msg_id: &str, new_text: &str) -> Result<()> {
-        self.session.send_edit(&self.jid, msg_id, new_text).await
+        self.session.send_edit(&self.jid, msg_id, new_text).await.map_err(Into::into)
     }
 
     pub async fn image(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
-        self.session.send_image(&self.jid, data, caption).await
+        self.session.send_image(&self.jid, data, caption).await.map_err(Into::into)
     }
 
     pub async fn video(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
-        self.session.send_video(&self.jid, data, caption).await
+        self.session.send_video(&self.jid, data, caption).await.map_err(Into::into)
     }
 
     pub async fn audio(&self, data: &[u8], mimetype: &str) -> Result<String> {
-        self.session.send_audio(&self.jid, data, mimetype).await
+        self.session.send_audio(&self.jid, data, mimetype).await.map_err(Into::into)
     }
 
     pub async fn voice_note(&self, data: &[u8], mimetype: &str) -> Result<String> {
-        self.session.send_voice_note(&self.jid, data, mimetype).await
+        self.session.send_voice_note(&self.jid, data, mimetype).await.map_err(Into::into)
     }
 
     pub async fn document(&self, data: &[u8], mimetype: &str, file_name: &str) -> Result<String> {
-        self.session.send_document(&self.jid, data, mimetype, file_name).await
+        self.session.send_document(&self.jid, data, mimetype, file_name).await.map_err(Into::into)
     }
 
     pub async fn sticker(&self, data: &[u8]) -> Result<String> {
-        self.session.send_sticker(&self.jid, data).await
+        self.session.send_sticker(&self.jid, data).await.map_err(Into::into)
     }
 
     pub async fn poll(
         &self, question: &str, options: &[&str], selectable_count: u32,
     ) -> Result<String> {
-        self.session.send_poll(&self.jid, question, options, selectable_count).await
+        self.session.send_poll(&self.jid, question, options, selectable_count).await.map_err(Into::into)
     }
 
     pub async fn poll_vote(&self, poll_msg_id: &str, selected: &[&str]) -> Result<()> {
-        self.session.send_poll_vote(&self.jid, poll_msg_id, selected).await
+        self.session.send_poll_vote(&self.jid, poll_msg_id, selected).await.map_err(Into::into)
     }
 
     pub async fn location(
@@ -1474,11 +1474,11 @@ impl<'a> Chat<'a> {
         latitude: f64, longitude: f64,
         name: Option<&str>, address: Option<&str>,
     ) -> Result<String> {
-        self.session.send_location(&self.jid, latitude, longitude, name, address).await
+        self.session.send_location(&self.jid, latitude, longitude, name, address).await.map_err(Into::into)
     }
 
     pub async fn contact(&self, display_name: &str, phone_e164: &str) -> Result<String> {
-        self.session.send_contact(&self.jid, display_name, phone_e164).await
+        self.session.send_contact(&self.jid, display_name, phone_e164).await.map_err(Into::into)
     }
 
     pub async fn link_preview(
@@ -1491,29 +1491,29 @@ impl<'a> Chat<'a> {
     ) -> Result<String> {
         self.session
             .send_link_preview(&self.jid, text, url, title, description, thumbnail_jpeg)
-            .await
+            .await.map_err(Into::into)
     }
 
     /// Send text with an auto-fetched link preview. Falls back to plain text
     /// when the URL fetch fails or no URL is present.
     pub async fn text_with_preview(&self, text: &str) -> Result<String> {
-        self.session.send_text_with_preview(&self.jid, text).await
+        self.session.send_text_with_preview(&self.jid, text).await.map_err(Into::into)
     }
 
     pub async fn typing(&self, composing: bool) -> Result<()> {
-        self.session.send_typing(&self.jid, composing).await
+        self.session.send_typing(&self.jid, composing).await.map_err(Into::into)
     }
 
     pub async fn mark_read(&self, keys: &[MessageKey]) -> Result<()> {
-        self.session.mark_read(keys).await
+        self.session.mark_read(keys).await.map_err(Into::into)
     }
 
     pub async fn forward_from(&self, from_jid: &str, msg_id: &str) -> Result<String> {
-        self.session.forward_message(&self.jid, from_jid, msg_id).await
+        self.session.forward_message(&self.jid, from_jid, msg_id).await.map_err(Into::into)
     }
 
     pub async fn set_ephemeral(&self, expiration_secs: u32) -> Result<()> {
-        self.session.set_ephemeral_duration(&self.jid, expiration_secs).await
+        self.session.set_ephemeral_duration(&self.jid, expiration_secs).await.map_err(Into::into)
     }
 
     pub fn history(&self, n: usize) -> Vec<crate::message_store::StoredMessage> {
