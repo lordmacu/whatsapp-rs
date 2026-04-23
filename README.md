@@ -27,7 +27,7 @@ tokio       = { version = "1", features = ["full"] }
 Or pin to the git repo while the API is unstable:
 
 ```toml
-whatsapp-rs = { git = "https://github.com/cristian-garcia/whatsapp-rs" }
+whatsapp-rs = { git = "https://github.com/lordmacu/whatsapp-rs" }
 ```
 
 ## Quick start
