@@ -703,25 +703,30 @@ impl MessageManager {
                 }
             }
             Some(MessageContent::Reply { reply_to_id, text }) => {
-                // Look up the quoted message's text from our store so the
-                // peer renders the quote bubble. Falls back to empty text
-                // when unknown; the reply still sends but without a quote.
-                let quoted_text = self
-                    .msg_store
-                    .lookup(&msg.key.remote_jid, reply_to_id)
-                    .and_then(|m| m.text)
-                    .unwrap_or_default();
-                // Determine the quoted message's sender for ContextInfo.
-                // Peer clients validate this matches their view of the
-                // original sender before rendering the quote.
-                let quoted_sender_owned = self
-                    .msg_store
-                    .lookup(&msg.key.remote_jid, reply_to_id)
-                    .map(|m| if m.from_me {
-                        self.our_jid.clone()
-                    } else {
-                        m.participant.unwrap_or_else(|| m.remote_jid.clone())
+                // Look up the quoted message by id under the current chat jid
+                // first. Incoming msgs from a LID-addressed peer are stored
+                // under the LID jid while the reply goes out under PN, so
+                // also try the aliased counterpart (learned in recv from
+                // sender_pn/participant_pn) and any stored jid ending with
+                // the peer's user id — that covers LID↔PN and device-suffix
+                // variants without requiring an exact match.
+                let stored = self.msg_store.lookup(&msg.key.remote_jid, reply_to_id)
+                    .or_else(|| {
+                        let alt = self.lid_pn_map.lock().ok()?
+                            .get(&bare_user_jid(&msg.key.remote_jid)).cloned()?;
+                        self.msg_store.lookup(&alt, reply_to_id)
+                    })
+                    .or_else(|| {
+                        // Last resort: scan every known chat for this id.
+                        self.msg_store.known_jids().into_iter()
+                            .find_map(|j| self.msg_store.lookup(&j, reply_to_id))
                     });
+                let quoted_text = stored.as_ref().and_then(|m| m.text.clone()).unwrap_or_default();
+                let quoted_sender_owned = stored.map(|m| if m.from_me {
+                    self.our_jid.clone()
+                } else {
+                    m.participant.unwrap_or_else(|| m.remote_jid.clone())
+                });
                 let participant = quoted_sender_owned.as_deref()
                     .or(msg.key.participant.as_deref());
                 encode_wa_reply_message(text, reply_to_id, participant, &quoted_text)
