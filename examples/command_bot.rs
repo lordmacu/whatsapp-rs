@@ -77,13 +77,15 @@ async fn main() -> Result<()> {
                         println!("← [{name}] {text}");
                         handle_command(text)
                     }
-                    Some(MessageContent::Image { info, caption }) => {
-                        println!("← [{name}] [imagen{}]", fmt_caption(caption.as_deref()));
+                    Some(MessageContent::Image { info, caption, view_once }) => {
+                        let tag = if *view_once { "imagen, ver-una-vez" } else { "imagen" };
+                        println!("← [{name}] [{tag}{}]", fmt_caption(caption.as_deref()));
                         let path = save_media(&session, &msg.key, info, MediaType::Image, "jpg", &dir).await;
                         handle_media(Media::Image { caption: caption.clone(), saved_at: path })
                     }
-                    Some(MessageContent::Video { info, caption }) => {
-                        println!("← [{name}] [video{}]", fmt_caption(caption.as_deref()));
+                    Some(MessageContent::Video { info, caption, view_once }) => {
+                        let tag = if *view_once { "video, ver-una-vez" } else { "video" };
+                        println!("← [{name}] [{tag}{}]", fmt_caption(caption.as_deref()));
                         let path = save_media(&session, &msg.key, info, MediaType::Video, "mp4", &dir).await;
                         handle_media(Media::Video { caption: caption.clone(), saved_at: path })
                     }

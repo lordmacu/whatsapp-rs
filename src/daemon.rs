@@ -52,6 +52,9 @@ pub enum Request {
     SendContact { jid: String, display_name: String, phone_e164: String },
     /// Send text that auto-attaches a link preview if the body contains a URL.
     SendTextPreview { jid: String, text: String },
+    /// "View once" image/video — receiver's WA wipes after first open.
+    SendViewOnceImage { jid: String, data_b64: String, caption: Option<String> },
+    SendViewOnceVideo { jid: String, data_b64: String, caption: Option<String> },
     Shutdown,
 }
 
@@ -271,10 +274,10 @@ fn event_to_json(session: &Session, ev: &MessageEvent) -> Option<serde_json::Val
             let content = msg.message.as_ref().map(|c| match c {
                 MessageContent::Text { text, mentioned_jids } =>
                     serde_json::json!({"type": "text", "text": text, "mentions": mentioned_jids}),
-                MessageContent::Image { info, caption } =>
-                    serde_json::json!({"type": "image", "caption": caption, "media": info}),
-                MessageContent::Video { info, caption } =>
-                    serde_json::json!({"type": "video", "caption": caption, "media": info}),
+                MessageContent::Image { info, caption, view_once } =>
+                    serde_json::json!({"type": "image", "caption": caption, "media": info, "view_once": view_once}),
+                MessageContent::Video { info, caption, view_once } =>
+                    serde_json::json!({"type": "video", "caption": caption, "media": info, "view_once": view_once}),
                 MessageContent::Audio { info, .. } =>
                     serde_json::json!({"type": "audio", "media": info}),
                 MessageContent::Document { info, file_name } =>
@@ -432,6 +435,28 @@ async fn dispatch(
         }
         Request::SendTextPreview { jid, text } => {
             match session.send_text_with_preview(&jid, &text).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendViewOnceImage { jid, data_b64, caption } => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let data = match STANDARD.decode(&data_b64) {
+                Ok(b) => b,
+                Err(e) => return Response::Err { error: format!("bad base64: {e}") },
+            };
+            match session.send_view_once_image(&jid, &data, caption.as_deref()).await {
+                Ok(id) => Response::Ok(serde_json::json!({"id": id})),
+                Err(e) => Response::Err { error: e.to_string() },
+            }
+        }
+        Request::SendViewOnceVideo { jid, data_b64, caption } => {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let data = match STANDARD.decode(&data_b64) {
+                Ok(b) => b,
+                Err(e) => return Response::Err { error: format!("bad base64: {e}") },
+            };
+            match session.send_view_once_video(&jid, &data, caption.as_deref()).await {
                 Ok(id) => Response::Ok(serde_json::json!({"id": id})),
                 Err(e) => Response::Err { error: e.to_string() },
             }

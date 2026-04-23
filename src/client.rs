@@ -972,10 +972,24 @@ impl Session {
         self.mgr.read().await.send_image(jid, data, caption).await.map_err(Into::into)
     }
 
+    /// Send a "view once" image — receiver's WA client wipes it after open.
+    pub async fn send_view_once_image(
+        &self, jid: &str, data: &[u8], caption: Option<&str>,
+    ) -> Result<String> {
+        self.mgr.read().await.send_view_once_image(jid, data, caption).await.map_err(Into::into)
+    }
+
     pub async fn send_video(
         &self, jid: &str, data: &[u8], caption: Option<&str>,
     ) -> Result<String> {
         self.mgr.read().await.send_video(jid, data, caption).await.map_err(Into::into)
+    }
+
+    /// Send a "view once" video.
+    pub async fn send_view_once_video(
+        &self, jid: &str, data: &[u8], caption: Option<&str>,
+    ) -> Result<String> {
+        self.mgr.read().await.send_view_once_video(jid, data, caption).await.map_err(Into::into)
     }
 
     pub async fn send_audio(&self, jid: &str, data: &[u8], mimetype: &str) -> Result<String> {
@@ -1439,8 +1453,18 @@ impl<'a> Chat<'a> {
         self.session.send_image(&self.jid, data, caption).await.map_err(Into::into)
     }
 
+    /// Image that receiver's WA wipes after first open.
+    pub async fn view_once_image(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
+        self.session.send_view_once_image(&self.jid, data, caption).await
+    }
+
     pub async fn video(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
         self.session.send_video(&self.jid, data, caption).await.map_err(Into::into)
+    }
+
+    /// Video that receiver's WA wipes after first open.
+    pub async fn view_once_video(&self, data: &[u8], caption: Option<&str>) -> Result<String> {
+        self.session.send_view_once_video(&self.jid, data, caption).await
     }
 
     pub async fn audio(&self, data: &[u8], mimetype: &str) -> Result<String> {

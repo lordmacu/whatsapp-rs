@@ -70,11 +70,13 @@ fn summarize_message(message: Option<&MessageContent>) -> Option<String> {
                 Some(format!("{text}  (mentions: {})", mentioned_jids.join(", ")))
             }
         }
-        MessageContent::Image { caption, .. } => {
-            Some(format!("<image: {}>", caption.as_deref().unwrap_or("")))
+        MessageContent::Image { caption, view_once, .. } => {
+            let tag = if *view_once { "image, view-once" } else { "image" };
+            Some(format!("<{tag}: {}>", caption.as_deref().unwrap_or("")))
         }
-        MessageContent::Video { caption, .. } => {
-            Some(format!("<video: {}>", caption.as_deref().unwrap_or("")))
+        MessageContent::Video { caption, view_once, .. } => {
+            let tag = if *view_once { "video, view-once" } else { "video" };
+            Some(format!("<{tag}: {}>", caption.as_deref().unwrap_or("")))
         }
         MessageContent::Audio { .. } => Some("<audio>".to_string()),
         MessageContent::Document { file_name, .. } => Some(format!("<document: {file_name}>")),
@@ -1058,6 +1060,31 @@ fn decode_plaintext(data: &[u8]) -> DecodedPayload {
                 }
             }
         }
+
+        // ViewOnce wrapper: one of field 25 (v1), 68 (v2), 91 (v2 extension).
+        // Each wraps a FutureProofMessage { message=1 = inner Message }.
+        // Unwrap, recurse, and promote the resulting Image/Video's view_once
+        // flag so callers can distinguish "normal" media from a one-shot.
+        for &wrapper in &[68u64, 25, 91] {
+            if let Some(wrap_bytes) = fields.get(&wrapper) {
+                if let Some(fp) = wa_proto::parse_proto_fields(wrap_bytes) {
+                    if let Some(inner) = fp.get(&1) {
+                        let decoded = decode_plaintext(inner);
+                        if let DecodedPayload::Message(c) = decoded {
+                            let promoted = match c {
+                                MessageContent::Image { info, caption, .. } =>
+                                    MessageContent::Image { info, caption, view_once: true },
+                                MessageContent::Video { info, caption, .. } =>
+                                    MessageContent::Video { info, caption, view_once: true },
+                                other => other,
+                            };
+                            return DecodedPayload::Message(promoted);
+                        }
+                        return decoded;
+                    }
+                }
+            }
+        }
     }
 
     // ProtocolMessage (revoke, edit, ephemeral, history sync, …)
@@ -1108,17 +1135,17 @@ fn decode_plaintext(data: &[u8]) -> DecodedPayload {
         // Canonical WAProto field numbers (legacy in second line kept so
         // our own stored msgs from before the fix still decode).
         let content = match field {
-            3  => MessageContent::Image { info, caption: m.caption },
+            3  => MessageContent::Image { info, caption: m.caption, view_once: false },
             7  => MessageContent::Document { info, file_name: m.file_name.unwrap_or_default() },
             8  => MessageContent::Audio { info, ptt: false },
-            9  => MessageContent::Video { info, caption: m.caption },
+            9  => MessageContent::Video { info, caption: m.caption, view_once: false },
             26 => MessageContent::Sticker { info },
             // legacy fallbacks
             4  => MessageContent::Document { info, file_name: m.file_name.unwrap_or_default() },
             5  => MessageContent::Audio { info, ptt: false },
-            6  => MessageContent::Video { info, caption: m.caption },
+            6  => MessageContent::Video { info, caption: m.caption, view_once: false },
             20 => MessageContent::Sticker { info },
-            _  => MessageContent::Image { info, caption: m.caption },
+            _  => MessageContent::Image { info, caption: m.caption, view_once: false },
         };
         return DecodedPayload::Message(content);
     }

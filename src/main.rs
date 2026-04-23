@@ -35,6 +35,7 @@ Commands:
   send-location <jid> <lat> <lon> [name] [address]   Share a location pin
   send-contact <jid> <display-name> <phone-E164>     Share a contact card
   send-text-preview <jid> <text>        Send text + auto-fetched link preview (detects URL)
+  send-viewonce <jid> <path> [caption]  Send a one-shot image/video (receiver's WA wipes after open)
   download <jid> <msg-id> [path]        Download received media to a file (default: ./<msg-id>)
   reply <jid> <msg-id> <text>           Reply to a specific message and exit
   react <jid> <msg-id> <emoji>          Send a reaction and exit
@@ -155,6 +156,12 @@ async fn main() -> Result<()> {
                 bail!("Usage: whatsapp-rs send-text-preview <jid> <text>");
             }
             cmd_send_text_preview(&args[1], &args[2]).await
+        }
+        "send-viewonce" => {
+            if args.len() < 3 {
+                bail!("Usage: whatsapp-rs send-viewonce <jid> <path> [caption]");
+            }
+            cmd_send_view_once(&args[1], &args[2], args.get(3).map(|s| s.as_str())).await
         }
         "download" => {
             if args.len() < 3 {
@@ -651,6 +658,44 @@ async fn cmd_send_contact(jid: &str, display_name: &str, phone_e164: &str) -> Re
     let client = client::Client::new()?;
     let session = client.connect().await?;
     let id = session.send_contact(jid, display_name, phone_e164).await?;
+    println!("sent: {id}");
+    Ok(())
+}
+
+async fn cmd_send_view_once(jid: &str, path: &str, caption: Option<&str>) -> Result<()> {
+    use base64::Engine as _;
+    let data = std::fs::read(path)?;
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let is_video = matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "3gp" | "mkv" | "webm");
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+    let cap = caption.map(str::to_string);
+
+    let req = if is_video {
+        daemon::Request::SendViewOnceVideo {
+            jid: jid.to_string(), data_b64: data_b64.clone(), caption: cap.clone(),
+        }
+    } else {
+        daemon::Request::SendViewOnceImage {
+            jid: jid.to_string(), data_b64, caption: cap.clone(),
+        }
+    };
+    if let Some(v) = daemon::try_daemon_request(req).await? {
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        println!("sent: {id}");
+        return Ok(());
+    }
+
+    let client = client::Client::new()?;
+    let session = client.connect().await?;
+    let id = if is_video {
+        session.send_view_once_video(jid, &data, caption).await?
+    } else {
+        session.send_view_once_image(jid, &data, caption).await?
+    };
     println!("sent: {id}");
     Ok(())
 }

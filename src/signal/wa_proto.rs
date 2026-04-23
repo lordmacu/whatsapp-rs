@@ -304,6 +304,20 @@ pub fn encode_wa_poll_message(
     (proto_message(49, &poll), enc_key)
 }
 
+/// Wrap a normal WAProto.Message blob (image/video) in a `ViewOnceMessageV2`
+/// envelope so the receiver's WA client deletes the media after first open.
+///
+/// Structure:
+/// ```text
+/// outer Message { viewOnceMessageV2 = FutureProofMessage { message = inner } }
+/// outer.field 68 ← FutureProofMessage bytes
+///   FutureProofMessage.field 1 ← inner Message bytes (tagged sub-message)
+/// ```
+pub fn wrap_view_once(inner_message: &[u8]) -> Vec<u8> {
+    let fp = proto_bytes(1, inner_message);
+    proto_message(68, &fp)
+}
+
 // ── WAProto.Message decode ────────────────────────────────────────────────────
 
 /// Extract the best text representation from a decrypted WAProto.Message blob.
@@ -1387,7 +1401,7 @@ fn parse_web_message_info_inner(data: &[u8], allow_missing_remote_jid: bool) -> 
         if let Some(info) = mf.get(&3).and_then(|b| parse_media_info(b)) {
             let caption = parse_proto_fields(mf.get(&3)?).ok_or(()).ok()
                 .and_then(|f| f.get(&8).and_then(|b| String::from_utf8(b.clone()).ok()));
-            return Some(crate::messages::MessageContent::Image { info, caption });
+            return Some(crate::messages::MessageContent::Image { info, caption, view_once: false });
         }
 
         // VideoMessage = field 9 (canonical) / legacy 6.
@@ -1395,7 +1409,7 @@ fn parse_web_message_info_inner(data: &[u8], allow_missing_remote_jid: bool) -> 
             let src = mf.get(&9).or_else(|| mf.get(&6))?;
             let caption = parse_proto_fields(src).ok_or(()).ok()
                 .and_then(|f| f.get(&8).and_then(|b| String::from_utf8(b.clone()).ok()));
-            return Some(crate::messages::MessageContent::Video { info, caption });
+            return Some(crate::messages::MessageContent::Video { info, caption, view_once: false });
         }
 
         // AudioMessage = field 8 (canonical) / legacy 5.

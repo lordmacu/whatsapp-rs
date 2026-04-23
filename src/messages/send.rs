@@ -746,6 +746,7 @@ impl MessageManager {
             encode_wa_audio_message, encode_wa_document_message, encode_wa_image_message,
             encode_wa_link_preview_message, encode_wa_reaction_message, encode_wa_reply_message,
             encode_wa_sticker_message, encode_wa_text_message, encode_wa_video_message,
+            wrap_view_once,
         };
         let bytes = match &msg.message {
             Some(MessageContent::Text { text, mentioned_jids }) => {
@@ -781,10 +782,14 @@ impl MessageManager {
                     .or(msg.key.participant.as_deref());
                 encode_wa_reply_message(text, reply_to_id, participant, &quoted_body)
             }
-            Some(MessageContent::Image { info, caption }) =>
-                encode_wa_image_message(info, caption.as_deref()),
-            Some(MessageContent::Video { info, caption }) =>
-                encode_wa_video_message(info, caption.as_deref()),
+            Some(MessageContent::Image { info, caption, view_once }) => {
+                let bytes = encode_wa_image_message(info, caption.as_deref());
+                if *view_once { wrap_view_once(&bytes) } else { bytes }
+            }
+            Some(MessageContent::Video { info, caption, view_once }) => {
+                let bytes = encode_wa_video_message(info, caption.as_deref());
+                if *view_once { wrap_view_once(&bytes) } else { bytes }
+            }
             Some(MessageContent::Audio { info, ptt }) => encode_wa_audio_message(info, *ptt),
             Some(MessageContent::Document { info, file_name }) =>
                 encode_wa_document_message(info, file_name),
@@ -1060,21 +1065,49 @@ impl MessageManager {
     }
 
     pub async fn send_image(&self, jid: &str, data: &[u8], caption: Option<&str>) -> Result<String> {
+        self.send_image_inner(jid, data, caption, false).await
+    }
+
+    /// Send a one-shot "view once" image. Receiver's WA wipes it after open.
+    pub async fn send_view_once_image(
+        &self, jid: &str, data: &[u8], caption: Option<&str>,
+    ) -> Result<String> {
+        self.send_image_inner(jid, data, caption, true).await
+    }
+
+    async fn send_image_inner(
+        &self, jid: &str, data: &[u8], caption: Option<&str>, view_once: bool,
+    ) -> Result<String> {
         let info = self.upload_media(data, crate::media::MediaType::Image, "image/jpeg").await?;
         let id = generate_message_id();
         self.send_message(jid, id.clone(), MessageContent::Image {
             info,
             caption: caption.map(|s| s.to_string()),
+            view_once,
         }).await?;
         Ok(id)
     }
 
     pub async fn send_video(&self, jid: &str, data: &[u8], caption: Option<&str>) -> Result<String> {
+        self.send_video_inner(jid, data, caption, false).await
+    }
+
+    /// Send a one-shot "view once" video.
+    pub async fn send_view_once_video(
+        &self, jid: &str, data: &[u8], caption: Option<&str>,
+    ) -> Result<String> {
+        self.send_video_inner(jid, data, caption, true).await
+    }
+
+    async fn send_video_inner(
+        &self, jid: &str, data: &[u8], caption: Option<&str>, view_once: bool,
+    ) -> Result<String> {
         let info = self.upload_media(data, crate::media::MediaType::Video, "video/mp4").await?;
         let id = generate_message_id();
         self.send_message(jid, id.clone(), MessageContent::Video {
             info,
             caption: caption.map(|s| s.to_string()),
+            view_once,
         }).await?;
         Ok(id)
     }

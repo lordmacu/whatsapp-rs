@@ -60,8 +60,20 @@ pub enum MessageContent {
         #[serde(default)]
         mentioned_jids: Vec<String>,
     },
-    Image { info: MediaInfo, caption: Option<String> },
-    Video { info: MediaInfo, caption: Option<String> },
+    Image {
+        info: MediaInfo,
+        caption: Option<String>,
+        /// "Ver una vez": receiver's WA client deletes the media from
+        /// disk + UI after it's opened once. Default `false`.
+        #[serde(default)]
+        view_once: bool,
+    },
+    Video {
+        info: MediaInfo,
+        caption: Option<String>,
+        #[serde(default)]
+        view_once: bool,
+    },
     Audio { info: MediaInfo, #[serde(default)] ptt: bool },
     Document { info: MediaInfo, file_name: String },
     Sticker { info: MediaInfo },
