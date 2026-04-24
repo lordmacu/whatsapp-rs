@@ -286,6 +286,12 @@ pub struct MessageManager {
     /// Ring cache of last ~256 outgoing messages. Answers incoming
     /// `<receipt type="retry">` from peer devices that missed the original.
     pub(crate) recent_sends: Arc<recent_sends::RecentSends>,
+    /// Per-`MessageManager` token-bucket limiter. Every
+    /// `send_encrypted_bytes` acquires through this instance. Default
+    /// is a fresh `RateLimiter::new()` so each Session — and each
+    /// account in a multi-account process — owns its own quota pool
+    /// instead of sharing a process-wide singleton.
+    pub(crate) rate_limiter: Arc<rate_limit::RateLimiter>,
 }
 
 #[allow(dead_code)]
@@ -312,7 +318,18 @@ impl MessageManager {
             retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
+            rate_limiter: Arc::new(rate_limit::RateLimiter::new()),
         }
+    }
+
+    /// Replace the default rate limiter with a shared or preconfigured
+    /// one. Use when you want multiple `MessageManager`s (e.g. running
+    /// the same account from the daemon + a CLI client in one process)
+    /// to share a single quota pool — or, more commonly, when you
+    /// want to override the env-var defaults programmatically.
+    pub fn with_rate_limiter(mut self, rl: Arc<rate_limit::RateLimiter>) -> Self {
+        self.rate_limiter = rl;
+        self
     }
 
     pub fn with_tx(
@@ -341,6 +358,7 @@ impl MessageManager {
             retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
+            rate_limiter: Arc::new(rate_limit::RateLimiter::new()),
         }
     }
 
@@ -370,6 +388,7 @@ impl MessageManager {
             retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
+            rate_limiter: Arc::new(rate_limit::RateLimiter::new()),
         }
     }
 
@@ -398,6 +417,7 @@ impl MessageManager {
             retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
+            rate_limiter: Arc::new(rate_limit::RateLimiter::new()),
         }
     }
 

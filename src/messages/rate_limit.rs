@@ -103,8 +103,16 @@ impl Default for RateLimiter {
     fn default() -> Self { Self::new() }
 }
 
-/// Process-wide singleton. All `send_encrypted_bytes` calls acquire through
-/// this instance. Lazily initialized on first access.
+/// Process-wide singleton — shared across every `Session` created via
+/// the old code path. **Deprecated**: new code should pass a per-Session
+/// `Arc<RateLimiter>` into `MessageManager` instead, so running multiple
+/// WhatsApp accounts in the same process doesn't share one quota
+/// pool. Kept for back-compat with `MessageManager::new` and external
+/// users that haven't migrated.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use per-Session `Arc<RateLimiter>` via `MessageManager::with_rate_limiter` — this singleton leaks quota across accounts"
+)]
 pub fn global() -> &'static RateLimiter {
     use std::sync::OnceLock;
     static GLOBAL: OnceLock<RateLimiter> = OnceLock::new();
@@ -137,5 +145,36 @@ mod tests {
         assert!(b.try_consume().is_zero());
         // Capacity is 3 — fourth needs to wait.
         assert!(!b.try_consume().is_zero());
+    }
+
+    /// Critical multi-account invariant: two separate `RateLimiter`s
+    /// must not share tokens. Draining limiter A must leave limiter B
+    /// fully stocked — otherwise running two accounts in one process
+    /// would serialise their sends through a shared pool.
+    ///
+    /// We check this at the bucket level (no `acquire().await` so the
+    /// test stays sync and doesn't depend on tokio time plumbing).
+    /// Each RateLimiter owns its own `global` and `per_jid` mutexes,
+    /// so two instances having disjoint state is the structural
+    /// guarantee; we verify by exhausting A's global bucket and
+    /// observing B's is still at full capacity.
+    #[test]
+    fn two_limiters_have_disjoint_state() {
+        let a = RateLimiter::new();
+        let b = RateLimiter::new();
+        // Drain A's global bucket. Default burst = 10 → 10 instant
+        // consumes, then a non-zero wait.
+        let a_global = &a.global;
+        for _ in 0..10 {
+            assert!(a_global.lock().unwrap().try_consume().is_zero());
+        }
+        assert!(!a_global.lock().unwrap().try_consume().is_zero(),
+            "A must be drained after burst");
+        // B's global should still be full.
+        let b_global = &b.global;
+        for _ in 0..10 {
+            assert!(b_global.lock().unwrap().try_consume().is_zero(),
+                "B must still have its own full quota");
+        }
     }
 }

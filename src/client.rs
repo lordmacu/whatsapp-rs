@@ -20,14 +20,55 @@ use tracing::{debug, info, warn};
 
 // ── Client ────────────────────────────────────────────────────────────────────
 
+/// Callback fired every time a fresh pairing QR payload is emitted.
+/// Receives the raw `ref,noise,identity,adv` payload string — pass to
+/// [`crate::qr::ascii::render_qr`] for a terminal render or feed into a
+/// `qrcode` encoder for PNG/SVG. Fires potentially several times during
+/// a single pairing session because WhatsApp rotates refs every ~20s.
+pub type QrCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct Client {
     store: Arc<FileStore>,
+    qr_cb: Option<QrCallback>,
 }
 
 impl Client {
     /// Create a client backed by the default file store (`~/.wacli/`).
     pub fn new() -> Result<Self> {
-        Ok(Self { store: Arc::new(FileStore::new()?) })
+        Ok(Self {
+            store: Arc::new(FileStore::new()?),
+            qr_cb: None,
+        })
+    }
+
+    /// Create a client whose state lives under `dir/.whatsapp-rs/...`
+    /// instead of the XDG default. Use when running multiple accounts
+    /// in the same process (each one needs a distinct dir — Signal
+    /// keys under a shared dir corrupt each other's crypto state).
+    ///
+    /// The directory is created on demand. A client built this way
+    /// never reads `XDG_DATA_HOME`, so hosts can avoid the
+    /// process-wide env-var override that `Client::new()` implicitly
+    /// relies on.
+    pub fn new_in_dir(dir: impl Into<std::path::PathBuf>) -> Result<Self> {
+        let dir = dir.into();
+        let base = dir.join(".whatsapp-rs");
+        Ok(Self {
+            store: Arc::new(FileStore::new_in_dir(base)?),
+            qr_cb: None,
+        })
+    }
+
+    /// Install a custom QR emitter. When set, the default behaviour of
+    /// printing the ASCII QR to stdout is suppressed and `f` is invoked
+    /// with each fresh payload instead. Lets hosts route the QR through
+    /// their own UI (broker event, webhook, web UI, Telegram, …).
+    pub fn on_qr<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
+        self.qr_cb = Some(Arc::new(f));
+        self
     }
 
     #[allow(dead_code)]
@@ -294,8 +335,12 @@ impl Client {
                                     B64.encode(c.signed_identity_key.public),
                                     B64.encode(&c.adv_secret_key)
                                 );
-                                println!("\n{}", qr::ascii::render_qr(qr_data.as_bytes()));
-                                println!("Scan with WhatsApp on your phone\n");
+                                if let Some(cb) = &self.qr_cb {
+                                    cb(&qr_data);
+                                } else {
+                                    println!("\n{}", qr::ascii::render_qr(qr_data.as_bytes()));
+                                    println!("Scan with WhatsApp on your phone\n");
+                                }
                                 let id = node.attr("id").unwrap_or("").to_string();
                                 let from =
                                     node.attr("from").unwrap_or("s.whatsapp.net").to_string();

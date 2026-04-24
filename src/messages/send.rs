@@ -872,11 +872,14 @@ impl MessageManager {
     /// Groups (`@g.us`): fetches participants, distributes SenderKey, encrypts as skmsg.
     /// 1:1: establishes Signal session if needed, encrypts as msg/pkmsg.
     async fn send_encrypted_bytes(&self, jid: &str, id: &str, wa_bytes: Vec<u8>) -> Result<()> {
-        // Ban-proofing: block until the global + per-JID token buckets grant
-        // us one token. Bursts are allowed up to each bucket's capacity; the
-        // call degrades to backpressure once exhausted. Configure via env
-        // vars `WA_RATE_GLOBAL_PER_SEC` / `WA_RATE_PER_JID_PER_SEC`.
-        crate::messages::rate_limit::global().acquire(jid).await;
+        // Ban-proofing: block until the per-Session token buckets grant
+        // us one token. Bursts are allowed up to each bucket's capacity;
+        // the call degrades to backpressure once exhausted. Configure
+        // via env vars `WA_RATE_GLOBAL_PER_SEC` / `WA_RATE_PER_JID_PER_SEC`
+        // or inject a custom limiter with
+        // `MessageManager::with_rate_limiter`. Each account in a
+        // multi-account process has its own quota by default.
+        self.rate_limiter.acquire(jid).await;
 
         let (stanza_type, media_type) =
             crate::signal::wa_proto::classify_stanza(&wa_bytes);
