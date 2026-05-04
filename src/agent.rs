@@ -448,6 +448,17 @@ pub fn extract_text(content: Option<&MessageContent>) -> Option<String> {
     Some(raw)
 }
 
+/// Phase 82.10.q — only treat the inbound as "actionable" (worth
+/// pulsing the typing-heartbeat for) when we have non-empty text.
+/// Decrypt-failed stubs, app-state syncs, and non-text content all
+/// return `None` from [`extract_text`] — those events shouldn't
+/// pulse "composing..." on the peer phone or each phantom pulse
+/// leaves a stale "escribiendo..." state when the offline backlog
+/// drains on reconnect.
+fn ctx_has_actionable_text(text: &Option<String>) -> bool {
+    text.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
 impl Session {
     /// Drive an agent-style event loop.
     ///
@@ -577,13 +588,38 @@ impl Session {
                 }
             }
 
+            let has_text = ctx_has_actionable_text(&text);
             let ctx = AgentCtx { msg: msg.clone(), text };
 
-            let _typing = self.typing_heartbeat(&msg.key.remote_jid);
+            // Phase 82.10.q — only fire the typing heartbeat when
+            // we have actionable text. Decrypt-failed messages and
+            // non-text content (status updates, app-state syncs)
+            // shouldn't pulse "composing..." on the peer phone —
+            // each phantom pulse leaves a stale "escribiendo..."
+            // hint in the WhatsApp client UI when the offline
+            // backlog drains on reconnect.
+            let _typing = if has_text {
+                Some(self.typing_heartbeat(&msg.key.remote_jid))
+            } else {
+                None
+            };
             let _slow = self.slow_notice(&msg.key.remote_jid);
             let response = handler(ctx).await;
             drop(_slow);
-            drop(_typing);
+            // Phase 82.10.q — abort the heartbeat refresher task and
+            // explicitly `await` a `send_typing(false)` so the "paused"
+            // packet lands BEFORE the outbound message. The default
+            // `Drop` impl spawns the clear async (fire-and-forget),
+            // which races the `send_text` packet — peer phones can
+            // see "escribiendo..." stuck because the `paused` arrives
+            // after the message or never (if the runtime scheduler is
+            // busy). Explicit await pins the order. Only emit the
+            // explicit clear if we actually started a heartbeat
+            // (avoids wakeup on phantom decrypt-failed messages).
+            if _typing.is_some() {
+                drop(_typing);
+                let _ = self.send_typing(&msg.key.remote_jid, false).await;
+            }
 
             if let Err(e) = self.apply_response(&msg.key, response).await {
                 tracing::warn!("agent response send failed: {e}");
