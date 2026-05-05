@@ -1141,6 +1141,15 @@ impl Session {
         self.mgr.read().await.send_text(jid, text).await.map_err(Into::into)
     }
 
+    /// Discover every AI bot WhatsApp has assigned to this account
+    /// without writing a single message first. Wraps the
+    /// `<iq xmlns="bot"><bot v="2"/></iq>` query whatsmeow uses.
+    pub async fn list_bots(
+        &self,
+    ) -> Result<Vec<crate::messages::bot_discovery::BotListInfo>> {
+        self.mgr.read().await.list_bots().await.map_err(Into::into)
+    }
+
     pub async fn send_reply(&self, jid: &str, reply_to_id: &str, text: &str) -> Result<String> {
         self.mgr.read().await.send_reply(jid, reply_to_id, text).await.map_err(Into::into)
     }

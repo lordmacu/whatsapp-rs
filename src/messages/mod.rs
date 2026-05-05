@@ -1,4 +1,5 @@
 pub mod bot_decrypt;
+pub mod bot_discovery;
 pub mod link_preview;
 pub mod rate_limit;
 pub mod recent_sends;
@@ -257,6 +258,37 @@ pub enum MessageEvent {
     /// name ("critical_block", "regular", ...). `action` carries the decoded
     /// mutation (contact rename, pin, mute, archive, …).
     AppStateUpdate { collection: String, action: crate::app_state::SyncAction },
+    /// An AI bot (Meta AI etc.) sent a chunk of a streamed reply. Each
+    /// `<bot edit="first|inner|last">` chunk fires its own event with
+    /// the SAME `target_id` (the original outbound id we sent to the
+    /// bot) so consumers can group them and dedupe to the latest by
+    /// `chunk_seq`.
+    ///
+    /// The `text` is already the human-readable joined output of the
+    /// `AIRichResponseMessage.submessages[].messageText` chain — feed
+    /// it straight into a chat panel.
+    ///
+    /// This event is intentionally separate from `NewMessage` so the
+    /// agent runtime never routes bot replies as user input
+    /// (otherwise the agent would reply to the bot and create a
+    /// fan-out loop).
+    BotMessage {
+        /// The bot's JID (e.g. `718584497008509@bot`).
+        bot_jid: String,
+        /// The reply chunk's stanza id. Different per chunk in a
+        /// streaming reply.
+        msg_id: String,
+        /// The original outbound message id we sent to the bot.
+        /// Constant across every chunk of one logical reply.
+        target_id: String,
+        /// The streaming-edit position (`first` / `inner` / `last`).
+        /// `last` indicates the reply is complete.
+        edit: String,
+        /// Concatenated text of every `submessages[].messageText` so
+        /// far. Each chunk replaces (not appends to) the previous
+        /// one — render the latest by `target_id`.
+        text: String,
+    },
 }
 
 // ── MessageManager ────────────────────────────────────────────────────────────

@@ -185,6 +185,9 @@ pub async fn print_event(session: &Session, event: MessageEvent) {
         MessageEvent::AppStateUpdate { collection, action } => {
             println!("[app-state {collection}] {action:?}");
         }
+        MessageEvent::BotMessage { bot_jid, edit, text, .. } => {
+            println!("[bot {bot_jid} ({edit})] {text}");
+        }
         MessageEvent::Receipt { .. }
         | MessageEvent::MessageUpdate { .. }
         | MessageEvent::Reaction { .. }

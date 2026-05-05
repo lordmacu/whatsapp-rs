@@ -53,11 +53,39 @@ use tracing::{debug, info, warn};
 use crate::binary::BinaryNode;
 use crate::signal::wa_proto::parse_proto_fields;
 
-/// Toggle the experiment via env. Cheap, no rebuild, default OFF.
+/// Whether the bot-decrypt pipeline is active. Default `true`; flip
+/// to `false` by setting `WA_BOT_DECRYPT=0` (or `false`) so callers
+/// who explicitly want the legacy "pass through undecryptable" path
+/// can opt out without recompiling.
 pub fn enabled() -> bool {
-    std::env::var("WA_BOT_DECRYPT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match std::env::var("WA_BOT_DECRYPT") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        _ => true,
+    }
+}
+
+/// Structured outcome of a successful `msmsg` decrypt — what the
+/// recv pipeline needs to fire a `MessageEvent::BotMessage`.
+#[derive(Debug, Clone)]
+pub struct DecryptedBotReply {
+    /// The bot's JID.
+    pub bot_jid: String,
+    /// This chunk's own stanza id.
+    pub msg_id: String,
+    /// The original outbound id we sent to the bot. Same across
+    /// every chunk of one streamed reply.
+    pub target_id: String,
+    /// `first` / `inner` / `last` — `last` indicates the reply is
+    /// complete.
+    pub edit: String,
+    /// Joined text of every `AIRichResponseMessage.submessages[].messageText`.
+    /// `None` when decrypt produced bytes that aren't a rich-response
+    /// envelope (rare; future protocol bumps).
+    pub text: Option<String>,
+    /// Raw plaintext after AES-GCM + ProtocolMessage unwrap. Kept so
+    /// future consumers can drill custom fields without re-running
+    /// the decrypt.
+    pub plaintext: Vec<u8>,
 }
 
 /// Strip `:device` suffix and `@server` from a JID — whatsmeow calls
@@ -327,20 +355,20 @@ fn parse_msmsg_envelope(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((iv, payload))
 }
 
-/// Decrypt an inbound `<enc type="msmsg">` from a bot. The caller
-/// passes the `<message>` node so we can pull `<meta target_id="…"
-/// target_sender_jid="…">` for the secret lookup.
+/// Decrypt an inbound `<enc type="msmsg">` from a bot and return
+/// a structured `DecryptedBotReply` (text + ids + edit position).
+/// The recv pipeline turns the outcome into a
+/// `MessageEvent::BotMessage`.
 ///
-/// Returns the plaintext `WAProto.Message` bytes ready to feed to
-/// `decode_plaintext`. Returns `Err` (no panic) on any failure so
-/// the existing recv pipeline can fall back to the warn+skip path.
+/// Returns `Err` (no panic) on any failure so the existing recv
+/// pipeline can fall back to the warn+skip path.
 pub fn decrypt_msmsg(
     message_node: &BinaryNode,
     enc_bytes: &[u8],
     our_jid: &str,
-) -> Result<Vec<u8>> {
+) -> Result<DecryptedBotReply> {
     if !enabled() {
-        return Err(anyhow!("bot_decrypt: disabled (set WA_BOT_DECRYPT=1)"));
+        return Err(anyhow!("bot_decrypt: disabled (set WA_BOT_DECRYPT=0 to opt out)"));
     }
     let bot_jid = message_node
         .attr("from")
@@ -464,21 +492,44 @@ pub fn decrypt_msmsg(
     } else {
         hex::encode(&unwrapped)
     };
+    // Optional /tmp dump for offline analysis. Gated behind
+    // `WA_BOT_DECRYPT_DUMP=1` so production deployments don't fill
+    // disk with bot conversations.
+    let mut dump_path = String::new();
+    if std::env::var("WA_BOT_DECRYPT_DUMP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        dump_path = format!("/tmp/msmsg_{bot_reply_msg_id}_{}.bin", unwrapped.len());
+        if let Err(e) = std::fs::write(&dump_path, &unwrapped) {
+            debug!(target: "wa::bot_decrypt", error = %e, "failed to dump msmsg plaintext");
+        }
+    }
+    let extracted_text = extract_ai_rich_text(&unwrapped);
+    let edit = find_bot_attrs(message_node)
+        .map(|(e, _)| e)
+        .unwrap_or_default();
     info!(
         target: "wa::bot_decrypt",
         bot = %bot_jid,
         bot_reply_msg_id = %bot_reply_msg_id,
         target_id = %target_id,
+        edit = %edit,
         plaintext_len = unwrapped.len(),
-        "msmsg decrypted ✓"
-    );
-    debug!(
-        target: "wa::bot_decrypt",
         plaintext_top_fields = ?pt_top_fields,
         plaintext_first_80b_hex = %pt_preview,
-        "msmsg payload preview"
+        text_len = extracted_text.as_deref().map(str::len).unwrap_or(0),
+        dump_path = %dump_path,
+        "msmsg decrypted ✓"
     );
-    Ok(unwrapped)
+    Ok(DecryptedBotReply {
+        bot_jid: bot_jid.to_string(),
+        msg_id: bot_reply_msg_id.to_string(),
+        target_id,
+        edit,
+        text: extracted_text,
+        plaintext: unwrapped,
+    })
 }
 
 /// If the plaintext is a `Message { protocolMessage { editedMessage }
@@ -495,6 +546,50 @@ fn unwrap_protocol_edited_message(plaintext: &[u8]) -> Option<Vec<u8>> {
     let edited = proto_fields.get(&14)?;
     Some(edited.clone())
 }
+
+/// Pull the human text out of a Meta AI
+/// `Message.richResponseMessage` (field 97 =
+/// `AIRichResponseMessage`). Each chunk of a streaming reply ships
+/// as a full snapshot of the response so far, with the text
+/// fragments split across repeated `submessages[]` (field 2), each
+/// carrying `messageText` in field 3. Joining them in declaration
+/// order rebuilds the markdown-ish answer the WA app renders.
+/// Returns `None` when the plaintext isn't a rich-response
+/// envelope.
+///
+/// `pub` so consumers who run their own `decrypt_msmsg` dispatcher
+/// can flatten the plaintext into a regular string without
+/// re-implementing the proto walk.
+pub fn extract_ai_rich_text(plaintext: &[u8]) -> Option<String> {
+    use crate::signal::wa_proto::parse_proto_fields_repeated;
+    let outer = parse_proto_fields(plaintext)?;
+    let rich = outer.get(&97)?;
+    let rich_repeated = parse_proto_fields_repeated(rich)?;
+    let mut out = String::new();
+    for (field, bytes) in rich_repeated {
+        if field != 2 {
+            continue;
+        }
+        let sub_fields = match parse_proto_fields(&bytes) {
+            Some(f) => f,
+            None => continue,
+        };
+        if let Some(text_bytes) = sub_fields.get(&3) {
+            if let Ok(s) = std::str::from_utf8(text_bytes) {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(s);
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 
 /// Walk the `<message>` children for the `<bot>` node and pull
 /// `edit` + `edit_target_id` attrs. Returns `None` when the node
@@ -611,6 +706,77 @@ mod tests {
         let b = apply_bot_message_hkdf(&secret);
         assert_eq!(a, b);
         assert_eq!(a.len(), 32);
+    }
+
+    /// Offline analysis loop. Once the daemon has captured at least
+    /// one msmsg plaintext to `/tmp/msmsg_*.bin`, run this with
+    ///
+    /// ```bash
+    /// cargo watch -x 'test --lib -p wa-agent \
+    ///   bot_decrypt::tests::inspect_dumped_plaintexts \
+    ///   -- --ignored --nocapture'
+    /// ```
+    ///
+    /// to iterate on the unwrap / decode logic without going back to
+    /// WhatsApp for fresh data. Walks every dumped file, drills into
+    /// `Message.protocolMessage.editedMessage` and prints the inner
+    /// field tree so we can spot the variant Meta AI is using.
+    #[test]
+    #[ignore = "offline analysis — requires /tmp/msmsg_*.bin from a live capture"]
+    fn inspect_dumped_plaintexts() {
+        use std::fs;
+        let dir = std::path::Path::new("/tmp");
+        let mut files: Vec<_> = fs::read_dir(dir)
+            .expect("/tmp readable")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("msmsg_") && n.ends_with(".bin"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            println!("no /tmp/msmsg_*.bin files found — run the live daemon first");
+            return;
+        }
+        for path in files {
+            let bytes = fs::read(&path).expect("read");
+            println!("\n=== {} ({} bytes) ===", path.display(), bytes.len());
+            let top = parse_proto_fields(&bytes).unwrap_or_default();
+            let mut keys: Vec<_> = top.keys().copied().collect();
+            keys.sort_unstable();
+            println!("top fields: {keys:?}");
+            // Drill ProtocolMessage.editedMessage if present, then
+            // pull the AIRichResponseMessage text so we can read the
+            // actual reply Meta AI streamed.
+            let maybe_inner = unwrap_protocol_edited_message(&bytes);
+            let inner_bytes: &[u8] = maybe_inner.as_deref().unwrap_or(&bytes);
+            if maybe_inner.is_some() {
+                println!(
+                    "unwrapped ProtocolMessage.editedMessage ({} bytes)",
+                    inner_bytes.len()
+                );
+            }
+            match extract_ai_rich_text(inner_bytes) {
+                Some(text) => {
+                    println!("AIRichResponseMessage.text:");
+                    println!("---");
+                    println!("{text}");
+                    println!("---");
+                }
+                None => {
+                    let preview: String = inner_bytes
+                        .iter()
+                        .take(160)
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    println!("(no AIRichResponseMessage detected) first 160 hex: {preview}");
+                }
+            }
+        }
     }
 
     #[test]

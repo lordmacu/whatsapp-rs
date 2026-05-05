@@ -406,18 +406,17 @@ impl MessageManager {
             .cloned()
             .or_else(|| all_enc.into_iter().next()) {
             match enc_type.as_str() {
-                // Bot-decrypt experiment — only fires when
-                // WA_BOT_DECRYPT=1. The branch produces a fully-
-                // decoded payload on success so the rest of the
-                // pipeline (history append, agent dispatch) sees it
-                // as an ordinary message. On any failure we fall
-                // through to the existing "unknown enc type" path
-                // so failure mode is identical to today's behaviour.
+                // Bot replies (Meta AI etc.) — `enc type="msmsg"` from
+                // a `*@bot` JID. Decrypt and emit a dedicated
+                // `MessageEvent::BotMessage` event so consumers can
+                // surface them in their own UI WITHOUT routing them
+                // through the regular agent dispatcher (each chunk
+                // of a streamed reply would otherwise look like a
+                // fresh user message and trip the agent into a
+                // fan-out loop). We always return `None` from this
+                // branch so the standard `NewMessage` path stays
+                // dormant for bot traffic.
                 "msmsg" if crate::messages::bot_decrypt::enabled() => {
-                    // Bot replies use our LID identity (not the PN
-                    // jid) when the bot's `<meta target_sender_jid>`
-                    // is empty. whatsmeow falls back to LID for the
-                    // bot server family, so we mirror that here.
                     let our_jid_for_bot = self
                         .our_lid
                         .as_deref()
@@ -425,9 +424,14 @@ impl MessageManager {
                     match crate::messages::bot_decrypt::decrypt_msmsg(
                         node, &enc_bytes, our_jid_for_bot,
                     ) {
-                        Ok(pt) => {
-                            let pt_unpadded = unpad_wa(&pt);
-                            Some(decode_plaintext(pt_unpadded))
+                        Ok(reply) => {
+                            let _ = self.event_tx.send(MessageEvent::BotMessage {
+                                bot_jid: reply.bot_jid,
+                                msg_id: reply.msg_id,
+                                target_id: reply.target_id,
+                                edit: reply.edit,
+                                text: reply.text.unwrap_or_default(),
+                            });
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -437,9 +441,9 @@ impl MessageManager {
                                 error = %e,
                                 "bot_decrypt: msmsg failed; treating as undecryptable"
                             );
-                            None
                         }
                     }
+                    None
                 }
                 "skmsg" => {
                     let r = self.decrypt_skmsg(&from, &decrypt_jid, &enc_bytes).await;

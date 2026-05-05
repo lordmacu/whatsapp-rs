@@ -288,6 +288,14 @@ impl MessageManager {
         ).await
     }
 
+    /// Discover the AI bots WhatsApp has assigned to this account
+    /// without sending any message first. Returns an empty `Vec`
+    /// when no bots are enrolled. See `messages::bot_discovery` for
+    /// the wire-level details.
+    pub async fn list_bots(&self) -> Result<Vec<crate::messages::bot_discovery::BotListInfo>> {
+        crate::messages::bot_discovery::list_bots(&self.socket).await
+    }
+
     pub async fn send_text(&self, jid: &str, text: &str) -> Result<String> {
         let id = generate_message_id();
         let content = MessageContent::Text { text: text.to_string(), mentioned_jids: Vec::new() };

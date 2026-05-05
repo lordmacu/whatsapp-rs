@@ -8,6 +8,33 @@ the API stabilizes (0.x may break on minor bumps).
 
 ## [Unreleased]
 
+## [0.1.5] — bot decryption surfaces + discovery API
+
+### Added
+- **`MessageEvent::BotMessage`** — fired on every successful
+  `msmsg` decrypt instead of swallowing the result. Carries
+  `bot_jid`, `msg_id`, `target_id`, `edit` (`first|inner|last`),
+  and `text` already flattened from the
+  `AIRichResponseMessage.submessages[].messageText` chain. Stays
+  separate from `NewMessage` so the agent dispatcher never routes
+  bot streams as user input (which would otherwise loop the agent
+  back at the bot).
+- **`Session::list_bots()`** — discover assigned AI bots
+  (Meta AI etc.) via the documented `<iq xmlns="bot"><bot v="2"/></iq>`
+  query. Returns `Vec<BotListInfo { jid, persona_id }>` without
+  needing to send a single message first.
+- **`bot_decrypt::DecryptedBotReply`** + `extract_ai_rich_text` are
+  now `pub`, so consumers running their own dispatcher can flatten
+  `AIRichResponseMessage` plaintext into a string without
+  re-implementing the proto walk.
+
+### Changed
+- `WA_BOT_DECRYPT` is now **default ON**. Set
+  `WA_BOT_DECRYPT=0` to opt out (legacy "treat msmsg as
+  undecryptable" path).
+- `/tmp/msmsg_*.bin` plaintext dumps are now off by default.
+  Enable with `WA_BOT_DECRYPT_DUMP=1` for offline analysis.
+
 ## [0.1.4] — clean build (no warnings)
 
 ### Fixed

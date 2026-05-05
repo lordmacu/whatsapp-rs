@@ -1466,6 +1466,7 @@ fn event_label(event: &MessageEvent) -> &'static str {
         MessageEvent::Reconnecting { .. }   => "Reconnecting",
         MessageEvent::Connected             => "Connected",
         MessageEvent::AppStateUpdate { .. } => "AppStateUpdate",
+        MessageEvent::BotMessage { .. }     => "BotMessage",
     }
 }
 
