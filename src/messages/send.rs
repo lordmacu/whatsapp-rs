@@ -303,6 +303,57 @@ impl MessageManager {
         Ok(id)
     }
 
+    /// Send a manual text to an AI bot (e.g. Meta AI on
+    /// `718584497008509@bot`). Embeds a fresh `messageSecret` and
+    /// the persona id in `MessageContextInfo` — without these the
+    /// bot accepts the message but never replies (its reply
+    /// envelope needs the same secret to derive its AES key, see
+    /// `bot_decrypt`).
+    ///
+    /// The capture half of `bot_decrypt::maybe_capture_secret` runs
+    /// off the multi-fanout DSM the phone re-emits, so this same
+    /// outbound also primes our local store: when the bot replies
+    /// we already have the secret indexed by the outbound id.
+    pub async fn send_text_to_bot(
+        &self,
+        bot_jid: &str,
+        text: &str,
+        persona_id: &str,
+    ) -> Result<String> {
+        use rand::RngCore;
+        let id = generate_message_id();
+        let mut secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        let wa_bytes =
+            crate::signal::wa_proto::encode_wa_text_for_bot(text, &secret, persona_id);
+        // Diagnostic: dump the exact plaintext we're about to
+        // encrypt + send so we can diff it against what the phone
+        // ships (captured via `bot_decrypt::maybe_capture_secret`'s
+        // own dump). Same `/tmp/dsm_*` naming with a `_web` suffix
+        // so the comparison is greppable.
+        let web_dump_path = format!("/tmp/dsm_web_{id}.bin");
+        if let Err(e) = std::fs::write(&web_dump_path, &wa_bytes) {
+            tracing::debug!(
+                target: "wa::bot_decrypt",
+                error = %e,
+                "failed to dump web outbound plaintext"
+            );
+        } else {
+            tracing::info!(
+                target: "wa::bot_decrypt",
+                path = %web_dump_path,
+                len = wa_bytes.len(),
+                "bot_decrypt: web outbound plaintext dumped"
+            );
+        }
+        // Pre-populate the bot_decrypt registry too — skipping the
+        // round-trip through DSM unwrap means the bot's first reply
+        // chunk decrypts even if the phone's fan-out is delayed.
+        crate::messages::bot_decrypt::stash_secret(bot_jid, &id, &secret);
+        self.send_encrypted_bytes(bot_jid, &id, wa_bytes).await?;
+        Ok(id)
+    }
+
     pub async fn send_location(
         &self, jid: &str,
         latitude: f64, longitude: f64,

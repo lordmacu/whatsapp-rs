@@ -1150,6 +1150,26 @@ impl Session {
         self.mgr.read().await.list_bots().await.map_err(Into::into)
     }
 
+    /// Send a manual text to an AI bot (Meta AI etc.). Differs
+    /// from `send_text` in that we generate a fresh 32-byte
+    /// `messageSecret`, attach it inside `MessageContextInfo`, and
+    /// stash it locally so the bot's reply chunks decrypt
+    /// immediately. Without that secret the bot accepts the
+    /// outbound but never sends a usable reply.
+    pub async fn send_text_to_bot(
+        &self,
+        bot_jid: &str,
+        text: &str,
+        persona_id: &str,
+    ) -> Result<String> {
+        self.mgr
+            .read()
+            .await
+            .send_text_to_bot(bot_jid, text, persona_id)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn send_reply(&self, jid: &str, reply_to_id: &str, text: &str) -> Result<String> {
         self.mgr.read().await.send_reply(jid, reply_to_id, text).await.map_err(Into::into)
     }

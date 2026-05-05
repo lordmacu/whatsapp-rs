@@ -54,6 +54,7 @@ pub struct BotListInfo {
 /// list" (Ok(vec![])) from "couldn't ask".
 pub async fn list_bots(socket: &Arc<SocketSender>) -> Result<Vec<BotListInfo>> {
     let id = generate_message_id();
+    tracing::info!(target: "wa::bot_discovery", iq_id = %id, "sending bot list iq");
     let req = BinaryNode {
         tag: "iq".into(),
         attrs: vec![
@@ -69,6 +70,7 @@ pub async fn list_bots(socket: &Arc<SocketSender>) -> Result<Vec<BotListInfo>> {
         }]),
     };
     let resp = socket.send_iq_await(req).await?;
+    tracing::info!(target: "wa::bot_discovery", "bot list iq response received");
 
     // Walk: <iq><bot><section type="all"><bot jid persona_id/>…</section></bot></iq>
     let bot_node = match &resp.content {

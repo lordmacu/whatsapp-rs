@@ -9,6 +9,40 @@ pub fn encode_wa_text_message(text: &str) -> Vec<u8> {
     proto_bytes(1, text.as_bytes())
 }
 
+/// Encode a text message addressed to a bot persona (Meta AI etc).
+/// Bots refuse to reply unless the outbound carries:
+///
+///   * `MessageContextInfo.messageSecret` (32 random bytes) — used
+///     by the bot to derive the AES-GCM key for its `msmsg` reply.
+///   * `MessageContextInfo.botMetadata.personaID` — tells the
+///     server which persona to route the prompt to.
+///
+/// Field numbers (verified against `whatsmeow/proto/.../WAWebProtobufsE2E.proto`
+/// and `WAAICommon.proto`):
+///   - `Message.conversation`           = field 1
+///   - `Message.messageContextInfo`     = field 35
+///   - `MessageContextInfo.messageSecret` = field 3
+///   - `MessageContextInfo.botMetadata`   = field 7
+///   - `BotMetadata.personaID`            = field 2
+pub fn encode_wa_text_for_bot(text: &str, message_secret: &[u8], _persona_id: &str) -> Vec<u8> {
+    // Empirically the phone's outbound to a bot only carries
+    // `messageSecret` (and a `deviceListMetadata` block we don't
+    // populate yet) inside `MessageContextInfo`. It does NOT
+    // include `botMetadata.personaID` even though whatsmeow's
+    // newest send path adds it for "bot mode". Sending the extra
+    // field appears to make the server accept-but-not-process the
+    // message (single checkmark, no reply). Match the phone shape:
+    // bare `messageSecret`, no `botMetadata`. We keep `_persona_id`
+    // in the signature so callers don't break — re-introduce the
+    // field once we confirm the phone's exact layout.
+    let mut mci = Vec::new();
+    mci.extend(proto_bytes(3, message_secret));
+    let mut out = Vec::new();
+    out.extend(proto_bytes(1, text.as_bytes()));
+    out.extend(proto_message(35, &mci));
+    out
+}
+
 /// Encode a reply WAProto.Message with a quote bubble.
 ///
 /// To render a quote, peer clients require all of:

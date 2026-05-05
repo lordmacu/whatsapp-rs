@@ -144,6 +144,32 @@ fn put_secret(chat: &str, msg_id: &str, secret: Vec<u8>) {
     s.map.insert(key, secret);
 }
 
+/// Public entry point for the outbound side: callers building a
+/// bot-bound WAProto.Message with their own `messageSecret` can
+/// hand the secret here BEFORE the encrypted stanza ships, so the
+/// bot's first reply chunk decrypts without waiting on the
+/// phone's multi-device DSM fan-out (which can lag a few seconds
+/// or get dropped on flaky networks).
+pub fn stash_secret(chat: &str, msg_id: &str, secret: &[u8]) {
+    if !enabled() {
+        return;
+    }
+    if secret.len() != 32 {
+        debug!(
+            "bot_decrypt: refusing to stash secret of length {}",
+            secret.len()
+        );
+        return;
+    }
+    info!(
+        target: "wa::bot_decrypt",
+        chat = %chat,
+        msg_id = %msg_id,
+        "bot_decrypt: stashed outbound messageSecret (direct send path)"
+    );
+    put_secret(chat, msg_id, secret.to_vec());
+}
+
 /// Look up a captured secret. Returns a copy because the underlying
 /// HashMap can reshape on insert. Case-folded the same way as
 /// `put_secret` so case differences between outbound `id` and
@@ -235,6 +261,27 @@ pub fn maybe_capture_secret(plaintext: &[u8], outer_chat_jid: &str, msg_id: &str
         "bot_decrypt: captured outbound messageSecret"
     );
     put_secret(&effective_chat, msg_id, secret_bytes);
+    // Also dump the FULL DSM plaintext so we can compare it
+    // byte-for-byte with what `Session::send_text_to_bot` builds.
+    // Helps diagnose "phone reply vs daemon outbound" formatting
+    // gaps (the symptom is bot acks our send with one checkmark
+    // but never replies). Path keyed by msg_id so per-message
+    // captures don't overwrite each other.
+    let dump_path = format!("/tmp/dsm_outbound_{msg_id}.bin");
+    if let Err(e) = std::fs::write(&dump_path, plaintext) {
+        debug!(
+            target: "wa::bot_decrypt",
+            error = %e,
+            "failed to dump DSM outbound plaintext"
+        );
+    } else {
+        info!(
+            target: "wa::bot_decrypt",
+            path = %dump_path,
+            len = plaintext.len(),
+            "bot_decrypt: DSM outbound plaintext dumped"
+        );
+    }
 }
 
 /// Try the top-level `messageContextInfo`. If absent, unwrap a
