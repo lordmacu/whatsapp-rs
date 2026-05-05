@@ -7,7 +7,7 @@ use crate::auth::credentials::{AuthCredentials, KeyPair, SignedKeyPair};
 use crate::auth::session_store::SessionStore;
 use crate::signal::ratchet::{RatchetMessage, RatchetSession, RatchetSnapshot};
 use crate::signal::wa_proto::{
-    decode_pre_key_message, decode_signal_header, encode_signal_header,
+    decode_pre_key_message, encode_signal_header,
 };
 use crate::signal::x3dh::{x3dh_receiver, PreKeyBundle, PreKeyMessage};
 use anyhow::{bail, Result};
@@ -39,6 +39,8 @@ struct PersistedSkipped {
 struct PersistedEntry {
     /// Legacy field — older on-disk sessions stored a 66-byte direction-
     /// specific AD. Ignored on load (we key MAC by `peer_identity` now).
+    /// Kept on the struct so serde tolerates the field on disk; never read.
+    #[allow(dead_code)]
     #[serde(default, skip_serializing)]
     ad: Option<Vec<u8>>,
     /// Peer's identity public key (32 bytes). Added after the direction-aware
@@ -1221,6 +1223,7 @@ fn decode_signal_wire(data: &[u8]) -> Result<(RatchetMessage, Vec<u8>)> {
     ))
 }
 
+#[allow(dead_code)] // Generic protobuf varint reader — handy for ad-hoc parsing inside this crate.
 fn read_varint_at(data: &[u8], mut pos: usize) -> Result<(u64, usize)> {
     let start = pos;
     let mut result = 0u64;

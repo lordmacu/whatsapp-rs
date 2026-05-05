@@ -8,6 +8,21 @@ the API stabilizes (0.x may break on minor bumps).
 
 ## [Unreleased]
 
+## [0.1.4] — clean build (no warnings)
+
+### Fixed
+- Lib now compiles with zero warnings: dropped six unused imports
+  (`Arc`, `HASH_LEN`, `proto_varint`, `decode_signal_header`, etc.)
+  and tagged five intentionally-kept-but-unused helpers
+  (`normalize_device_jid`, `build_candidate_jids`,
+  `read_varint_at`, `msg_mac`, `PersistedEntry::ad`) with
+  `#[allow(dead_code)]` and a one-line note on why each survives.
+- Bin (`whatsapp-rs` CLI) sets `#![allow(dead_code, unused_imports)]`
+  at the crate root: it re-`mod`-s the same files the lib publishes,
+  so the public API surface trips dead-code lint when checked
+  bin-side. The allow keeps the lib's clean status while letting
+  the CLI stay terse.
+
 ## [0.1.3] — pin xeddsa to 1.0.2 (build fix)
 
 ### Fixed

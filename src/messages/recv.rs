@@ -14,6 +14,7 @@ const NACK_UNHANDLED_ERROR: u32 = 500;
 /// happens when the primary phone sends to us without a device suffix in the
 /// `from` attr, but we separately initiate a session using the explicit `:0`
 /// form.
+#[allow(dead_code)] // Reserved — used by the deprecated `:0`-fallback path; keep for ad-hoc debugging.
 fn normalize_device_jid(jid: &str) -> String {
     let at = match jid.find('@') { Some(i) => i, None => return jid.to_string() };
     let (before, server) = (&jid[..at], &jid[at..]);
@@ -1579,6 +1580,7 @@ pub fn extract_all_enc(node: &BinaryNode) -> Vec<(Vec<u8>, String)> {
 ///      sends to that number).
 ///
 /// The first candidate that successfully decrypts wins.
+#[allow(dead_code)] // Helper kept for the multi-candidate decrypt path that's currently disabled.
 fn build_candidate_jids(
     primary: &str,
     node: &BinaryNode,

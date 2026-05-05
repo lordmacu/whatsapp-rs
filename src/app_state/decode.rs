@@ -4,7 +4,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::debug;
 
 use super::crypto::{
@@ -12,10 +11,9 @@ use super::crypto::{
     MutationKeys, SyncdOperation,
 };
 use super::keys::AppStateKeyStore;
-use super::lt_hash::{add, sub, HASH_LEN};
+use super::lt_hash::{add, sub};
 use super::proto::{
-    decode_external_blob, decode_sync_action_data, decode_syncd_mutations_blob,
-    decode_syncd_patch, decode_syncd_snapshot, ExternalBlobRef, SyncdMutation,
+    decode_sync_action_data, decode_syncd_mutations_blob, ExternalBlobRef,
     SyncdPatch, SyncdRecord, SyncdSnapshot,
 };
 use super::state::CollectionState;

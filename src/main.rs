@@ -1,3 +1,11 @@
+// The bin re-declares every module the lib publishes (via `mod …;`
+// instead of `use wa_agent::…`), so when this binary compiles, every
+// public API surface area is checked against "is this used IN this
+// bin?" — and the honest answer for most of it is "no, it's there
+// for library consumers". Suppress those bin-only dead-code /
+// unused-import warnings without touching the lib's clean status.
+#![allow(dead_code, unused_imports)]
+
 mod agent;
 mod app_state;
 mod auth;

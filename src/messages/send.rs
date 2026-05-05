@@ -155,7 +155,7 @@ fn parse_retry_keys_bundle(
 /// own other devices can display the message as "sent by me". Matches
 /// Baileys `encodeWAMessage({ deviceSentMessage: { destinationJid, message } })`.
 fn wrap_device_sent_message(destination_jid: &str, inner_msg_bytes: &[u8]) -> Vec<u8> {
-    use crate::signal::wa_proto::{proto_bytes, proto_varint as _};
+    use crate::signal::wa_proto::proto_bytes;
     // DeviceSentMessage body: field 1 = destinationJid, field 2 = message.
     let mut body = Vec::new();
     body.extend(proto_bytes(1, destination_jid.as_bytes()));
@@ -750,9 +750,9 @@ impl MessageManager {
     /// Side-effects: registers poll enc_key in PollStore when encoding a Poll.
     fn encode_content(&self, msg: &WAMessage) -> Result<Vec<u8>> {
         use crate::signal::wa_proto::{
-            encode_wa_audio_message, encode_wa_document_message, encode_wa_image_message,
+            encode_wa_audio_message, encode_wa_document_message,
             encode_wa_link_preview_message, encode_wa_reaction_message, encode_wa_reply_message,
-            encode_wa_sticker_message, encode_wa_text_message, encode_wa_video_message,
+            encode_wa_sticker_message, encode_wa_text_message,
             wrap_view_once,
         };
         let bytes = match &msg.message {

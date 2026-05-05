@@ -384,6 +384,7 @@ fn msg_decrypt(mk: &[u8; 32], wire_with_mac: &[u8], ad: &[u8]) -> Result<Vec<u8>
         .map_err(|e| anyhow::anyhow!("decrypt: {e}"))
 }
 
+#[allow(dead_code)] // Legacy AD-keyed MAC — superseded by the identity-keyed path; kept for round-trip.
 fn msg_mac(auth_key: &[u8; 32], ad: &[u8], ciphertext: &[u8]) -> [u8; 8] {
     let mut mac = HmacSha256::new_from_slice(auth_key).expect("hmac");
     mac.update(ad);
