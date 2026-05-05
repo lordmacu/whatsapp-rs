@@ -1,3 +1,4 @@
+pub mod bot_decrypt;
 pub mod link_preview;
 pub mod rate_limit;
 pub mod recent_sends;

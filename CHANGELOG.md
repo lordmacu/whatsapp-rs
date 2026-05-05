@@ -8,6 +8,31 @@ the API stabilizes (0.x may break on minor bumps).
 
 ## [Unreleased]
 
+## [0.1.2] — Meta AI / `@bot` decryption + media field-number fix
+
+### Added
+- **`messages::bot_decrypt`** (opt-in via `WA_BOT_DECRYPT=1`) —
+  decrypt inbound `enc type="msmsg"` envelopes from `*@bot` JIDs
+  (Meta AI and friends). Captures `MessageContextInfo.messageSecret`
+  off our own outbound DSM, derives the AES-GCM key per the
+  whatsmeow algorithm (HKDF-SHA256 with the "Bot Message" tag, our
+  LID as origMsgSender, the bot JID as modSender), and unwraps the
+  resulting `ProtocolMessage.editedMessage` (Meta AI streams
+  replies as a sequence of `<bot edit="…" edit_target_id="…">`
+  edits — `inner` and `last` re-key off the FIRST chunk's id).
+  Off by default; in-memory FIFO secret store capped at 1024 entries.
+- `agent::ctx_has_actionable_text` now also pulses the typing
+  heartbeat for inbound audio messages so the user sees an
+  "escribiendo…" while STT + LLM run.
+
+### Fixed
+- `signal::wa_proto::decode_wa_media` / `parse_media_sub` now
+  hand the outer message tag through to the sub-parser. WAProto
+  uses different field numbers for `mediaKey` / `fileEncSHA256`
+  per media type — the previous version hardcoded the image
+  layout and silently broke audio / video / document / sticker
+  HMAC verification ("media MAC mismatch" symptom).
+
 ## [0.1.1] — multi-account isolation
 
 ### Added

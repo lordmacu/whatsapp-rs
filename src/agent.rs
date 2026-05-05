@@ -449,14 +449,19 @@ pub fn extract_text(content: Option<&MessageContent>) -> Option<String> {
 }
 
 /// Phase 82.10.q — only treat the inbound as "actionable" (worth
-/// pulsing the typing-heartbeat for) when we have non-empty text.
-/// Decrypt-failed stubs, app-state syncs, and non-text content all
-/// return `None` from [`extract_text`] — those events shouldn't
-/// pulse "composing..." on the peer phone or each phantom pulse
-/// leaves a stale "escribiendo..." state when the offline backlog
-/// drains on reconnect.
-fn ctx_has_actionable_text(text: &Option<String>) -> bool {
-    text.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+/// pulsing the typing-heartbeat for) when the handler is going to
+/// produce a real response. We pulse for:
+///   * non-empty text (regular chat reply path);
+///   * audio messages (the handler will run STT + LLM, taking ≥1 s
+///     — without typing the user sees nothing for the duration).
+/// We DON'T pulse for decrypt-failed stubs, app-state syncs, or
+/// stickers / images (those still return `Response::Noop` today,
+/// so a phantom "escribiendo..." would leave a stale UI hint).
+fn ctx_has_actionable_text(text: &Option<String>, content: Option<&MessageContent>) -> bool {
+    if text.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        return true;
+    }
+    matches!(content, Some(MessageContent::Audio { .. }))
 }
 
 impl Session {
@@ -588,7 +593,7 @@ impl Session {
                 }
             }
 
-            let has_text = ctx_has_actionable_text(&text);
+            let has_text = ctx_has_actionable_text(&text, msg.message.as_ref());
             let ctx = AgentCtx { msg: msg.clone(), text };
 
             // Phase 82.10.q — only fire the typing heartbeat when

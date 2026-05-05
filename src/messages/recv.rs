@@ -405,6 +405,41 @@ impl MessageManager {
             .cloned()
             .or_else(|| all_enc.into_iter().next()) {
             match enc_type.as_str() {
+                // Bot-decrypt experiment — only fires when
+                // WA_BOT_DECRYPT=1. The branch produces a fully-
+                // decoded payload on success so the rest of the
+                // pipeline (history append, agent dispatch) sees it
+                // as an ordinary message. On any failure we fall
+                // through to the existing "unknown enc type" path
+                // so failure mode is identical to today's behaviour.
+                "msmsg" if crate::messages::bot_decrypt::enabled() => {
+                    // Bot replies use our LID identity (not the PN
+                    // jid) when the bot's `<meta target_sender_jid>`
+                    // is empty. whatsmeow falls back to LID for the
+                    // bot server family, so we mirror that here.
+                    let our_jid_for_bot = self
+                        .our_lid
+                        .as_deref()
+                        .unwrap_or(&self.our_jid);
+                    match crate::messages::bot_decrypt::decrypt_msmsg(
+                        node, &enc_bytes, our_jid_for_bot,
+                    ) {
+                        Ok(pt) => {
+                            let pt_unpadded = unpad_wa(&pt);
+                            Some(decode_plaintext(pt_unpadded))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "wa::bot_decrypt",
+                                from = %from,
+                                msg_id = %id,
+                                error = %e,
+                                "bot_decrypt: msmsg failed; treating as undecryptable"
+                            );
+                            None
+                        }
+                    }
+                }
                 "skmsg" => {
                     let r = self.decrypt_skmsg(&from, &decrypt_jid, &enc_bytes).await;
                     // If no sender key yet, ask sender to re-ship SKDM. For
@@ -483,6 +518,13 @@ impl MessageManager {
                             self.retry_ids.lock().unwrap()
                                 .remove(&sender_retry_key(sender_jid));
                             let plaintext = unpad_wa(&plaintext);
+                            // Bot-decrypt experiment: capture MessageSecret
+                            // when the multi-fanned-out outbound is destined
+                            // for a bot chat. No-op when WA_BOT_DECRYPT is
+                            // unset (default).
+                            crate::messages::bot_decrypt::maybe_capture_secret(
+                                plaintext, &from, &id,
+                            );
                             self.maybe_process_skdm(&decrypt_jid, plaintext);
                             Some(decode_plaintext(plaintext))
                         }

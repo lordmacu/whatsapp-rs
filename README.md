@@ -115,6 +115,67 @@ group-leave / group-subject / group-desc / group <jid>`.
 - **`run_agent_with_transcribe(acl, stt, handler)`** — voice-note in,
   text out via your STT (Whisper, Deepgram, local).
 
+### Meta AI / `@bot` decryption (experimental, opt-in)
+
+Inbound messages from WhatsApp's built-in **Meta AI** assistant (and
+any other `*@bot` JID) arrive on the wire as `enc type="msmsg"` — a
+Meta-internal envelope that's distinct from the regular Signal
+`pkmsg` / `msg` / `skmsg` types and is **not** part of the Signal
+ratchet. By default the library treats `msmsg` as undecryptable
+(same behaviour as before). Set the env var `WA_BOT_DECRYPT=1` to
+opt into the experimental decryption pipeline:
+
+```bash
+WA_BOT_DECRYPT=1 cargo run --release -- listen
+```
+
+When the flag is set, two hooks light up:
+
+1. **Capture** — every successfully decrypted Signal plaintext is
+   sniffed for `MessageContextInfo.messageSecret` (proto field 35 →
+   field 3). When the user's phone sends to a bot, the outbound is
+   multi-fanned to every linked device wrapped in a
+   `deviceSentMessage` (DSM, field 31). We unwrap the DSM, confirm
+   the destination is `*@bot`, and stash the 32-byte secret in an
+   in-memory FIFO keyed by `(bot_jid, msg_id)` (case-folded).
+2. **Decrypt** — when an `<enc type="msmsg">` arrives from a bot,
+   we read `<meta target_id>` to find the original outbound id and
+   look the secret up. The reply's AES-GCM key is derived per the
+   whatsmeow / WhatsApp Web algorithm:
+
+   ```text
+   base   = HKDF-SHA256(messageSecret,    salt=∅, info="Bot Message",   L=32)
+   useCase= msgID ∥ ourLID(NonAD) ∥ botJID(NonAD) ∥ ""    // empty modType
+   aesKey = HKDF-SHA256(base,             salt=∅, info=useCase,         L=32)
+   aad    = msgID ∥ 0x00 ∥ botJID(NonAD)
+   pt     = AES-256-GCM(aesKey, encIV, encPayload, aad)
+   ```
+
+Two corners that bit us empirically and are now handled:
+
+- **Streamed edits.** Meta AI ships replies as a sequence of
+  `<bot edit="first|inner|last" edit_target_id="…">` chunks; each
+  chunk REPLACES the previous one. For `inner` and `last` the
+  derivation uses `edit_target_id` (the FIRST chunk's id), not the
+  per-chunk stanza id. Whatsmeow does the same.
+- **Identity for bot keys is the LID, not the PN.** The `<meta>`
+  on bot replies usually omits `target_sender_jid`; whatsmeow falls
+  back to `cli.getOwnLID()` because the bot family server uses LID
+  identities. We pass `Session.our_lid` (NonAD-stripped) into the
+  derivation when the meta attr is empty.
+
+After decrypt the plaintext is a `WAProto.Message` wrapped in a
+`ProtocolMessage.editedMessage` (field 12 → field 14 — Meta AI
+emits `MESSAGE_EDIT` for streaming UX). We unwrap that envelope so
+the rest of the pipeline (text extraction, agent dispatch, outbox)
+sees the bot reply as an ordinary text message.
+
+Off by default for two reasons: the in-memory secret store costs
+RAM (capped at 1024 entries), and the feature touches a Meta-
+internal protocol that might shift on any upstream update. Logs
+land on the `wa::bot_decrypt` target (`info!` for capture +
+decrypt success, `debug!` for derivation inputs).
+
 ### Reliability
 
 - Reconnect loop with exponential backoff + ±20% jitter + liveness

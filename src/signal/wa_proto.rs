@@ -604,12 +604,15 @@ pub struct WaMediaFields {
 ///   3=image, 4=document, 5=audio, 6=video, 20=sticker
 pub fn decode_wa_media(data: &[u8]) -> Option<(WaMediaFields, u64)> {
     let outer = parse_proto_fields(data)?;
-    // Canonical fields first (image=3, document=7, audio=8, video=9,
-    // sticker=26). Legacy 4/5/6/20 kept as fallback so messages we sent
-    // ourselves before the field-number fix still decode.
+    // Canonical message tags (image=3, document=7, audio=8, video=9,
+    // sticker=26). Each one's sub-payload uses a DIFFERENT field
+    // number for `mediaKey` per WAProto, so we hand the message-tag
+    // through to the sub parser (legacy tags 4/5/6/20 are kept for
+    // round-trip with our own pre-fix stored messages — they don't
+    // appear in real inbound, so passing the same tag is fine).
     for &field in &[3u64, 7, 8, 9, 26, 4, 5, 6, 20] {
         if let Some(sub) = outer.get(&field) {
-            if let Some(m) = parse_media_sub(sub) {
+            if let Some(m) = parse_media_sub(sub, field) {
                 return Some((m, field));
             }
         }
@@ -617,25 +620,66 @@ pub fn decode_wa_media(data: &[u8]) -> Option<(WaMediaFields, u64)> {
     None
 }
 
-fn parse_media_sub(data: &[u8]) -> Option<WaMediaFields> {
+fn parse_media_sub(data: &[u8], outer_tag: u64) -> Option<WaMediaFields> {
     let f = parse_proto_fields(data)?;
 
-    // Canonical (Baileys) sub-field layout. Legacy tags (3=sha,4=len,7=key,
-    // 8=caption,15=directPath) tried as fallback so our own stored messages
-    // from before the fix still round-trip.
+    // Per WAProto, the mediaKey + fileEncSHA256 fields land at
+    // different positions for each message type. Hardcoding `8` (the
+    // image layout) silently broke audio/video/document/sticker
+    // because field 8 in those is `fileEncSHA256` — verifying the
+    // HMAC against that produced the well-known "media MAC mismatch"
+    // crash on every voice note. Layout cheatsheet:
+    //
+    //   ImageMessage    : url=1 mime=2 caption=3 sha=4 len=5 mk=8  enc_sha=9
+    //   AudioMessage    : url=1 mime=2 sha=3 len=4 sec=5 ptt=6 mk=7  enc_sha=8
+    //   VideoMessage    : url=1 mime=2 sha=3 len=4 sec=5 mk=6 cap=7 enc_sha=11
+    //   DocumentMessage : url=1 mime=2 title=3 sha=4 len=5 pages=6 mk=7 fname=8 enc_sha=9
+    //   StickerMessage  : url=1 sha=2 enc_sha=3 mk=4 mime=5 height=6 width=7
+    let (mk_field, enc_sha_field, sha_field, len_field, mime_field, caption_field) =
+        match outer_tag {
+            // Image (canonical 3, legacy 4)
+            3 | 4 => (8, 9, 4, 5, 2, Some(3)),
+            // Document (canonical 7)
+            7 => (7, 9, 4, 5, 2, None),
+            // Audio (canonical 8, legacy 5)
+            8 | 5 => (7, 8, 3, 4, 2, None),
+            // Video (canonical 9, legacy 6)
+            9 | 6 => (6, 11, 3, 4, 2, Some(7)),
+            // Sticker (canonical 26, legacy 20)
+            26 | 20 => (4, 3, 2, 0 /*len absent*/, 5, None),
+            // Fallback: the legacy "image-like" guess we used before.
+            _ => (8, 9, 4, 5, 2, Some(3)),
+        };
+
     let url = f.get(&1).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
-    let mimetype = f.get(&2).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
-    let caption = f.get(&3).and_then(|b| String::from_utf8(b.clone()).ok())
-        .or_else(|| f.get(&8).and_then(|b| String::from_utf8(b.clone()).ok()));
-    let file_sha256 = f.get(&4).cloned().or_else(|| f.get(&3).cloned()).unwrap_or_default();
-    let file_length = f.get(&5).or_else(|| f.get(&4))
-        .and_then(|b| read_varint_from_bytes(b)).unwrap_or(0);
-    let media_key = f.get(&8).cloned().or_else(|| f.get(&7).cloned()).unwrap_or_default();
-    let file_enc_sha256 = f.get(&9).cloned().unwrap_or_default();
-    let direct_path = f.get(&11).and_then(|b| String::from_utf8(b.clone()).ok())
-        .or_else(|| f.get(&15).and_then(|b| String::from_utf8(b.clone()).ok()))
+    let mimetype = f.get(&mime_field).and_then(|b| String::from_utf8(b.clone()).ok()).unwrap_or_default();
+    let caption = caption_field
+        .and_then(|cf| f.get(&cf).and_then(|b| String::from_utf8(b.clone()).ok()));
+    let file_sha256 = f.get(&sha_field).cloned().unwrap_or_default();
+    let file_length = if len_field == 0 {
+        0
+    } else {
+        f.get(&len_field).and_then(|b| read_varint_from_bytes(b)).unwrap_or(0)
+    };
+    let media_key = f.get(&mk_field).cloned().unwrap_or_default();
+    let file_enc_sha256 = f.get(&enc_sha_field).cloned().unwrap_or_default();
+    // directPath lives at field 11 (image/audio canonical) or 13
+    // (video) — try a small whitelist instead of hard-coding.
+    let direct_path = [11u64, 13, 8, 15]
+        .iter()
+        .find_map(|p| f.get(p).and_then(|b| String::from_utf8(b.clone()).ok()))
         .unwrap_or_default();
-    let file_name = f.get(&30).and_then(|b| String::from_utf8(b.clone()).ok());
+    let file_name = f.get(&30).and_then(|b| String::from_utf8(b.clone()).ok())
+        .or_else(|| {
+            // Document.fileName is field 8 — caption_field handles
+            // image's "caption" at 3 / video's at 7, document gets
+            // fileName at 8 instead.
+            if outer_tag == 7 {
+                f.get(&8).and_then(|b| String::from_utf8(b.clone()).ok())
+            } else {
+                None
+            }
+        });
 
     if url.is_empty() && direct_path.is_empty() {
         return None;
