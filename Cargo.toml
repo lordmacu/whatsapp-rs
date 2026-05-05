@@ -1,6 +1,6 @@
 [package]
 name          = "wa-agent"
-version       = "0.1.2"
+version       = "0.1.3"
 edition       = "2021"
 rust-version  = "1.88"
 description   = "WhatsApp multi-device client library — Signal-protocol 1:1 + groups, media, polls, view-once, scheduler, and an agent runtime for LLM / webhook / voice-note bots."
@@ -62,7 +62,7 @@ cbc = { version = "0.1", features = ["alloc"] }
 ctr = "0.9"
 pbkdf2 = "0.12"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-xeddsa = "1"
+xeddsa = "=1.0.2"   # 1.1 broke API: switched to rand_core::CryptoRng (OsRng no longer impls it)
 
 # Protobuf
 prost = "0.13"

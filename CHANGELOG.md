@@ -8,6 +8,16 @@ the API stabilizes (0.x may break on minor bumps).
 
 ## [Unreleased]
 
+## [0.1.3] — pin xeddsa to 1.0.2 (build fix)
+
+### Fixed
+- Pin `xeddsa = "=1.0.2"` so a fresh resolver doesn't pull
+  `xeddsa 1.1.0`, which switched the `Sign::sign` bound from
+  `rand::CryptoRng` to `rand_core::CryptoRng` and broke
+  compilation against `rand::rngs::OsRng`. v0.1.2 (just published)
+  builds fine against the locked 1.0.2 but fails on a clean
+  CI resolve.
+
 ## [0.1.2] — Meta AI / `@bot` decryption + media field-number fix
 
 ### Added
