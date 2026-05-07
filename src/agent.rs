@@ -322,6 +322,81 @@ impl Response {
     pub fn react(emoji: impl std::fmt::Display) -> Self { Self::React(emoji.to_string()) }
 }
 
+/// When the runtime starts the chat-presence heartbeat for a turn.
+///
+/// Ported semantics (the names match
+/// `research/docs/concepts/typing-indicators.md`); only `Instant`
+/// and `Never` are honoured in v1. The other two are accepted by
+/// the parser so callers can pre-configure their YAML for a
+/// future release without breaking it; today they fall back to
+/// `Instant` with a `tracing::warn!` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypingMode {
+    /// Start pulsing as soon as the handler is invoked. v1 default.
+    Instant,
+    /// Start when the LLM emits its first reasoning delta. v1
+    /// fallback to `Instant` + warn.
+    Thinking,
+    /// Start when the first non-silent text delta arrives. v1
+    /// fallback to `Instant` + warn.
+    Message,
+    /// Skip auto-presence; caller manages it.
+    Never,
+}
+
+impl Default for TypingMode {
+    fn default() -> Self { Self::Instant }
+}
+
+/// Returned by [`TypingMode::from_str`] for unknown values. Owned
+/// `String` so the error survives the parse borrow.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("unknown typing_mode `{0}`; valid: instant|thinking|message|never")]
+pub struct ParseTypingModeError(pub String);
+
+impl std::str::FromStr for TypingMode {
+    type Err = ParseTypingModeError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "instant" => Ok(Self::Instant),
+            "thinking" => Ok(Self::Thinking),
+            "message" => Ok(Self::Message),
+            "never" => Ok(Self::Never),
+            other => Err(ParseTypingModeError(other.to_string())),
+        }
+    }
+}
+
+/// Builder-style options for [`crate::Session::run_agent_with_opts`].
+///
+/// `RunAgentOpts::default()` reproduces the pre-step-11 behaviour
+/// of [`crate::Session::run_agent`] — auto-typing on, instant
+/// mode, default presence-heartbeat config — so the existing
+/// entry points can delegate to the new API without any caller
+/// observing a difference.
+#[derive(Debug, Clone, Copy)]
+pub struct RunAgentOpts {
+    /// When `true`, the runtime starts a presence heartbeat per
+    /// inbound turn. Set `false` if your channel plugin owns
+    /// presence end-to-end.
+    pub auto_typing: bool,
+    /// When the heartbeat starts. See [`TypingMode`].
+    pub typing_mode: TypingMode,
+    /// Tunables forwarded to
+    /// [`crate::Session::chat_presence_heartbeat_with`].
+    pub presence_cfg: crate::presence_handle::PresenceHeartbeatConfig,
+}
+
+impl Default for RunAgentOpts {
+    fn default() -> Self {
+        Self {
+            auto_typing: true,
+            typing_mode: TypingMode::default(),
+            presence_cfg: crate::presence_handle::PresenceHeartbeatConfig::default(),
+        }
+    }
+}
+
 // ── Access control ────────────────────────────────────────────────────────────
 
 /// Gate an agent on a set of allowed JIDs so it only responds to known
@@ -458,6 +533,44 @@ mod tests {
     }
 
     #[test]
+    fn typing_mode_parses_known_variants() {
+        use std::str::FromStr;
+        assert_eq!(TypingMode::from_str("instant").unwrap(), TypingMode::Instant);
+        assert_eq!(TypingMode::from_str("thinking").unwrap(), TypingMode::Thinking);
+        assert_eq!(TypingMode::from_str("message").unwrap(), TypingMode::Message);
+        assert_eq!(TypingMode::from_str("never").unwrap(), TypingMode::Never);
+    }
+
+    #[test]
+    fn typing_mode_parser_is_case_insensitive_and_trims() {
+        use std::str::FromStr;
+        assert_eq!(TypingMode::from_str("  Instant  ").unwrap(), TypingMode::Instant);
+        assert_eq!(TypingMode::from_str("NEVER").unwrap(), TypingMode::Never);
+    }
+
+    #[test]
+    fn typing_mode_unknown_value_errors_with_owned_string() {
+        use std::str::FromStr;
+        let err = TypingMode::from_str("bogus").unwrap_err();
+        assert_eq!(err.0, "bogus");
+        assert!(err.to_string().contains("instant|thinking|message|never"));
+    }
+
+    #[test]
+    fn typing_mode_default_is_instant() {
+        assert_eq!(TypingMode::default(), TypingMode::Instant);
+    }
+
+    #[test]
+    fn run_agent_opts_default_matches_legacy_behaviour() {
+        let opts = RunAgentOpts::default();
+        assert!(opts.auto_typing);
+        assert_eq!(opts.typing_mode, TypingMode::Instant);
+        // Presence cfg defaults verified separately in
+        // `presence_handle::tests::default_config_matches_documented_values`.
+    }
+
+    #[test]
     fn contains_voice_note_recurses_into_multi() {
         let multi_with_voice = Response::Multi(vec![
             Response::Text("first".into()),
@@ -557,7 +670,25 @@ impl Session {
         F: Fn(AgentCtx) -> Fut,
         Fut: std::future::Future<Output = Response>,
     {
-        self.run_agent_full(acl, None, handler).await
+        self.run_agent_full(acl, None, RunAgentOpts::default(), handler).await
+    }
+
+    /// Like [`Self::run_agent_with`] but with explicit
+    /// [`RunAgentOpts`] (typing mode, presence heartbeat config,
+    /// `auto_typing` toggle). Use when the channel plugin needs
+    /// to disable the auto-typing or supply non-default
+    /// keepalive/TTL/breaker thresholds.
+    pub async fn run_agent_with_opts<F, Fut>(
+        &self,
+        acl: Acl,
+        opts: RunAgentOpts,
+        handler: F,
+    ) -> crate::error::Result<()>
+    where
+        F: Fn(AgentCtx) -> Fut,
+        Fut: std::future::Future<Output = Response>,
+    {
+        self.run_agent_full(acl, None, opts, handler).await
     }
 
     /// Run an agent loop that transcribes incoming voice notes / audio
@@ -576,13 +707,20 @@ impl Session {
         F: Fn(AgentCtx) -> Fut,
         Fut: std::future::Future<Output = Response>,
     {
-        self.run_agent_full(acl, Some(Box::new(transcribe) as Box<dyn Transcriber>), handler).await
+        self.run_agent_full(
+            acl,
+            Some(Box::new(transcribe) as Box<dyn Transcriber>),
+            RunAgentOpts::default(),
+            handler,
+        )
+        .await
     }
 
     async fn run_agent_full<F, Fut>(
         &self,
         acl: Acl,
         transcribe: Option<Box<dyn Transcriber>>,
+        opts: RunAgentOpts,
         handler: F,
     ) -> crate::error::Result<()>
     where
@@ -657,34 +795,83 @@ impl Session {
             let has_text = ctx_has_actionable_text(&text, msg.message.as_ref());
             let ctx = AgentCtx { msg: msg.clone(), text };
 
-            // Phase 82.10.q — only fire the typing heartbeat when
-            // we have actionable text. Decrypt-failed messages and
+            // Phase 82.10.q — only fire the heartbeat when we have
+            // actionable text. Decrypt-failed messages and
             // non-text content (status updates, app-state syncs)
             // shouldn't pulse "composing..." on the peer phone —
             // each phantom pulse leaves a stale "escribiendo..."
             // hint in the WhatsApp client UI when the offline
             // backlog drains on reconnect.
-            let _typing = if has_text {
-                Some(self.typing_heartbeat(&msg.key.remote_jid))
-            } else {
-                None
-            };
+            //
+            // `RunAgentOpts.auto_typing == false` opts out entirely
+            // (channel plugin owns presence). `typing_mode == Never`
+            // does the same; `Thinking` and `Message` fall back to
+            // `Instant` v1 — the runtime warn-logs once on the
+            // first inbound and continues. No-op for `Instant`
+            // (current behaviour).
+            let mut presence_handle: Option<crate::presence_handle::PresenceHandle> = None;
+            if has_text && opts.auto_typing {
+                let effective_mode = match opts.typing_mode {
+                    TypingMode::Never => None,
+                    TypingMode::Instant => Some(TypingMode::Instant),
+                    TypingMode::Thinking | TypingMode::Message => {
+                        tracing::warn!(
+                            requested_mode = ?opts.typing_mode,
+                            "typing_mode `Thinking`/`Message` not implemented yet; falling back to Instant"
+                        );
+                        Some(TypingMode::Instant)
+                    }
+                };
+                if effective_mode.is_some() {
+                    presence_handle = Some(self.chat_presence_heartbeat_with(
+                        &msg.key.remote_jid,
+                        crate::messages::ChatPresenceMedia::Text,
+                        opts.presence_cfg,
+                    ));
+                }
+            }
             let _slow = self.slow_notice(&msg.key.remote_jid);
             let response = handler(ctx).await;
             drop(_slow);
+
+            // Voice-note switch: if the response (or any nested
+            // child of `Response::Multi`) is a `VoiceNote`, flip
+            // the active heartbeat to `Audio` and give the peer
+            // client ~250 ms to repaint the indicator before we
+            // pause + send. The sleep is cosmetic — the wire
+            // accepts back-to-back stanzas just fine, but
+            // WhatsApp Web debounces UI updates and a near-zero
+            // gap can paint the "recording…" indicator for a
+            // single frame.
+            let switched_audio = response.contains_voice_note();
+            if switched_audio {
+                if let Some(h) = presence_handle.as_ref() {
+                    h.switch_media(crate::messages::ChatPresenceMedia::Audio);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+
             // Phase 82.10.q — abort the heartbeat refresher task and
-            // explicitly `await` a `send_typing(false)` so the "paused"
-            // packet lands BEFORE the outbound message. The default
-            // `Drop` impl spawns the clear async (fire-and-forget),
-            // which races the `send_text` packet — peer phones can
-            // see "escribiendo..." stuck because the `paused` arrives
-            // after the message or never (if the runtime scheduler is
-            // busy). Explicit await pins the order. Only emit the
-            // explicit clear if we actually started a heartbeat
-            // (avoids wakeup on phantom decrypt-failed messages).
-            if _typing.is_some() {
-                drop(_typing);
-                let _ = self.send_typing(&msg.key.remote_jid, false).await;
+            // explicitly `await` a `send_chat_presence(Paused, None)`
+            // so the "paused" packet lands BEFORE the outbound
+            // message. The default `Drop` impl spawns the clear
+            // async (fire-and-forget), which races the `send_text`
+            // / `send_voice_note` packet — peer phones can see
+            // "escribiendo..." / "grabando..." stuck because the
+            // `paused` arrives after the message or never (if the
+            // runtime scheduler is busy). Explicit await pins the
+            // order. Only emit the explicit clear if we actually
+            // started a heartbeat (avoids wakeup on phantom
+            // decrypt-failed messages).
+            if presence_handle.is_some() {
+                drop(presence_handle);
+                let _ = self
+                    .send_chat_presence(
+                        &msg.key.remote_jid,
+                        crate::messages::ChatPresenceState::Paused,
+                        None,
+                    )
+                    .await;
             }
 
             if let Err(e) = self.apply_response(&msg.key, response).await {
