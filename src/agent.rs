@@ -287,8 +287,30 @@ pub enum Response {
     Image { data: Vec<u8>, caption: Option<String> },
     /// MP4 video with optional caption.
     Video { data: Vec<u8>, caption: Option<String> },
+    /// Push-to-talk voice note. `mime` is typically
+    /// `"audio/ogg; codecs=opus"`; the runtime trusts the caller to
+    /// supply opus-encoded bytes (see [`Session::send_voice_note`]).
+    /// Surfaced as a variant so [`Session::run_agent_with_opts`]
+    /// (Step 11) can switch the active presence handle to
+    /// [`crate::messages::ChatPresenceMedia::Audio`] before
+    /// applying.
+    VoiceNote { data: Vec<u8>, mime: String },
     /// Multiple responses sent in order.
     Multi(Vec<Response>),
+}
+
+impl Response {
+    /// `true` when this response (or any nested
+    /// [`Response::Multi`] child) is a [`Response::VoiceNote`].
+    /// Used by the agent runtime to decide whether to switch the
+    /// active presence handle to `Audio` before applying.
+    pub fn contains_voice_note(&self) -> bool {
+        match self {
+            Self::VoiceNote { .. } => true,
+            Self::Multi(items) => items.iter().any(Self::contains_voice_note),
+            _ => false,
+        }
+    }
 }
 
 impl Response {
@@ -414,6 +436,45 @@ mod tests {
             Response::Text(s) => assert_eq!(s, "a"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn voice_note_response_constructs_correctly() {
+        let r = Response::VoiceNote { data: vec![1, 2, 3], mime: "audio/ogg; codecs=opus".into() };
+        match &r {
+            Response::VoiceNote { data, mime } => {
+                assert_eq!(data, &vec![1u8, 2, 3]);
+                assert_eq!(mime, "audio/ogg; codecs=opus");
+            }
+            _ => panic!("expected VoiceNote variant"),
+        }
+    }
+
+    #[test]
+    fn contains_voice_note_detects_top_level() {
+        assert!(Response::VoiceNote { data: vec![], mime: "x".into() }.contains_voice_note());
+        assert!(!Response::Text("hi".into()).contains_voice_note());
+        assert!(!Response::Noop.contains_voice_note());
+    }
+
+    #[test]
+    fn contains_voice_note_recurses_into_multi() {
+        let multi_with_voice = Response::Multi(vec![
+            Response::Text("first".into()),
+            Response::VoiceNote { data: vec![], mime: "x".into() },
+        ]);
+        assert!(multi_with_voice.contains_voice_note());
+
+        let multi_without = Response::Multi(vec![
+            Response::Text("a".into()),
+            Response::Text("b".into()),
+        ]);
+        assert!(!multi_without.contains_voice_note());
+
+        let nested = Response::Multi(vec![Response::Multi(vec![
+            Response::VoiceNote { data: vec![], mime: "x".into() },
+        ])]);
+        assert!(nested.contains_voice_note());
     }
 }
 
@@ -682,6 +743,10 @@ impl Session {
             }
             Response::Video { data, caption } => {
                 self.send_video(&trigger.remote_jid, &data, caption.as_deref()).await?;
+                Ok(())
+            }
+            Response::VoiceNote { data, mime } => {
+                self.send_voice_note(&trigger.remote_jid, &data, &mime).await?;
                 Ok(())
             }
             Response::Multi(items) => {
