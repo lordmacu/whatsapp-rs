@@ -1070,27 +1070,20 @@ impl Drop for Session {
 
 /// RAII handle for a typing heartbeat. See [`Session::typing_heartbeat`].
 ///
-/// Dropping the handle aborts the refresher task and fires one last
-/// `typing=off` in a background task (Drop can't be async). The off send
-/// is best-effort — it may race with the task-executor being torn down
-/// but normally lands well under 100 ms.
-pub struct TypingHandle {
-    abort: tokio::task::AbortHandle,
-    mgr: Arc<RwLock<Arc<MessageManager>>>,
-    jid: String,
-}
-
-impl Drop for TypingHandle {
-    fn drop(&mut self) {
-        self.abort.abort();
-        let mgr = self.mgr.clone();
-        let jid = std::mem::take(&mut self.jid);
-        tokio::spawn(async move {
-            let m = mgr.read().await;
-            let _ = m.send_typing(&jid, false).await;
-        });
-    }
-}
+/// Newtype wrapper around [`crate::presence_handle::PresenceHandle`]
+/// pinned to [`crate::messages::ChatPresenceMedia::Text`]. The
+/// presence handle owns the abort + final `<paused/>` emit on
+/// drop, so this struct carries no extra fields. Kept separate
+/// from `PresenceHandle` so the public API stays
+/// backwards-compatible — callers that imported `TypingHandle`
+/// from earlier whatsapp-rs versions keep working unchanged.
+///
+/// `#[allow(dead_code)]` suppresses the spurious unused-field
+/// warning: the inner `PresenceHandle` is "read" only through its
+/// own `Drop` impl when this struct drops, which the compiler
+/// can't see.
+#[allow(dead_code)]
+pub struct TypingHandle(crate::presence_handle::PresenceHandle);
 
 #[allow(dead_code)]
 impl Session {
@@ -1444,20 +1437,12 @@ impl Session {
     }
 
     pub fn typing_heartbeat(&self, jid: &str) -> TypingHandle {
-        let mgr = self.mgr.clone();
-        let jid_owned = jid.to_string();
-        let refresh_mgr = mgr.clone();
-        let refresh_jid = jid_owned.clone();
-        let task = tokio::spawn(async move {
-            // Send the initial on immediately (interval's first tick fires instantly).
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-                let m = refresh_mgr.read().await;
-                let _ = m.send_typing(&refresh_jid, true).await;
-            }
-        });
-        TypingHandle { abort: task.abort_handle(), mgr, jid: jid_owned }
+        // Delegates to the unified presence machinery. `Text` media
+        // means the wire shape is `<chatstate><composing/></chatstate>`
+        // — exactly what the legacy hand-rolled spawn did.
+        TypingHandle(
+            self.chat_presence_heartbeat(jid, crate::messages::ChatPresenceMedia::Text),
+        )
     }
 
     /// Start a chat-presence heartbeat that pulses the chosen
