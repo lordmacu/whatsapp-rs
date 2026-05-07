@@ -1,10 +1,13 @@
 pub mod bot_decrypt;
 pub mod bot_discovery;
+pub mod chat_presence;
 pub mod link_preview;
 pub mod rate_limit;
 pub mod recent_sends;
 pub mod recv;
 pub mod send;
+
+pub use chat_presence::{ChatPresenceMedia, ChatPresenceState};
 
 use crate::binary::BinaryNode;
 use crate::signal::SignalRepository;
