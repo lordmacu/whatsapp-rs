@@ -1464,6 +1464,18 @@ impl Session {
     }
 
     /// Tunable variant of [`Self::chat_presence_heartbeat`].
+    ///
+    /// The refresher task hardens against two failure modes the
+    /// upstream OpenClaw `typing.ts:13-21` handles equivalently:
+    ///
+    ///   * **TTL** — auto-stops after `cfg.max_duration` so a
+    ///     handle the caller forgets to drop can't pulse forever.
+    ///   * **Circuit breaker** — stops after
+    ///     `cfg.max_consecutive_failures` straight `send_node`
+    ///     errors so a broken socket isn't hammered.
+    ///
+    /// Either trip aborts the task; the [`crate::presence_handle::PresenceHandle::Drop`]
+    /// impl still emits a final `<paused/>` when the handle drops.
     pub fn chat_presence_heartbeat_with(
         &self,
         jid: &str,
@@ -1475,24 +1487,61 @@ impl Session {
         let refresh_mgr = self.mgr.clone();
         let refresh_jid = jid.to_string();
         let interval_dur = cfg.keepalive_interval;
+        let max_duration = cfg.max_duration;
+        let max_failures = cfg.max_consecutive_failures;
         let task = tokio::spawn(async move {
             // First pulse fires immediately (tokio's interval ticks
             // at t=0). Subsequent pulses honour the configured
             // keepalive cadence.
+            let started = tokio::time::Instant::now();
             let mut interval = tokio::time::interval(interval_dur);
+            let mut consecutive_failures: u32 = 0;
             loop {
                 interval.tick().await;
+                if !max_duration.is_zero()
+                    && tokio::time::Instant::now().duration_since(started) >= max_duration
+                {
+                    tracing::warn!(
+                        jid = %refresh_jid,
+                        max_duration_secs = max_duration.as_secs(),
+                        "presence heartbeat TTL reached; stopping pulses"
+                    );
+                    return;
+                }
                 let media = crate::presence_handle::__decode_media_byte(
                     media_state.load(std::sync::atomic::Ordering::SeqCst),
                 );
                 let m = refresh_mgr.read().await;
-                let _ = m
+                let pulse = m
                     .send_chat_presence(
                         &refresh_jid,
                         crate::messages::ChatPresenceState::Composing,
                         Some(media),
                     )
                     .await;
+                drop(m);
+                match pulse {
+                    Ok(()) => {
+                        consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        tracing::warn!(
+                            jid = %refresh_jid,
+                            error = %e,
+                            attempt = consecutive_failures,
+                            "presence heartbeat pulse failed"
+                        );
+                        if max_failures > 0 && consecutive_failures >= max_failures {
+                            tracing::warn!(
+                                jid = %refresh_jid,
+                                max_failures,
+                                "presence heartbeat circuit breaker tripped; stopping pulses"
+                            );
+                            return;
+                        }
+                    }
+                }
             }
         });
         handle.set_abort(task.abort_handle());
