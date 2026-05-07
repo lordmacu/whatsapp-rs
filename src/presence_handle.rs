@@ -81,6 +81,16 @@ fn decode_media(byte: u8) -> ChatPresenceMedia {
     }
 }
 
+/// Crate-internal door for the refresher task in
+/// [`crate::client::Session::chat_presence_heartbeat_with`] to
+/// translate the byte it loads from the shared `AtomicU8` back
+/// into a [`ChatPresenceMedia`]. Public-in-crate so the spawn
+/// site doesn't have to copy the encoding logic.
+#[doc(hidden)]
+pub fn __decode_media_byte(byte: u8) -> ChatPresenceMedia {
+    decode_media(byte)
+}
+
 /// RAII guard for an in-flight chat-presence heartbeat.
 ///
 /// Constructing one (via

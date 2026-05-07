@@ -27,6 +27,7 @@ mod metrics;
 mod noise;
 mod outbox;
 mod poll_store;
+mod presence_handle;
 mod qr;
 mod scheduler;
 mod signal;

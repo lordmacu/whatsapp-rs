@@ -1404,6 +1404,25 @@ impl Session {
         self.mgr.read().await.send_typing(jid, composing).await.map_err(Into::into)
     }
 
+    /// Send a `<chatstate>` stanza with optional `media`
+    /// discriminator on the `<composing>` inner node. Pass
+    /// `Some(ChatPresenceMedia::Audio)` to switch the peer phone's
+    /// indicator from "typing…" to "recording audio…". `media` is
+    /// ignored when `state == Paused`.
+    pub async fn send_chat_presence(
+        &self,
+        jid: &str,
+        state: crate::messages::ChatPresenceState,
+        media: Option<crate::messages::ChatPresenceMedia>,
+    ) -> Result<()> {
+        self.mgr
+            .read()
+            .await
+            .send_chat_presence(jid, state, media)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Start a "typing…" heartbeat on `jid`. WA expires the indicator after
     /// ~15 s of silence, so a long-running agent must refresh it. Returns a
     /// [`TypingHandle`] that loops `typing=on` every 10 s until dropped; at
@@ -1439,6 +1458,60 @@ impl Session {
             }
         });
         TypingHandle { abort: task.abort_handle(), mgr, jid: jid_owned }
+    }
+
+    /// Start a chat-presence heartbeat that pulses the chosen
+    /// [`crate::messages::ChatPresenceMedia`] every
+    /// `keepalive_interval`. Pass `ChatPresenceMedia::Audio` for
+    /// the voice-note flow so the peer phone renders "recording
+    /// audio…" instead of "typing…".
+    ///
+    /// Returns a [`crate::presence_handle::PresenceHandle`] that you can
+    /// [`crate::presence_handle::PresenceHandle::switch_media`] mid-stream (e.g.
+    /// start as `Text`, switch to `Audio` once the LLM produces a
+    /// voice reply). Drop emits a final `<paused/>`.
+    pub fn chat_presence_heartbeat(
+        &self,
+        jid: &str,
+        media: crate::messages::ChatPresenceMedia,
+    ) -> crate::presence_handle::PresenceHandle {
+        self.chat_presence_heartbeat_with(jid, media, crate::presence_handle::PresenceHeartbeatConfig::default())
+    }
+
+    /// Tunable variant of [`Self::chat_presence_heartbeat`].
+    pub fn chat_presence_heartbeat_with(
+        &self,
+        jid: &str,
+        media: crate::messages::ChatPresenceMedia,
+        cfg: crate::presence_handle::PresenceHeartbeatConfig,
+    ) -> crate::presence_handle::PresenceHandle {
+        let mut handle = crate::presence_handle::PresenceHandle::new(self.mgr.clone(), jid.to_string(), media, cfg);
+        let media_state = handle.media_state_handle();
+        let refresh_mgr = self.mgr.clone();
+        let refresh_jid = jid.to_string();
+        let interval_dur = cfg.keepalive_interval;
+        let task = tokio::spawn(async move {
+            // First pulse fires immediately (tokio's interval ticks
+            // at t=0). Subsequent pulses honour the configured
+            // keepalive cadence.
+            let mut interval = tokio::time::interval(interval_dur);
+            loop {
+                interval.tick().await;
+                let media = crate::presence_handle::__decode_media_byte(
+                    media_state.load(std::sync::atomic::Ordering::SeqCst),
+                );
+                let m = refresh_mgr.read().await;
+                let _ = m
+                    .send_chat_presence(
+                        &refresh_jid,
+                        crate::messages::ChatPresenceState::Composing,
+                        Some(media),
+                    )
+                    .await;
+            }
+        });
+        handle.set_abort(task.abort_handle());
+        handle
     }
 
     pub async fn send_presence(&self, available: bool) -> Result<()> {
