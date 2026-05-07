@@ -411,17 +411,41 @@ impl MessageManager {
     }
 
     /// Send composing/paused typing indicator to a JID.
+    ///
+    /// Retained for backwards compatibility. New code should call
+    /// [`Self::send_chat_presence`] directly — it accepts an
+    /// optional [`super::chat_presence::ChatPresenceMedia`] so the
+    /// peer phone can render "recording audio…" instead of
+    /// "typing…" before a voice note.
     pub async fn send_typing(&self, jid: &str, composing: bool) -> Result<()> {
-        let state = if composing { "composing" } else { "paused" };
-        let node = BinaryNode {
-            tag: "chatstate".to_string(),
-            attrs: vec![("to".to_string(), jid.to_string())],
-            content: NodeContent::List(vec![BinaryNode {
-                tag: state.to_string(),
-                attrs: vec![],
-                content: NodeContent::None,
-            }]),
+        let state = if composing {
+            super::chat_presence::ChatPresenceState::Composing
+        } else {
+            super::chat_presence::ChatPresenceState::Paused
         };
+        self.send_chat_presence(jid, state, None).await
+    }
+
+    /// Send a `<chatstate>` stanza with optional `media`
+    /// discriminator on the `<composing>` inner node. Pass
+    /// `Some(ChatPresenceMedia::Audio)` to switch the peer phone's
+    /// indicator from "typing…" to "recording audio…". `media` is
+    /// ignored when `state == Paused`.
+    ///
+    /// Wire shape:
+    ///
+    /// ```xml
+    /// <chatstate to="JID"><composing/></chatstate>             <!-- typing -->
+    /// <chatstate to="JID"><composing media="audio"/></chatstate> <!-- recording -->
+    /// <chatstate to="JID"><paused/></chatstate>                <!-- stop -->
+    /// ```
+    pub async fn send_chat_presence(
+        &self,
+        jid: &str,
+        state: super::chat_presence::ChatPresenceState,
+        media: Option<super::chat_presence::ChatPresenceMedia>,
+    ) -> Result<()> {
+        let node = super::chat_presence::build_chat_presence_node(jid, state, media);
         self.socket.send_node(&node).await
     }
 

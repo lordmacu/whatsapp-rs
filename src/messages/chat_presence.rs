@@ -66,3 +66,133 @@ impl ChatPresenceMedia {
         }
     }
 }
+
+/// Build the `<chatstate>` [`BinaryNode`] without touching any
+/// socket. Pure function so wire-shape tests can roundtrip the
+/// stanza through the binary encoder without spinning up a full
+/// `MessageManager`.
+///
+/// `media` is honoured on [`ChatPresenceState::Composing`] only;
+/// it is dropped silently for `Paused` (matching the wire-level
+/// behaviour expected by WhatsApp Web).
+pub fn build_chat_presence_node(
+    jid: &str,
+    state: ChatPresenceState,
+    media: Option<ChatPresenceMedia>,
+) -> crate::binary::BinaryNode {
+    use crate::binary::{BinaryNode, NodeContent};
+
+    let inner_tag = match state {
+        ChatPresenceState::Composing => "composing",
+        ChatPresenceState::Paused => "paused",
+    };
+    let inner_attrs: Vec<(String, String)> = match (state, media) {
+        (ChatPresenceState::Composing, Some(m)) => match m.wire_attr() {
+            Some(v) => vec![("media".to_string(), v.to_string())],
+            None => vec![],
+        },
+        _ => vec![],
+    };
+    BinaryNode {
+        tag: "chatstate".to_string(),
+        attrs: vec![("to".to_string(), jid.to_string())],
+        content: NodeContent::List(vec![BinaryNode {
+            tag: inner_tag.to_string(),
+            attrs: inner_attrs,
+            content: NodeContent::None,
+        }]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binary::NodeContent;
+
+    fn inner_node(node: &crate::binary::BinaryNode) -> &crate::binary::BinaryNode {
+        match &node.content {
+            NodeContent::List(items) => items.first().expect("expected one inner node"),
+            _ => panic!("chatstate must wrap inner node in NodeContent::List"),
+        }
+    }
+
+    #[test]
+    fn composing_text_emits_no_media_attr() {
+        let node = build_chat_presence_node(
+            "573144347358@s.whatsapp.net",
+            ChatPresenceState::Composing,
+            Some(ChatPresenceMedia::Text),
+        );
+        assert_eq!(node.tag, "chatstate");
+        assert_eq!(node.attr("to"), Some("573144347358@s.whatsapp.net"));
+        let inner = inner_node(&node);
+        assert_eq!(inner.tag, "composing");
+        assert!(
+            inner.attr("media").is_none(),
+            "Text media must omit the attr entirely; got media={:?}",
+            inner.attr("media")
+        );
+    }
+
+    #[test]
+    fn composing_audio_emits_media_audio() {
+        let node = build_chat_presence_node(
+            "573144347358@s.whatsapp.net",
+            ChatPresenceState::Composing,
+            Some(ChatPresenceMedia::Audio),
+        );
+        let inner = inner_node(&node);
+        assert_eq!(inner.tag, "composing");
+        assert_eq!(inner.attr("media"), Some("audio"));
+    }
+
+    #[test]
+    fn paused_emits_simple_paused() {
+        let node = build_chat_presence_node(
+            "573144347358@s.whatsapp.net",
+            ChatPresenceState::Paused,
+            Some(ChatPresenceMedia::Audio), // ignored
+        );
+        let inner = inner_node(&node);
+        assert_eq!(inner.tag, "paused");
+        assert!(
+            inner.attr("media").is_none(),
+            "Paused must drop media attr; got {:?}",
+            inner.attr("media")
+        );
+    }
+
+    #[test]
+    fn composing_no_media_arg_omits_attr() {
+        let node = build_chat_presence_node(
+            "573144347358@s.whatsapp.net",
+            ChatPresenceState::Composing,
+            None,
+        );
+        let inner = inner_node(&node);
+        assert_eq!(inner.tag, "composing");
+        assert!(inner.attr("media").is_none());
+    }
+
+    #[test]
+    fn send_typing_node_matches_send_chat_presence_with_no_media() {
+        // The wrapper `MessageManager::send_typing(jid, true)` must
+        // produce the same `<chatstate>` node as
+        // `send_chat_presence(jid, Composing, None)` — guards
+        // against the wrapper drifting from the canonical builder.
+        let typing_on = build_chat_presence_node(
+            "1@s.whatsapp.net",
+            ChatPresenceState::Composing,
+            None,
+        );
+        let typing_off = build_chat_presence_node(
+            "1@s.whatsapp.net",
+            ChatPresenceState::Paused,
+            None,
+        );
+        assert_eq!(inner_node(&typing_on).tag, "composing");
+        assert!(inner_node(&typing_on).attr("media").is_none());
+        assert_eq!(inner_node(&typing_off).tag, "paused");
+    }
+}
+
