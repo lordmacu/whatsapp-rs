@@ -19,6 +19,7 @@ pub mod messages;
 pub mod metrics;
 pub mod noise;
 pub mod poll_store;
+pub mod presence_handle;
 pub mod qr;
 pub mod scheduler;
 pub mod signal;
@@ -28,6 +29,10 @@ pub mod webhook;
 pub use client::{Chat, Client, Session};
 pub use error::{Result as WaResult, WaError};
 pub use message_store::StoredMessage;
-pub use messages::{ChatInfo, MediaInfo, MessageContent, MessageEvent, MessageKey, MessageStatus, WAMessage};
+pub use messages::{
+    ChatInfo, ChatPresenceMedia, ChatPresenceState, MediaInfo, MessageContent, MessageEvent,
+    MessageKey, MessageStatus, WAMessage,
+};
+pub use presence_handle::{PresenceHandle, PresenceHeartbeatConfig};
 pub use socket::group::{GroupInfo, ParticipantInfo, ParticipantResult};
 pub use socket::privacy::{PrivacyPatch, PrivacySettings, PrivacyValue};
