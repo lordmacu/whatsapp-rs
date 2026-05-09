@@ -40,13 +40,37 @@ path = "src/main.rs"
 name = "whatsapp_rs"
 path = "src/lib.rs"
 
+[features]
+# Default keeps the existing behaviour — `tokio-tungstenite` uses
+# OpenSSL via `native-tls` so downstream consumers that already
+# build against system OpenSSL (the proyecto daemon, every existing
+# bot example) compile byte-equivalently to before this feature
+# split landed.
+default = ["native-tls"]
+
+# OpenSSL TLS stack via `tokio-tungstenite`. Requires libssl
+# headers at build time — the historical default for Linux server
+# deploys.
+native-tls = ["tokio-tungstenite/native-tls"]
+
+# Pure-rustls TLS stack with the webpki-roots CA bundle. No
+# OpenSSL dependency at build time, so the binary cross-compiles
+# cleanly to Android NDK / Termux / any musl target without
+# pre-built OpenSSL artefacts. Required by the Phase 90 mobile
+# (Android Flutter) embedded build of the Nexo daemon's WhatsApp
+# plugin. Mutually exclusive with `native-tls`; consumers that
+# pin this feature must also pass `default-features = false` to
+# disable the OpenSSL default.
+rustls-tls = ["tokio-tungstenite/rustls-tls-webpki-roots"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# WebSocket
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-native-tls = "0.2"
+# WebSocket — TLS backend selected by the cargo features above.
+# `default-features = false` keeps `connect` + `handshake` while
+# leaving the TLS choice to the feature gate.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 
 # Crypto - Noise protocol
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -97,3 +121,17 @@ axum = "0.7"
 
 [build-dependencies]
 prost-build = "0.13"
+
+# Tuned release for the chat workspace machine. Trade ~5 % runtime
+# perf for parallel codegen + no LTO so iteration is ~2× faster.
+# Reserve plain `--release` (override via -p flag) for publish.
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+strip         = "symbols"
+
+[profile.release-fast]
+inherits      = "release"
+lto           = false
+codegen-units = 16
+strip         = "none"
