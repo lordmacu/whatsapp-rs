@@ -694,6 +694,7 @@ impl SignalRepository {
             "decrypt msg: jid={jid} primary={primary} candidates={candidates:?}"
         );
         let mut last_err: Option<anyhow::Error> = None;
+        let mut dup_err: Option<anyhow::Error> = None;
         for candidate in &candidates {
             match self.decrypt_normal_for_jid(candidate, &msg, data) {
                 Ok(pt) => {
@@ -710,11 +711,25 @@ impl SignalRepository {
                     tracing::info!(
                         "decrypt msg: candidate {candidate} failed: {e}"
                     );
-                    last_err = Some(e);
+                    // A "counter already passed" on ANY candidate means this
+                    // exact message was already decrypted on that session — a
+                    // duplicate redelivery, not a broken session. Preserve that
+                    // signal: it must win over a sibling device's "MAC mismatch"
+                    // (which only means "this stanza wasn't encrypted for that
+                    // slot"), so the recv layer can tell a benign replay apart
+                    // from a genuinely poisoned session.
+                    if dup_err.is_none() && format!("{e:#}").contains("already passed") {
+                        dup_err = Some(e);
+                    } else {
+                        last_err = Some(e);
+                    }
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no sessions for {jid}")))
+        // Prefer the duplicate signal over an arbitrary last candidate error.
+        Err(dup_err
+            .or(last_err)
+            .unwrap_or_else(|| anyhow::anyhow!("no sessions for {jid}")))
     }
 
     fn decrypt_normal_for_jid(

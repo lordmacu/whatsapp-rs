@@ -261,6 +261,13 @@ pub enum MessageEvent {
     /// name ("critical_block", "regular", ...). `action` carries the decoded
     /// mutation (contact rename, pin, mute, archive, …).
     AppStateUpdate { collection: String, action: crate::app_state::SyncAction },
+    /// The Signal session with `jid` was dropped after sustained decrypt
+    /// failures. The peer is still encrypting with their side of the stale
+    /// session, so the next inbound from them will also fail. Agents should
+    /// react by sending an outbound message to `jid` (a tiny ping is enough)
+    /// to force a fresh X3DH handshake — without that nudge the channel
+    /// stays poisoned until the peer manually re-pairs.
+    SessionReset { jid: String },
     /// An AI bot (Meta AI etc.) sent a chunk of a streamed reply. Each
     /// `<bot edit="first|inner|last">` chunk fires its own event with
     /// the SAME `target_id` (the original outbound id we sent to the
@@ -328,6 +335,15 @@ pub struct MessageManager {
     /// account in a multi-account process — owns its own quota pool
     /// instead of sharing a process-wide singleton.
     pub(crate) rate_limiter: Arc<rate_limit::RateLimiter>,
+}
+
+/// Load the per-sender decrypt-failure counters that back the auto-recovery /
+/// SessionReset escalation. These are intentionally NOT persisted across
+/// restarts yet (no writer is wired up), so this always starts empty — same
+/// as the long-standing `HashMap::new()` default. The call site exists so a
+/// disk-backed save can be added later without touching `with_stores`.
+fn load_retry_ids_from_disk() -> std::collections::HashMap<String, u32> {
+    std::collections::HashMap::new()
 }
 
 #[allow(dead_code)]
@@ -438,6 +454,7 @@ impl MessageManager {
         poll_store: Arc<crate::poll_store::PollStore>,
         outbox: Arc<crate::outbox::OutboxStore>,
     ) -> Self {
+        let retry_ids = std::sync::Mutex::new(load_retry_ids_from_disk());
         Self {
             socket,
             signal,
@@ -450,7 +467,7 @@ impl MessageManager {
             outbox,
             app_state_keys: None,
             app_state_sync: None,
-            retry_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            retry_ids,
             pending_pdo_retries: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             recent_sends: Arc::new(recent_sends::RecentSends::new()),
             rate_limiter: Arc::new(rate_limit::RateLimiter::new()),

@@ -37,6 +37,27 @@ fn sender_retry_key(sender: &str) -> String {
     format!("sender:{sender}")
 }
 
+/// True when a 1:1 decrypt failure is actually a DUPLICATE of a message we
+/// already decrypted — the ratchet refusing to re-advance a counter it has
+/// already consumed ("msg counter N already passed (chain at M)", see
+/// `signal/ratchet.rs`). This is a benign offline-backlog redelivery on a
+/// HEALTHY session, not a broken one. It must be excluded from the
+/// consecutive-failure auto-recovery counter and plain-acked (never NACK'd),
+/// or the server resends the same stanza forever and the bogus failures can
+/// trip a spurious SessionReset that drops a perfectly good session.
+///
+/// Matched on the error text because the whole decrypt stack returns
+/// `anyhow::Error` (stringly-typed `bail!`s); `decrypt_message` is responsible
+/// for surfacing this variant ahead of sibling-candidate "MAC mismatch"
+/// errors. Kept in one place so the contract with the ratchet message is
+/// explicit and testable.
+fn is_duplicate_decrypt_error(err: &anyhow::Error) -> bool {
+    // `{:#}` walks the full anyhow chain, so a wrapped/context'd error still
+    // matches.
+    let msg = format!("{err:#}");
+    msg.contains("already passed")
+}
+
 fn retry_cache_key(id: &str, sender: &str) -> String {
     format!("{id}:{sender}")
 }
@@ -349,7 +370,7 @@ impl MessageManager {
             from_me |= sender_bare == bare_user_jid(our_lid);
         }
 
-        let key = MessageKey {
+        let mut key = MessageKey {
             remote_jid: from.clone(),
             from_me,
             id: id.clone(),
@@ -401,6 +422,17 @@ impl MessageManager {
         }
 
         // Decrypt Signal-encrypted content if present
+        // Set when a 1:1 decrypt fails because the message is a DUPLICATE of one
+        // we already decrypted (ratchet "counter already passed"), not because
+        // the session is broken. Such redeliveries (offline-backlog replays)
+        // must be plain-acked — NACK'ing them makes the server resend forever —
+        // and must NOT count toward auto-recovery / SessionReset.
+        let mut decrypt_was_duplicate = false;
+        // Set when a from_me message is a deviceSentMessage (owner wrote from their
+        // phone to someone else): the REAL recipient is the DSM's destinationJid, not
+        // the `from` (which is the owner's own account). Used below to re-attribute
+        // `key.remote_jid` so the message lands in the right chat.
+        let mut dsm_dest: Option<String> = None;
         let decoded = if let Some((enc_bytes, enc_type)) = all_enc.iter()
             .find(|(_, t)| t == "skmsg")
             .cloned()
@@ -517,9 +549,15 @@ impl MessageManager {
                     // candidates corrupts every session we touch.
                     match self.signal.decrypt_message(&decrypt_jid, &enc_bytes, &enc_type).await {
                         Ok(plaintext) => {
-                            // Reset the per-sender failure counter on success
-                            // so a later transient failure still gets a count=1
-                            // reminder before we escalate to count=2+keys.
+                            // A genuine successful decrypt proves the session is
+                            // healthy: reset the consecutive-failure counter so only
+                            // a truly dead session (a run of GENUINE failures with no
+                            // success in between) ever escalates to SessionReset.
+                            // (The earlier "never reset" heuristic was a workaround
+                            // for the offline-backlog redelivery storm caused by the
+                            // reconnect loop — that loop is fixed, and duplicate
+                            // redeliveries are now excluded from the counter outright,
+                            // so resetting on success is both safe and correct.)
                             self.retry_ids.lock().unwrap()
                                 .remove(&sender_retry_key(sender_jid));
                             let plaintext = unpad_wa(&plaintext);
@@ -531,58 +569,105 @@ impl MessageManager {
                                 plaintext, &from, &id,
                             );
                             self.maybe_process_skdm(&decrypt_jid, plaintext);
+                            // If WE sent this from another device to someone else, the
+                            // real recipient is the DSM destinationJid — capture it so
+                            // the message is attributed to that chat, not our own.
+                            if from_me {
+                                dsm_dest = crate::signal::wa_proto::dsm_destination_jid(plaintext);
+                            }
                             Some(decode_plaintext(plaintext))
+                        }
+                        Err(e) if is_duplicate_decrypt_error(&e) => {
+                            // DUPLICATE redelivery: the ratchet reports "counter
+                            // already passed", i.e. this exact message was ALREADY
+                            // decrypted on a healthy session. It's an offline-backlog
+                            // replay, not a broken session. So: do NOT count it toward
+                            // auto-recovery, do NOT send a retry receipt, and (in the
+                            // ack block below) PLAIN-ack it — NACK'ing a duplicate
+                            // makes the server resend it forever. Leaving the counter
+                            // untouched is deliberate; a genuine success/failure will
+                            // move it.
+                            decrypt_was_duplicate = true;
+                            debug!(
+                                "decrypt: duplicate redelivery from {from} (msg {id}) — \
+                                 already decrypted on a healthy session, ignoring: {e}"
+                            );
+                            Some(DecodedPayload::Message(MessageContent::Text {
+                                text: "<decrypt failed>".to_string(),
+                                mentioned_jids: Vec::new(),
+                            }))
+                        }
+                        Err(e) if from_me => {
+                            // Our OWN account's fanout that we can't decrypt — typically
+                            // backlog copies of our own sent messages whose ratchet has
+                            // advanced (MAC mismatch on redelivery). Auto-recovery makes
+                            // NO sense here: dropping sessions + a SessionReset pkmsg to
+                            // our own LID is futile and the resulting send-storm wedges
+                            // the socket. So skip recovery entirely and PLAIN-ack to
+                            // drain (reuse the duplicate path: no count, no retry, no
+                            // NACK, no SessionReset).
+                            decrypt_was_duplicate = true;
+                            debug!(
+                                "decrypt: own-account (from_me) decrypt failed for {from} \
+                                 (msg {id}) — skipping auto-recovery: {e}"
+                            );
+                            Some(DecodedPayload::Message(MessageContent::Text {
+                                text: "<decrypt failed>".to_string(),
+                                mentioned_jids: Vec::new(),
+                            }))
                         }
                         Err(e) => {
                             debug!("signal decrypt failed for {from}: {e}");
-                            // Count consecutive decrypt failures from this
-                            // sender (keyed by the sender jid, not the msg
-                            // id — each msg has a unique id so a per-msg
-                            // counter always starts at 1 and we never
-                            // escalate to count=2 with keys). Two straight
-                            // failures means the session is truly broken
-                            // and we need peer to re-X3DH.
+                            // Count CONSECUTIVE genuine decrypt failures from this
+                            // sender (keyed by the sender jid). A genuine success
+                            // resets this to 0, so only a truly dead session — every
+                            // message fails, none decrypt — accumulates toward the
+                            // auto-recovery threshold and re-X3DH.
                             //
-                            // Track the counter for ALL failures — including
-                            // offline-replay ones — so that a broken session
-                            // surfaced by backlog drain can still trigger the
-                            // count≥3 auto-recovery below. Without this, the
-                            // exact scenario the bot hits on restart (server
-                            // replays backlog encrypted with a stale session
-                            // we no longer have, every attempt fails, but
-                            // is_offline_replay=true suppresses the counter)
-                            // would leave the session poisoned until a fresh
-                            // *live* message arrives, which the peer often
-                            // never sends if they think the bot is gone.
+                            // Count offline-replay failures too, so a broken session
+                            // surfaced by the one-time backlog drain on restart can
+                            // still trigger recovery. (Duplicate replays are filtered
+                            // out by the arm above, so this no longer over-counts.)
                             let retry_count = {
                                 let mut retries = self.retry_ids.lock().unwrap();
-                                let count = retries.entry(sender_retry_key(sender_jid)).or_insert(0);
+                                let key = sender_retry_key(sender_jid);
+                                let prev = retries.get(&key).copied().unwrap_or(0);
+                                let count = retries.entry(key.clone()).or_insert(0);
                                 *count += 1;
-                                *count
+                                let rc = *count;
+                                tracing::warn!(
+                                    "decrypt-fail-debug: sender={sender_jid} msg_id={id} retry_key={key} prev={prev} retry_count={rc} is_offline={is_offline_replay}"
+                                );
+                                rc
                             };
                             let include_keys = retry_count > 1;
-                            // Auto-recovery: if peer hasn't honoured the
-                            // count=2-with-keys retry after a few tries,
-                            // our and their session states are truly
-                            // diverged. Drop every session for this user
+                            // Auto-recovery: after enough CONSECUTIVE genuine
+                            // failures, our and the peer's session states are
+                            // truly diverged. Drop every session for this user
                             // so the peer's next send or our next outgoing
-                            // fetch_pre_key_bundle → X3DH → pkmsg path
-                            // can rebuild from scratch. Matches the
-                            // manual `jq | rm sessions` recovery we've
-                            // been doing by hand. Runs even during offline
-                            // replay — a pure-local operation, no network
-                            // cost — so the next live message from this peer
-                            // has a chance of decrypting.
-                            if retry_count >= 3 {
+                            // fetch_pre_key_bundle → X3DH → pkmsg path can
+                            // rebuild from scratch. Runs even during offline
+                            // replay — a pure-local operation, no network cost.
+                            if retry_count >= 5 {
                                 let peer_bare = bare_user_jid(sender_jid);
                                 let removed = self.signal.drop_sessions_for_user(&peer_bare);
                                 tracing::warn!(
                                     "auto-recovery: {retry_count} consecutive decrypt failures \
-                                     from {peer_bare} — dropped {removed} session(s). Peer or \
-                                     our next send will re-X3DH."
+                                     from {peer_bare} — dropped {removed} session(s). \
+                                     Emitting SessionReset so the bot can send a proactive ping."
                                 );
                                 self.retry_ids.lock().unwrap()
                                     .remove(&sender_retry_key(sender_jid));
+                                // Notify the bot (or any other consumer) so it can
+                                // proactively send an outbound pkmsg to the peer. Without
+                                // this nudge the peer keeps encrypting with their (still-
+                                // good-from-their-side) stale session and we keep
+                                // failing to decrypt — the broken state never heals
+                                // because neither side has a reason to initiate. The
+                                // pkmsg is the only thing that breaks the stalemate.
+                                let _ = self.event_tx.send(MessageEvent::SessionReset {
+                                    jid: peer_bare.clone(),
+                                });
                             }
                             // Skip the network-side retry-receipt during
                             // offline backlog drain — replying to every
@@ -622,7 +707,12 @@ impl MessageManager {
             Some(DecodedPayload::Message(MessageContent::Text { text, .. }))
                 if text == "<decrypt failed>" || text == "<skmsg decrypt failed>"
         );
-        if decrypt_failed {
+        if decrypt_was_duplicate {
+            // Duplicate redelivery of an already-decrypted message: plain-ack so
+            // the server drops it from the queue. A NACK/retry here would loop the
+            // redelivery indefinitely.
+            self.send_message_ack(node).await;
+        } else if decrypt_failed {
             if from.ends_with("@g.us") {
                 info!(
                     group_jid = %from,
@@ -660,6 +750,30 @@ impl MessageManager {
         if let Some(ref name) = push_name {
             let name_jid = participant.as_deref().unwrap_or(from.as_str());
             self.contacts.upsert(name_jid, name);
+        }
+
+        // Re-attribute own fanout (deviceSentMessage) to its REAL recipient. The
+        // owner writing from their phone to a peer arrives here as from_me with
+        // `from` = our own account; the DSM destinationJid is the actual chat.
+        // Resolve it to the SAME addressing the peer's inbound uses — prefer the
+        // LID alias if we've learned it — so handlers find the peer's chat state.
+        if from_me {
+            if let Some(dest) = dsm_dest.take() {
+                let dest_bare = bare_user_jid(&dest);
+                let resolved = if dest_bare.ends_with("@lid") {
+                    dest_bare
+                } else {
+                    self.signal
+                        .alias_of(&dest_bare)
+                        .filter(|a| a.ends_with("@lid"))
+                        .unwrap_or(dest_bare)
+                };
+                tracing::info!(
+                    "from_me DSM: re-attributing to recipient dest={dest} resolved={resolved} (was {})",
+                    key.remote_jid
+                );
+                key.remote_jid = resolved;
+            }
         }
 
         match decoded {
@@ -1663,4 +1777,128 @@ fn extract_sync_collections(node: &BinaryNode) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod reply_decode_tests {
+    use super::*;
+    use crate::signal::wa_proto;
+
+    // Regression: a quoted reply (Message.extendedTextMessage, field 6) was
+    // being misdecoded as a legacy Video (decode_wa_media's legacy tag 6),
+    // so the bot saw empty text and answered "solo te puedo leer por texto".
+    #[test]
+    fn reply_decodes_as_text_not_video() {
+        let quoted = wa_proto::proto_bytes(1, b"mensaje original del bot");
+        let blob = wa_proto::encode_wa_reply_message(
+            "esta es mi respuesta",
+            "ABCD1234",
+            Some("573144347358@s.whatsapp.net"),
+            &quoted,
+        );
+        let decoded = decode_plaintext(&blob);
+        match decoded {
+            DecodedPayload::Message(MessageContent::Text { text, .. }) => {
+                assert_eq!(text, "esta es mi respuesta");
+            }
+            DecodedPayload::Message(MessageContent::Reply { text, .. }) => {
+                assert_eq!(text, "esta es mi respuesta");
+            }
+            DecodedPayload::Message(MessageContent::Video { caption, .. }) => {
+                panic!("reply misdecoded as Video (caption={caption:?})");
+            }
+            DecodedPayload::Message(_) => panic!("reply decoded as wrong message variant"),
+            _ => panic!("reply decoded as non-message payload"),
+        }
+    }
+
+    // Guard against over-correction: a REAL image (carries mediaKey +
+    // fileEncSha256) must still decode as Image after the parse_media_sub
+    // crypto-field guard added for the reply/mention fix.
+    #[test]
+    fn real_image_still_decodes_as_image() {
+        let info = crate::messages::MediaInfo {
+            url: "https://mmg.whatsapp.net/x".to_string(),
+            direct_path: "/v/t62.7118-24/x".to_string(),
+            media_key: vec![1u8; 32],
+            file_enc_sha256: vec![2u8; 32],
+            file_sha256: vec![3u8; 32],
+            file_length: 12345,
+            mimetype: "image/jpeg".to_string(),
+        };
+        let blob = wa_proto::encode_wa_image_message(&info, Some("una foto"));
+        match decode_plaintext(&blob) {
+            DecodedPayload::Message(MessageContent::Image { caption, .. }) => {
+                assert_eq!(caption.as_deref(), Some("una foto"));
+            }
+            _ => panic!("real image failed to decode as Image"),
+        }
+    }
+
+    // A plain extended-text message with a @mention (also field 6, no media)
+    // must not be swallowed by the media decoder either.
+    #[test]
+    fn mention_text_decodes_as_text() {
+        let blob = wa_proto::encode_wa_text_with_mentions(
+            "hola @ana",
+            &["573001112233@s.whatsapp.net"],
+        );
+        match decode_plaintext(&blob) {
+            DecodedPayload::Message(MessageContent::Text { text, .. }) => {
+                assert_eq!(text, "hola @ana");
+            }
+            DecodedPayload::Message(MessageContent::Video { .. }) => {
+                panic!("mention text misdecoded as Video");
+            }
+            _ => panic!("mention text decoded as wrong variant"),
+        }
+    }
+
+    // The duplicate-vs-genuine classifier is the gate for auto-recovery /
+    // SessionReset. It must recognise the ratchet's "counter already passed"
+    // bail (a benign redelivery) and NOT mistake a real session failure for one.
+    #[test]
+    fn duplicate_decrypt_error_is_recognised() {
+        // Mirrors signal/ratchet.rs:145.
+        let dup = anyhow::anyhow!("msg counter 0 already passed (chain at 1)");
+        assert!(is_duplicate_decrypt_error(&dup));
+
+        // Survives an anyhow context wrapper (the `{:#}` chain walk).
+        let wrapped = dup.context("decrypt msg: candidate 573...@s.whatsapp.net failed");
+        assert!(is_duplicate_decrypt_error(&wrapped));
+    }
+
+    #[test]
+    fn genuine_decrypt_failures_are_not_duplicates() {
+        assert!(!is_duplicate_decrypt_error(&anyhow::anyhow!("MAC mismatch")));
+        assert!(!is_duplicate_decrypt_error(&anyhow::anyhow!(
+            "no session for 573...@s.whatsapp.net (have: [])"
+        )));
+    }
+
+    // Owner→peer fanout (deviceSentMessage) must surface the real recipient
+    // (destinationJid) so the message isn't misattributed to the owner's own chat.
+    #[test]
+    fn dsm_destination_jid_extracted() {
+        // Build Message.deviceSentMessage(31) { destinationJid(1), message(2) }.
+        let inner_msg = wa_proto::proto_bytes(1, b"si hay cobertura etb"); // conversation
+        let mut dsm = Vec::new();
+        dsm.extend(wa_proto::proto_bytes(1, b"573154645370@s.whatsapp.net")); // destinationJid
+        dsm.extend(wa_proto::proto_message(2, &inner_msg)); // message
+        let blob = wa_proto::proto_message(31, &dsm);
+
+        assert_eq!(
+            wa_proto::dsm_destination_jid(&blob).as_deref(),
+            Some("573154645370@s.whatsapp.net")
+        );
+        // The inner content still decodes (DSM unwrap path).
+        match decode_plaintext(&blob) {
+            DecodedPayload::Message(MessageContent::Text { text, .. }) => {
+                assert_eq!(text, "si hay cobertura etb");
+            }
+            _ => panic!("DSM inner message failed to decode as text"),
+        }
+        // A plain (non-DSM) message has no destinationJid.
+        assert_eq!(wa_proto::dsm_destination_jid(&inner_msg), None);
+    }
 }
