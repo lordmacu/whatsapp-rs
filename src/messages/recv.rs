@@ -542,34 +542,56 @@ impl MessageManager {
                             // escalate to count=2 with keys). Two straight
                             // failures means the session is truly broken
                             // and we need peer to re-X3DH.
+                            //
+                            // Track the counter for ALL failures — including
+                            // offline-replay ones — so that a broken session
+                            // surfaced by backlog drain can still trigger the
+                            // count≥3 auto-recovery below. Without this, the
+                            // exact scenario the bot hits on restart (server
+                            // replays backlog encrypted with a stale session
+                            // we no longer have, every attempt fails, but
+                            // is_offline_replay=true suppresses the counter)
+                            // would leave the session poisoned until a fresh
+                            // *live* message arrives, which the peer often
+                            // never sends if they think the bot is gone.
+                            let retry_count = {
+                                let mut retries = self.retry_ids.lock().unwrap();
+                                let count = retries.entry(sender_retry_key(sender_jid)).or_insert(0);
+                                *count += 1;
+                                *count
+                            };
+                            let include_keys = retry_count > 1;
+                            // Auto-recovery: if peer hasn't honoured the
+                            // count=2-with-keys retry after a few tries,
+                            // our and their session states are truly
+                            // diverged. Drop every session for this user
+                            // so the peer's next send or our next outgoing
+                            // fetch_pre_key_bundle → X3DH → pkmsg path
+                            // can rebuild from scratch. Matches the
+                            // manual `jq | rm sessions` recovery we've
+                            // been doing by hand. Runs even during offline
+                            // replay — a pure-local operation, no network
+                            // cost — so the next live message from this peer
+                            // has a chance of decrypting.
+                            if retry_count >= 3 {
+                                let peer_bare = bare_user_jid(sender_jid);
+                                let removed = self.signal.drop_sessions_for_user(&peer_bare);
+                                tracing::warn!(
+                                    "auto-recovery: {retry_count} consecutive decrypt failures \
+                                     from {peer_bare} — dropped {removed} session(s). Peer or \
+                                     our next send will re-X3DH."
+                                );
+                                self.retry_ids.lock().unwrap()
+                                    .remove(&sender_retry_key(sender_jid));
+                            }
+                            // Skip the network-side retry-receipt during
+                            // offline backlog drain — replying to every
+                            // replayed stanza with our identity + prekey
+                            // bundle would flood the offline queue and
+                            // trip the server's abuse detection. The
+                            // ack-with-error at the bottom of this fn is
+                            // enough to release those backlog entries.
                             if !is_offline_replay {
-                                let retry_count = {
-                                    let mut retries = self.retry_ids.lock().unwrap();
-                                    let count = retries.entry(sender_retry_key(sender_jid)).or_insert(0);
-                                    *count += 1;
-                                    *count
-                                };
-                                let include_keys = retry_count > 1;
-                                // Auto-recovery: if peer hasn't honoured the
-                                // count=2-with-keys retry after a few tries,
-                                // our and their session states are truly
-                                // diverged. Drop every session for this user
-                                // so the peer's next send or our next outgoing
-                                // fetch_pre_key_bundle → X3DH → pkmsg path
-                                // can rebuild from scratch. Matches the
-                                // manual `jq | rm sessions` recovery we've
-                                // been doing by hand.
-                                if retry_count >= 3 {
-                                    let peer_bare = bare_user_jid(sender_jid);
-                                    let removed = self.signal.drop_sessions_for_user(&peer_bare);
-                                    tracing::warn!(
-                                        "auto-recovery: {retry_count} consecutive decrypt failures \
-                                         from {peer_bare} — dropped {removed} session(s). Peer or \
-                                         our next send will re-X3DH."
-                                    );
-                                    self.retry_ids.lock().unwrap()
-                                        .remove(&sender_retry_key(sender_jid));
-                                }
                                 send_retry_receipt_fn(
                                     &self.socket, node, &from, &id, t,
                                     self.signal.registration_id(),
