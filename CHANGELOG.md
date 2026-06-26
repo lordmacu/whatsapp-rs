@@ -8,6 +8,39 @@ the API stabilizes (0.x may break on minor bumps).
 
 ## [Unreleased]
 
+## [0.1.7] — own-account decrypt, DSM re-attribution, retry & decode fixes
+
+### Added
+- **`MessageEvent::SessionReset { jid }`** — fired when a peer's Signal
+  session is dropped after N consecutive *genuine* decrypt failures.
+  Consumers should send the peer an outbound message to force a fresh
+  X3DH handshake (the broken state won't heal on its own otherwise).
+- **Own-account `from_me` decrypt** — your phone fans its own sent
+  messages out to companion devices addressed under your account LID; a
+  LID↔PN alias is now registered on `<success>` so those resolve to the
+  session held under your PN and decrypt (previously: `no session`).
+- **`deviceSentMessage` re-attribution** — own-device fanout is now
+  attributed to the *real recipient* chat (`destinationJid`), not your
+  own account, so handlers route it to the right conversation.
+
+### Fixed
+- **Reply / @mention decoded as Video** — `extendedTextMessage` (proto
+  field 6) collided with the legacy media tag; `parse_media_sub` now
+  requires `mediaKey` + `fileEncSha256`, so text variants no longer
+  decode as media.
+- **Duplicate-redelivery handling** — ratchet "counter already passed"
+  is classified as a benign duplicate: plain-acked (no NACK→resend loop)
+  and excluded from the auto-recovery counter. Genuine success resets it.
+- **SessionReset storm on own account** — own-account (`from_me`) decrypt
+  failures no longer count toward / trigger SessionReset (re-X3DH with
+  yourself is futile and the pkmsg storm trips WhatsApp anti-abuse).
+- **Own-device fanout "Waiting for this message"** — the primary's
+  retry-receipt is now resolved (cache lookup by id, since the send was
+  cached under the recipient chat) and re-wrapped in `deviceSentMessage`
+  before resending, so the primary can finally decrypt. Message ids are
+  normalised to lowercase in the recent-sends cache (we send `3EB0…` but
+  WhatsApp echoes `3eb0…`).
+
 ## [0.1.5] — bot decryption surfaces + discovery API
 
 ### Added

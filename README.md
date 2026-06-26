@@ -185,7 +185,16 @@ decrypt success, `debug!` for derivation inputs).
 - Token-bucket rate limiter (global + per-JID) on every content send.
   Tunable via `WA_RATE_*` env vars.
 - De-dup of incoming `NewMessage` so agents don't double-process
-  server-replayed stanzas.
+  server-replayed stanzas. Backlog redeliveries (ratchet "counter already
+  passed") are classified as benign duplicates — plain-acked, never NACK'd
+  into a resend loop, and excluded from the auto-recovery counter.
+- Own-account decrypt: `from_me` messages (your phone's fanout, incl. your
+  own manual sends) decrypt via an own-account LID↔PN alias; `deviceSentMessage`
+  copies are re-attributed to the real recipient chat (not your own account).
+- Own-device fanout recovery: outgoing copies are mirrored to your other
+  devices so they render as "sent by me"; the primary's retry-receipts are
+  honoured (cache lookup by id + DSM re-wrap) so it can decrypt them instead
+  of getting stuck on "Waiting for this message".
 
 ### Ops
 
@@ -198,7 +207,10 @@ decrypt success, `debug!` for derivation inputs).
 - **Events** — `MessageEvent::{Connected, Disconnected, Reconnecting,
   NewMessage, Receipt, MessageUpdate, Reaction, Typing, Presence,
   MessageRevoke, MessageEdit, EphemeralSetting, GroupUpdate, PollVote,
-  HistorySync, AppStateUpdate}`.
+  HistorySync, AppStateUpdate, BotMessage, SessionReset}`. `SessionReset`
+  fires when a peer's Signal session is dropped after sustained decrypt
+  failures — react by sending the peer an outbound message to force a
+  fresh X3DH handshake.
 
 ### App-state sync (projected)
 
