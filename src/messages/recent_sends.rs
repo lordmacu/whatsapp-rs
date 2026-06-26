@@ -34,7 +34,10 @@ impl RecentSends {
 
     pub fn insert(&self, jid: &str, id: &str, msg: WAMessage) {
         let Ok(mut inner) = self.inner.lock() else { return };
-        let key = (jid.to_string(), id.to_string());
+        // Normalise the message id to lowercase: we send ids uppercase
+        // (`3EB0…`) but WhatsApp echoes them lowercase (`3eb0…`) in
+        // ack/receipt/retry stanzas — so cache + lookups must agree.
+        let key = (jid.to_string(), id.to_ascii_lowercase());
         let ptr = inner.ptr;
         if let Some(old) = inner.ring[ptr].take() {
             inner.map.remove(&old);
@@ -46,7 +49,7 @@ impl RecentSends {
 
     pub fn get(&self, jid: &str, id: &str) -> Option<WAMessage> {
         let inner = self.inner.lock().ok()?;
-        inner.map.get(&(jid.to_string(), id.to_string())).cloned()
+        inner.map.get(&(jid.to_string(), id.to_ascii_lowercase())).cloned()
     }
 
     /// Look up a cached send by message id ALONE, regardless of the chat it was
@@ -56,10 +59,11 @@ impl RecentSends {
     /// O(n) over ≤256 entries; only used as a fallback when `get` misses.
     pub fn get_by_id(&self, id: &str) -> Option<WAMessage> {
         let inner = self.inner.lock().ok()?;
+        let id_lc = id.to_ascii_lowercase();
         inner
             .map
             .iter()
-            .find(|((_, k_id), _)| k_id == id)
+            .find(|((_, k_id), _)| *k_id == id_lc)
             .map(|(_, m)| m.clone())
     }
 }
