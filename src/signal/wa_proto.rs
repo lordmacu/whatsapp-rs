@@ -566,6 +566,20 @@ pub fn decode_wa_text(data: &[u8]) -> Option<String> {
     decode_wa_text_full(data).map(|(t, _)| t)
 }
 
+/// Extract the `destinationJid` (field 1) from a `Message.deviceSentMessage`
+/// (field 31). When the account owner sends a message from their phone, WhatsApp
+/// fans a copy out to companion devices wrapped in a DSM whose `destinationJid`
+/// is the REAL recipient. The plain `from` of that fanout stanza is the owner's
+/// own account, so without reading this field the message gets misattributed to
+/// the owner's own chat. Returns `None` when the blob isn't a DSM.
+pub fn dsm_destination_jid(data: &[u8]) -> Option<String> {
+    let fields = parse_proto_fields(data)?;
+    let dsm = fields.get(&31)?;
+    let dsm_fields = parse_proto_fields(dsm)?;
+    let dest = dsm_fields.get(&1)?;
+    String::from_utf8(dest.clone()).ok().filter(|s| !s.is_empty())
+}
+
 /// Decode text + mentionedJid list. ContextInfo lives in ExtendedTextMessage.field 17,
 /// mentionedJid is ContextInfo.field 15 (repeated string).
 pub fn decode_wa_text_full(data: &[u8]) -> Option<(String, Vec<String>)> {
@@ -716,6 +730,18 @@ fn parse_media_sub(data: &[u8], outer_tag: u64) -> Option<WaMediaFields> {
         });
 
     if url.is_empty() && direct_path.is_empty() {
+        return None;
+    }
+    // Real encrypted media ALWAYS carries both a mediaKey and a fileEncSha256
+    // (both are required to download + decrypt the blob). Non-media variants
+    // that happen to share a Message field number with our "legacy" media
+    // tags — contactMessage(4), locationMessage(5), extendedTextMessage(6) —
+    // do not. Without this guard a quoted reply or @mention (both
+    // extendedTextMessage = field 6) gets matched as a legacy Video: its text
+    // lands in field 1 = "url", so the bot sees a media message with no text
+    // and answers "solo te puedo leer por texto". Requiring the crypto fields
+    // rejects every such false positive regardless of field-number collisions.
+    if media_key.is_empty() || file_enc_sha256.is_empty() {
         return None;
     }
     Some(WaMediaFields { url, direct_path, media_key, file_enc_sha256, file_sha256, file_length, mimetype, caption, file_name })

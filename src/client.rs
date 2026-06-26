@@ -335,6 +335,10 @@ impl Client {
                                     B64.encode(c.signed_identity_key.public),
                                     B64.encode(&c.adv_secret_key)
                                 );
+                                // Log the raw QR payload so an operator can render
+                                // it to a crisp PNG (e.g. `qrencode`) for scanning,
+                                // not just the dark-background ASCII art.
+                                tracing::info!("QR_RAW:{qr_data}");
                                 if let Some(cb) = &self.qr_cb {
                                     cb(&qr_data);
                                 } else {
@@ -962,6 +966,20 @@ async fn run_one_connection(
                         // reject messages while they run.
                         if node.tag == "success" {
                             info!("login success ({})", node.attr("lid").unwrap_or("no lid"));
+                            // Alias our OWN LID↔PN. Our phone fans its sent messages
+                            // out to us (deviceSentMessage) addressed under our LID,
+                            // but the Signal session we hold for our own device lives
+                            // under our PN — so without this mapping our own manual
+                            // messages (from_me) fail with "no session for <our LID>".
+                            // The alias makes session lookup fall back PN↔LID.
+                            if let Some(lid) = node.attr("lid") {
+                                let lid_bare = bare_user_jid(lid);
+                                let pn_bare = bare_user_jid(&mgr.our_jid);
+                                if lid_bare != pn_bare && lid_bare.ends_with("@lid") {
+                                    mgr.signal.set_jid_alias(&lid_bare, &pn_bare);
+                                    info!("aliased own LID↔PN ({lid_bare} ↔ {pn_bare}) for from_me decrypt");
+                                }
+                            }
                             let _ = mgr.event_tx.send(MessageEvent::Connected);
 
                             // Fire-and-forget app-state resync if we already have keys.

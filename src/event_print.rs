@@ -193,5 +193,8 @@ pub async fn print_event(session: &Session, event: MessageEvent) {
         | MessageEvent::Reaction { .. }
         | MessageEvent::EphemeralSetting { .. }
         | MessageEvent::Connected => {}
+        MessageEvent::SessionReset { jid } => {
+            println!("[session-reset] dropped Signal session with {jid}, proactive ping will rebuild it");
+        }
     }
 }

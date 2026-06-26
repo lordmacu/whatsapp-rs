@@ -622,6 +622,28 @@ pub fn extract_text(content: Option<&MessageContent>) -> Option<String> {
     Some(raw)
 }
 
+/// Short, log-friendly name of a decoded message variant. Used by the inbound
+/// debug log so we can see at a glance how each message was classified
+/// (debugging the "reply gets detected as video" report).
+fn variant_name(content: Option<&MessageContent>) -> &'static str {
+    match content {
+        None => "none",
+        Some(MessageContent::Text { .. }) => "Text",
+        Some(MessageContent::Reply { .. }) => "Reply",
+        Some(MessageContent::LinkPreview { .. }) => "LinkPreview",
+        Some(MessageContent::Image { .. }) => "Image",
+        Some(MessageContent::Video { .. }) => "Video",
+        Some(MessageContent::Audio { .. }) => "Audio",
+        Some(MessageContent::Document { .. }) => "Document",
+        Some(MessageContent::Sticker { .. }) => "Sticker",
+        Some(MessageContent::Reaction { .. }) => "Reaction",
+        Some(MessageContent::Poll { .. }) => "Poll",
+        Some(MessageContent::Location { .. }) => "Location",
+        Some(MessageContent::Contact { .. }) => "Contact",
+        Some(_) => "other",
+    }
+}
+
 /// Phase 82.10.q — only treat the inbound as "actionable" (worth
 /// pulsing the typing-heartbeat for) when the handler is going to
 /// produce a real response. We pulse for:
@@ -766,6 +788,16 @@ impl Session {
             }
 
             let mut text = extract_text(msg.message.as_ref());
+
+            // 🔎 DEBUG (reply/video investigation): log how every inbound was
+            // classified + the extracted text, so a reply should now show
+            // variant=Text with the real text instead of variant=Video/empty.
+            tracing::info!(
+                "🔎 inbound: sender={} variant={} text={:?}",
+                sender,
+                variant_name(msg.message.as_ref()),
+                text.as_deref().map(|t| t.chars().take(80).collect::<String>()),
+            );
 
             // Voice-note transcription: only runs when configured AND the
             // message is audio with no accompanying text. Failure is silent

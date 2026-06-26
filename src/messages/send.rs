@@ -703,12 +703,33 @@ impl MessageManager {
             .unwrap_or(1);
 
         let bare_chat = bare_user_jid(&from);
-        let Some(cached) = self.recent_sends.get(&bare_chat, &msg_id) else {
-            tracing::debug!(
-                "incoming retry-receipt for {from}/{msg_id}: no cached send (cache miss or too old)",
-            );
-            return Ok(());
+        // `from` is the device asking for a resend. For OWN-device retries (our
+        // primary phone couldn't decrypt our own-device fanout), the message was
+        // cached under the RECIPIENT's chat, not our own account — so the
+        // (chat, id) key misses. Fall back to a by-id lookup.
+        let cached = match self
+            .recent_sends
+            .get(&bare_chat, &msg_id)
+            .or_else(|| self.recent_sends.get_by_id(&msg_id))
+        {
+            Some(m) => m,
+            None => {
+                tracing::debug!(
+                    "incoming retry-receipt for {from}/{msg_id}: no cached send (cache miss or too old)",
+                );
+                return Ok(());
+            }
         };
+
+        // Is this retry from one of OUR OWN devices (own-device fanout)? Such
+        // copies must be re-wrapped in the deviceSentMessage envelope below.
+        let from_bare = bare_user_jid(&from);
+        let is_own_device = from_bare == bare_user_jid(&self.our_jid)
+            || self
+                .our_lid
+                .as_deref()
+                .map(|l| from_bare == bare_user_jid(l))
+                .unwrap_or(false);
 
         // Target the specific device. Drop `:0` to match wire convention.
         let device_jid = strip_zero_device(&from);
@@ -751,7 +772,16 @@ impl MessageManager {
         }
 
         let wa_bytes = self.encode_content(&cached)?;
-        let padded = pad_wa(&wa_bytes);
+        // Our OWN devices expect the deviceSentMessage envelope (addressed to the
+        // ORIGINAL recipient), not the bare message. Re-wrap for own-device
+        // retries so the primary phone can render it; peer retries get the plain
+        // message as before.
+        let payload = if is_own_device {
+            wrap_device_sent_message(&cached.key.remote_jid, &wa_bytes)
+        } else {
+            wa_bytes
+        };
+        let padded = pad_wa(&payload);
         let enc = self.signal.encrypt_message(&device_jid, &padded).await?;
         let is_pkmsg = enc.msg_type == "pkmsg";
 
