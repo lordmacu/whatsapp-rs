@@ -1468,6 +1468,7 @@ fn event_label(event: &MessageEvent) -> &'static str {
         MessageEvent::Connected             => "Connected",
         MessageEvent::AppStateUpdate { .. } => "AppStateUpdate",
         MessageEvent::BotMessage { .. }     => "BotMessage",
+        MessageEvent::SessionReset { .. }   => "SessionReset",
     }
 }
 
