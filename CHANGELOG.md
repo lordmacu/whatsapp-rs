@@ -34,6 +34,13 @@ the API stabilizes (0.x may break on minor bumps).
 - **SessionReset storm on own account** — own-account (`from_me`) decrypt
   failures no longer count toward / trigger SessionReset (re-X3DH with
   yourself is futile and the pkmsg storm trips WhatsApp anti-abuse).
+- **SessionReset on stale offline backlog** — `offline=N` decrypt failures
+  no longer count toward auto-recovery. Old backlog (e.g. messages from
+  before a re-pair, encrypted under a session we no longer hold) can never
+  decrypt and re-delivers on every reconnect; counting it fired a futile
+  SessionReset that pinged the peer with an empty message. Only LIVE
+  failures recover now (a genuinely-broken session still fails — and
+  recovers — on the peer's next live send); backlog is just drained.
 - **Own-device fanout "Waiting for this message"** — the primary's
   retry-receipt is now resolved (cache lookup by id, since the send was
   cached under the recipient chat) and re-wrapped in `deviceSentMessage`
