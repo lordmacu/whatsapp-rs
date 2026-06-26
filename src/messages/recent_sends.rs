@@ -48,6 +48,20 @@ impl RecentSends {
         let inner = self.inner.lock().ok()?;
         inner.map.get(&(jid.to_string(), id.to_string())).cloned()
     }
+
+    /// Look up a cached send by message id ALONE, regardless of the chat it was
+    /// sent to. Needed for retry-receipts from our OWN devices (own-device
+    /// fanout): the message was cached under the recipient's chat, but the retry
+    /// arrives addressed from our own account — so the `(chat, id)` key misses.
+    /// O(n) over ≤256 entries; only used as a fallback when `get` misses.
+    pub fn get_by_id(&self, id: &str) -> Option<WAMessage> {
+        let inner = self.inner.lock().ok()?;
+        inner
+            .map
+            .iter()
+            .find(|((_, k_id), _)| k_id == id)
+            .map(|(_, m)| m.clone())
+    }
 }
 
 impl Default for RecentSends {
