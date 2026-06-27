@@ -191,6 +191,52 @@ impl Client {
             ).await;
         });
 
+        // ── Process-level liveness watchdog (defense-in-depth) ──────────────
+        // The per-connection watchdog inside run_session_loop is itself a tokio
+        // task: if the WHOLE runtime ever wedges, it freezes too and nothing
+        // recovers (the bug we hit — a stalled websocket write blocked the recv
+        // loop AND the socket close()). So: a tokio task bumps a heartbeat every
+        // 10s, and a DEDICATED OS THREAD (immune to a runtime stall) checks it.
+        // If it goes stale (>120s) the async runtime is wedged → log it loudly
+        // and exit; systemd (Restart=on-failure, RestartSec=10) brings a fresh
+        // process back in ~10s. Spawned once per process (survives reconnects).
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            fn unix_now() -> u64 {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            }
+            let heartbeat = Arc::new(AtomicU64::new(unix_now()));
+            let hb_writer = heartbeat.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(10));
+                loop {
+                    tick.tick().await;
+                    hb_writer.store(unix_now(), Ordering::Relaxed);
+                }
+            });
+            std::thread::Builder::new()
+                .name("liveness-watchdog".into())
+                .spawn(move || {
+                    const STALL_SECS: u64 = 120;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        let stale = unix_now().saturating_sub(heartbeat.load(Ordering::Relaxed));
+                        if stale > STALL_SECS {
+                            tracing::error!(
+                                "RUNTIME STALL: tokio heartbeat stale {stale}s — async runtime wedged. \
+                                 Exiting for systemd restart."
+                            );
+                            eprintln!("RUNTIME STALL ({stale}s) — exiting for restart");
+                            std::process::exit(70);
+                        }
+                    }
+                })
+                .expect("spawn liveness-watchdog thread");
+        }
+
         // Wait up to 10 s for <success>. `Connected` is emitted immediately
         // after the server sends <success>; passive-active and OTK upload
         // run in the background and don't block the send path.

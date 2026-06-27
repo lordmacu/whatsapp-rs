@@ -43,10 +43,28 @@ pub struct SocketSender {
 
 impl SocketSender {
     pub async fn send_node(&self, node: &BinaryNode) -> Result<()> {
+        use tokio::time::{timeout, Duration};
         let encoded = encode_node(node);
         let encrypted = self.state.lock().await.encrypt(&encoded)?;
         let frame = build_frame(&encrypted);
-        self.tx.lock().await.send(Message::Binary(frame)).await?;
+        // Bound the websocket write. On a half-open / stalled TCP connection the
+        // write can hang FOREVER while holding `self.tx`. That freezes the whole
+        // bot: the recv loop blocks on its next send (silent hang, TCP still
+        // ESTAB), AND the liveness watchdog's `close()` — which also locks
+        // `self.tx` — can never run, so nothing recovers. A ceiling turns the
+        // stall into an error → recv loop breaks → reconnect, and frees `tx`.
+        match timeout(
+            Duration::from_secs(30),
+            async {
+                let mut tx = self.tx.lock().await;
+                tx.send(Message::Binary(frame)).await
+            },
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => bail!("send_node: websocket write stalled (>30s) — forcing reconnect"),
+        }
         Ok(())
     }
 

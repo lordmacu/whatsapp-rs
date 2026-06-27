@@ -8,6 +8,22 @@ the API stabilizes (0.x may break on minor bumps).
 
 ## [Unreleased]
 
+### Fixed
+- **Permanent silent hang on a stalled websocket write.** `SocketSender::send_node`
+  awaited `tx.send()` with no timeout. On a half-open / stalled TCP connection
+  that write hangs forever while holding the `tx` async-mutex, which (a) freezes
+  the serial recv loop on its next send — total silence with the TCP still
+  ESTAB — and (b) blocks the liveness watchdog's `close()` (also needs `tx`), so
+  nothing ever recovers. Bounded the write to 30s → it now errors → recv loop
+  breaks → reconnect, and `tx` is freed so the watchdog can act.
+
+### Added
+- **Process-level liveness watchdog (OS thread).** The per-connection watchdog is
+  a tokio task and can't help if the whole runtime wedges (it freezes too). A
+  tokio task now bumps a heartbeat every 10s and a dedicated OS thread (immune to
+  a runtime stall) checks it; if it goes stale >120s it logs `RUNTIME STALL` and
+  exits, so `systemd Restart=on-failure` brings a fresh process back in ~10s.
+
 ## [0.1.7] — own-account decrypt, DSM re-attribution, retry & decode fixes
 
 ### Added
